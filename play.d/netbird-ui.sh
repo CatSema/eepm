@@ -3,7 +3,7 @@
 PKGNAME=netbird-ui
 SUPPORTEDARCHES="x86_64"
 VERSION="$2"
-DESCRIPTION="NetBird UI for managing WireGuard®-based overlay networks"
+DESCRIPTION="Graphical interface to manage NetBird's secure WireGuard® overlay networks with SSO/MFA authentication, access control policies, and real-time network visualization - designed to complement the CLI experience."
 URL="https://github.com/netbirdio/netbird"
 
 . $(dirname $0)/common.sh

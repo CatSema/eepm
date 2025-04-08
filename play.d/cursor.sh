@@ -1,10 +1,10 @@
 #!/bin/sh
 
-PKGNAME=cursor
+PKGNAME=Cursor
 SUPPORTEDARCHES="x86_64"
 VERSION="$2"
-DESCRIPTION="The AI-first Code Editor"
-URL="https://cursor.sh/"
+DESCRIPTION="Built to make you extraordinarily productive, Cursor is the best way to code with AI."
+URL="https://www.cursor.com/"
 
 . $(dirname $0)/common.sh
 

@@ -34,7 +34,7 @@ SHAREDIR=$PROGDIR
 # will replaced with /etc/eepm during install
 CONFIGDIR=$PROGDIR/../etc
 
-EPMVERSION="3.64.47"
+EPMVERSION="3.64.51"
 
 # package, single (file), pipe, git
 EPMMODE="package"
@@ -136,6 +136,48 @@ restore_color()
     } | $USETTY
 }
 
+is_osc8_supported()
+{
+    # Return cached result
+    [ -n "$__OSC8_SUPPORTED" ] && return 0
+    [ -n "$__OSC8_NOT_SUPPORTED" ] && return 1
+    # Check terminal
+    if [ -z "$USETTY" ] ; then
+        __OSC8_NOT_SUPPORTED=1 ; return 1
+    fi
+    # VTE-based terminals (GNOME Terminal, Tilix, etc.)
+    if [ -n "$VTE_VERSION" ] && [ "$VTE_VERSION" -ge 5000 ] 2>/dev/null ; then
+        __OSC8_SUPPORTED=1 ; return 0
+    fi
+    # iTerm2
+    [ "$TERM_PROGRAM" = "iTerm.app" ] && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    # Windows Terminal
+    [ -n "$WT_SESSION" ] && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    # Konsole
+    [ -n "$KONSOLE_VERSION" ] && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    # kitty
+    [ -n "$KITTY_WINDOW_ID" ] && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    # foot
+    { [ "$TERM" = "foot" ] || [ "$TERM" = "foot-extra" ] ; } && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    # WezTerm
+    [ "$TERM_PROGRAM" = "WezTerm" ] && { __OSC8_SUPPORTED=1 ; return 0 ; }
+    __OSC8_NOT_SUPPORTED=1
+    return 1
+}
+
+make_osc8_link()
+{
+    local url="$1"
+    local text="$2"
+    if is_osc8_supported ; then
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "${text:-$url}"
+    elif [ -n "$text" ] ; then
+        printf '%s (%s)' "$text" "$url"
+    else
+        printf '%s' "$url"
+    fi
+}
+
 echover()
 {
     [ -z "$verbose" ] && return
@@ -155,7 +197,7 @@ showcmd()
         set_boldcolor $GREEN
         local PROMTSIG="\$"
         is_root && PROMTSIG="#"
-        echo " $PROMTSIG $*"
+        echo " $PROMTSIG $*" | tr '\t' ' '
         restore_color
     fi >&2
 }
@@ -306,7 +348,7 @@ tolower()
 
 firstword()
 {
-        echo "$*" | cut -f1 -d" "
+        echo "$*" | awk '{print $1}'
 }
 
 lastword()
@@ -316,7 +358,7 @@ lastword()
 
 sed_escape()
 {
-    echo "$*" | sed -e 's/[]()$*.^|[]/\\&/g'
+    echo "$*" | sed -e 's|[][()$*.^|/]|\\&|g'
 }
 
 
@@ -395,7 +437,10 @@ message()
 __promo_message()
 {
     local PROMOMESSAGE="$EPMPROMOMESSAGE"
-    [ -n "$PROMOMESSAGE" ] || PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: https://t.me/useepm)"
+    if [ -z "$PROMOMESSAGE" ] ; then
+        local tg_link=$(make_osc8_link "https://t.me/useepm")
+        PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: $tg_link)"
+    fi
     echo "$PROMOMESSAGE"
 }
 
@@ -506,10 +551,11 @@ set_sudo()
         return "$SUDO_TESTED"
     fi
 
-    # if input is a console and stderr is a console
-    if inputisatty && isatty2 ; then
+    # if /dev/tty is available, sudo can ask for password (it opens /dev/tty directly)
+    if [ -r /dev/tty ] && [ -w /dev/tty ] ; then
         if ! $SUDO_CMD -n true ; then
-            info "Please enter sudo user password to use sudo for all privileged operations in the current session." >&2
+            # show message only if stderr is a tty (otherwise it might be lost)
+            isatty2 && info "Please enter sudo user password to use sudo for all privileged operations in the current session." >&2
             if ! $SUDO_CMD -l >/dev/null ; then
                 [ "$nofail" = "nofail" ] || SUDO="fatal 'For this operation run epm under root, or install and tune sudo (http://altlinux.org/sudo)'"
                 SUDO_TESTED="3"
@@ -582,16 +628,50 @@ __get_package_for_command()
     esac
 }
 
+read_tty() {
+    if [ -c /dev/tty ] ; then
+        read -r "$@" </dev/tty
+    else
+        read -r "$@"
+    fi
+}
+
 confirm() {
     local response
-    # call with a prompt string or use a default
-    read -r -p "${1:-Are you sure? [y/N]} " response
+    local prompt
+    if [ -n "$1" ] ; then
+        prompt="$(eval_gettext "$1")"
+    else
+        prompt="$(eval_gettext "Are you sure? [y/N]")"
+    fi
+    printf "%s " "$prompt" >&2
+    read_tty response || return 1
     case $response in
         [yY][eE][sS]|[yY])
             true
             ;;
         *)
             false
+            ;;
+    esac
+}
+
+confirm_yes() {
+    local response
+    local prompt
+    if [ -n "$1" ] ; then
+        prompt="$(eval_gettext "$1")"
+    else
+        prompt="$(eval_gettext "Are you sure? [Y/n]")"
+    fi
+    printf "%s " "$prompt" >&2
+    read_tty response || return 1
+    case $response in
+        [nN][oO]|[nN])
+            false
+            ;;
+        *)
+            true
             ;;
     esac
 }
@@ -715,10 +795,17 @@ esu()
     fi
 }
 
+__escape_regex_special()
+{
+    # escape: \ . ^ $ ( ) [ ] { } +
+    # keep | for OR patterns in search
+    echo "$1" | sed -e 's|[\\.^$(){}+]|\\&|g' -e 's|\[|\\[|g' -e 's|\]|\\]|g'
+}
+
 __convert_glob__to_regexp()
 {
-    # translate glob to regexp
-    echo "$1" | sed -e "s|\*|.*|g" -e "s|?|.|g"
+    # first escape regex special chars, then translate glob to regexp
+    __escape_regex_special "$1" | sed -e "s|\*|.*|g" -e "s|?|.|g"
 }
 
 regexp_subst()
@@ -771,38 +858,6 @@ assure_exists()
 }
 
 
-assure_exist_arch()
-{
-    local cmd="$1"
-
-    if ! is_command "$cmd"; then
-        info "$cmd utility not found, attempting to install it..."
-        docmd epm install "$cmd" || {
-        info "Attempting to build $cmd from AUR using makepkg..."
-
-        if ! epm installed base-devel >/dev/null 2>&1; then
-            info "Installing base-devel for building packages..."
-            docmd epm install base-devel
-        fi
-
-        local tmpdir
-        tmpdir="$(mktemp -d)" || fatal "Could not create temporary directory"
-        remove_on_exit "$tmpdir"
-
-        # Clone the AUR package
-        docmd git clone --branch "$cmd" --single-branch https://github.com/archlinux/aur.git "$tmpdir/$cmd"
-
-        cd "$tmpdir/$cmd"
-
-        # Build and install using makepkg
-        docmd makepkg -si --noconfirm
-
-        info "$cmd successfully built and installed from AUR"
-    }
-    fi
-}
-
-
 assure_exists_erc()
 {
     local package="erc"
@@ -828,15 +883,16 @@ disabled_eget()
 
 fetch_url()
 {
-    info "Fetching $1 ..."
-    eget -q -O- "$1"
+    local url="$1"
+    info 'Fetching $url ...'
+    eget -q -O- "$url"
 }
 
 sudocmd_eget()
 {
     # use internal eget only if exists
     if [ -s $SHAREDIR/tools_eget ] ; then
-        ( sudocmd EGET_BACKEND="$eget_backend" $CMDSHELL "$SHAREDIR"/tools_eget "$@" )
+        sudocmd env EGET_BACKEND="$eget_backend" $CMDSHELL "$SHAREDIR"/tools_eget "$@"
         return
     fi
 }
@@ -846,19 +902,36 @@ calc_sha256sum()
     sha256sum "$1" | awk '{print $1}'
 }
 
+get_checksum_value()
+{
+    echo "$1" | sed 's/^[^:]*://'
+}
+
+calc_checksum()
+{
+    local spec="$1"
+    local file="$2"
+    case "${spec%%:*}" in
+        md5|md5hash)
+            md5sum "$file" ;;
+        sha1|sha1hash)
+            sha1sum "$file" ;;
+        sha512|sha512hash)
+            sha512sum "$file" ;;
+        *)
+            sha256sum "$file" ;;
+    esac | awk '{print $1}'
+}
+
 print_sha256sum()
 {
-    if ! is_command sha256sum ; then
-        info "sha256sum is missed, can't print sha256 for packages..."
-        return
-    fi
-
     local checksum=''
     if [ "$1" = "--checksum" ] ; then
         checksum="$2"
         shift 2
-        pcs="$(calc_sha256sum "$1")"
-        [ "$checksum" = "$pcs" ] || fatal "Checksum verification failed. Awaited checksum: $checksum, package checksum: $pcs"
+        local expected="$(get_checksum_value "$checksum")"
+        local pcs="$(calc_checksum "$checksum" "$1")"
+        [ "$expected" = "$pcs" ] || fatal "Checksum verification failed (${checksum%%:*}). Awaited: $expected, got: $pcs"
     fi
 
     local files="$*"
@@ -882,13 +955,14 @@ parse_json_value()
 
 get_json_value()
 {
-    if is_url "$1" ; then
+    local src="$1"
+    if is_url "$src" ; then
         local toutput
-        toutput="$(fetch_url "$1")" || return
+        toutput="$(fetch_url "$src")" || return
         echo "$toutput" | parse_json_value "$2"
     else
-        [ -s "$1" ] || fatal "File $1 is missed, can't get json"
-        parse_json_value "$2" < "$1"
+        [ -s "$src" ] || fatal 'File $src is missing, can'\''t get JSON'
+        parse_json_value "$2" < "$src"
     fi
 }
 
@@ -899,15 +973,22 @@ parse_json_values()
     epm --inscript --quiet tool json -b | grep "^$field" | sed -e 's|.*\][[:space:]]||' | sed -e 's|"\(.*\)"|\1|g'
 }
 
+parse_json_object_keys()
+{
+    local field="$1"
+    epm --inscript --quiet tool json -b | grep "^\[\"$field\"," | sed -e 's|^\[\"[^\"]*\",\"\([^\"]*\)\"\].*|\1|'
+}
+
 get_json_values()
 {
-    if is_url "$1" ; then
+    local src="$1"
+    if is_url "$src" ; then
         local toutput
-        toutput="$(fetch_url "$1")" || return
+        toutput="$(fetch_url "$src")" || return
         echo "$toutput" | parse_json_values "$2"
     else
-        [ -s "$1" ] || fatal "File $1 is missed, can't get json"
-        parse_json_values "$2" < "$1"
+        [ -s "$src" ] || fatal 'File $src is missing, can'\''t get JSON'
+        parse_json_values "$2" < "$src"
     fi
 }
 
@@ -980,6 +1061,18 @@ eget()
     is_command curl || try_assure_exists wget
     is_command wget || try_assure_exists curl
     internal_tools_eget "$@"
+}
+
+is_package_file()
+{
+    local t
+    t="$(get_package_type "$1")" || return 1
+    case "$t" in
+        ELF|exe|msi|AppImage)
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 get_package_type()
@@ -1132,9 +1225,10 @@ is_active_systemd()
 
 assure_distr()
 {
+    local distr="$1"
     local TEXT="this option"
     [ -n "$2" ] && TEXT="$2"
-    [ "$DISTRNAME" = "$1" ] || fatal "$TEXT supported only for $1 distro"
+    [ "$DISTRNAME" = "$distr" ] || fatal '$TEXT supported only for $distr distro'
 }
 
 get_pkg_name_delimiter()
@@ -1189,7 +1283,7 @@ remove_on_exit()
         if [ -d "$1" ] ; then
             to_clean_tmp_dirs="$to_clean_tmp_dirs
 $1"
-        elif [ -f "$1" ] ; then
+        else
             to_clean_tmp_files="$to_clean_tmp_files
 $1"
         fi
@@ -1212,33 +1306,42 @@ $1"
 
 has_space()
 {
-        # not for dash:
-        [ "$1" != "${1/ //}" ]
-        # [ "$(echo "$*" | sed -e "s| ||")" != "$*" ]
+        case "$1" in
+            *[[:space:]]*) return 0 ;;
+        esac
+        return 1
+}
+
+filter_glob_list()
+{
+    local f
+    for f in "$@" ; do
+        [ -e "$f" ] && printf "%s " "$f"
+    done
 }
 
 
 is_url()
 {
-    echo "$1" | grep -q "^[filehtps]*:/"
+    echo "$1" | grep -qE "^(file|ftp|http|https|ipfs|rsync):/" && return 0
+    # SSH/rsync URL: host:/path or user@host:/path (but not scheme://)
+    echo "$1" | grep -qE '^[^:]+:/' && ! echo "$1" | grep -q "://"
 }
 
-if a= type -a type 2>/dev/null >/dev/null ; then
-print_command_path()
+is_bash()
 {
-    a= type -fpP -- "$1" 2>/dev/null
+    [ -n "$BASH_VERSION" ]
 }
-elif a= which which 2>/dev/null >/dev/null ; then
-    # the best case if we have which command (other ways needs checking)
-    # TODO: don't use which at all, it is a binary, not builtin shell command
+
+if is_bash ; then
 print_command_path()
 {
-    a= which -- "$1" 2>/dev/null
+    type -fpP -- "$1" 2>/dev/null
 }
 else
 print_command_path()
 {
-    a= type "$1" 2>/dev/null | sed -e 's|.* /|/|'
+    command -v "$1" 2>/dev/null
 }
 fi
 
@@ -1269,6 +1372,52 @@ subst()
     sed -i -e "$@"
 }
 fi
+
+__epm_suggest_similar_packages()
+{
+    local pkg="$1"
+    local cache="$epm_vardir/available-packages"
+    local count="${suggest_count:-7}"
+
+    # need cache file
+    [ -s "$cache" ] || return 1
+
+    # need fzf for fuzzy search
+    is_command fzf || return 1
+
+    local similar
+    similar="$(fzf -f "$pkg" < "$cache" 2>/dev/null | head -$count)"
+    [ -z "$similar" ] && return 1
+
+    # Interactive selection if enabled (via config or --interactive flag)
+    if [ -n "$suggest_interactive$interactive" ] && inputisatty ; then
+        local selected
+        selected="$(echo "$similar" | fzf --prompt="$(eval_gettext "Select package"): " --height=10 --reverse)"
+        if [ -n "$selected" ] ; then
+            echo "$selected"
+            return 0
+        fi
+        return 1
+    fi
+
+    # Non-interactive: just show suggestions (to stderr)
+    echo "" >&2
+    echog "Perhaps you meant:" >&2
+    echo "$similar" | sed 's/^/  /' >&2
+    return 1
+}
+
+__epm_suggest_similar_packages_by_list()
+{
+    local pkg
+    local selected_all=""
+    for pkg in "$@" ; do
+        local selected
+        selected="$(__epm_suggest_similar_packages "$pkg")"
+        [ -n "$selected" ] && selected_all="$selected_all $selected"
+    done
+    echo $selected_all
+}
 
 check_core_commands()
 {
@@ -1359,7 +1508,7 @@ serv_disable()
 {
     local SERVICE="$1"
 
-    is_service_autostart $1 || { info "Service $1 already disabled for startup" && return ; }
+    is_service_autostart $SERVICE || { info 'Service $SERVICE already disabled for startup' && return ; }
 
     case $SERVICETYPE in
         service-chkconfig|service-upstart)
@@ -1411,7 +1560,7 @@ serv_enable()
 {
     local SERVICE="$1"
 
-    is_service_autostart $1 && info "Service $1 is already enabled for startup" && return
+    is_service_autostart $SERVICE && info 'Service $SERVICE is already enabled for startup' && return
 
     case $SERVICETYPE in
         service-chkconfig)
@@ -1469,6 +1618,14 @@ serv_exists()
                 ;;
             esac
     esac
+}
+
+# File bin/serv-is_active:
+
+
+serv_is_active()
+{
+    is_service_running "$1"
 }
 
 # File bin/serv-list:
@@ -1624,7 +1781,13 @@ serv_log()
 
     case $SERVICETYPE in
         systemd)
-            sudocmd journalctl -b -u "$SERVICE" "$@"
+            if [ "$1" = "-f" ] ; then
+                shift
+                $SYSTEMCTL_RUNNER journalctl $SYSTEMCTL_ARGS -f -u "$SERVICE" "$@"
+            else
+                # -e to jump to end of log
+                $SYSTEMCTL_RUNNER journalctl $SYSTEMCTL_ARGS -e -u "$SERVICE" "$@"
+            fi
             ;;
         *)
             case $BASEDISTRNAME in
@@ -1646,8 +1809,8 @@ serv_off()
 {
     local SERVICE="$1"
 
-    is_service_running $1 && { serv_stop $1 || return ; }
-    is_service_autostart $1 || { info "Service $1 already disabled for startup" && return ; }
+    is_service_running $SERVICE && { serv_stop $SERVICE || return ; }
+    is_service_autostart $SERVICE || { info 'Service $SERVICE already disabled for startup' && return ; }
     serv_disable $SERVICE
 }
 
@@ -1656,10 +1819,11 @@ serv_off()
 
 serv_on()
 {
-    serv_enable "$1" || return
+    local SERVICE="$1"
+    serv_enable "$SERVICE" || return
     # start if need
-    is_service_running $1 && info "Service $1 is already running" && return
-    serv_start $1
+    is_service_running $SERVICE && info 'Service $SERVICE is already running' && return
+    serv_start $SERVICE
 }
 
 # File bin/serv-print:
@@ -1788,7 +1952,7 @@ is_service_running()
             sudorun $INITDIR/$1 status >/dev/null 2>/dev/null
             ;;
         systemd)
-            a='' systemctl status $1 >/dev/null 2>/dev/null
+            $SYSTEMCTL $SYSTEMCTL_ARGS status $1 >/dev/null 2>/dev/null
             ;;
         runit)
             sudorun sv status "$SERVICE" >/dev/null 2>/dev/null
@@ -1817,7 +1981,7 @@ is_service_autostart()
             test -L "$(echo /etc/rc5.d/S??$1)"
             ;;
         systemd)
-            a='' systemctl is-enabled $1
+            $SYSTEMCTL $SYSTEMCTL_ARGS is-enabled $1
             ;;
         runit)
             test -L "/var/service/$SERVICE"
@@ -1980,14 +2144,14 @@ _print_additional_usage
 ################# incorporate bin/distr_info #################
 internal_distr_info()
 {
-# 2007-2023 (c) Vitaly Lipatov <lav@etersoft.ru>
-# 2007-2023 (c) Etersoft
-# 2007-2023 Public domain
+# 2007-2026 (c) Vitaly Lipatov <lav@etersoft.ru>
+# 2007-2026 (c) Etersoft
+# 2007-2026 Public domain
 
 # You can set ROOTDIR to root system dir
 #ROOTDIR=
 
-PROGVERSION="20250206"
+PROGVERSION="20260206"
 
 # TODO: check /etc/system-release
 
@@ -2007,24 +2171,22 @@ has()
     grep "$*" "$DISTROFILE" >/dev/null 2>&1
 }
 
-# copied from epm-sh-functions
-# print a path to the command if exists in $PATH
-if a='' which which 2>/dev/null >/dev/null ; then
-    # the best case if we have which command (other ways needs checking)
-    # TODO: don't use which at all, it is binary, not builtin shell command
-print_command_path()
+# detect bash
+is_bash()
 {
-    a='' which -- "$1" 2>/dev/null
+    [ -n "$BASH_VERSION" ]
 }
-elif a='' type -a type 2>/dev/null >/dev/null ; then
+
+# print a path to the command if exists in $PATH
+if is_bash ; then
 print_command_path()
 {
-    a='' type -fpP -- "$1" 2>/dev/null
+    type -fpP -- "$1" 2>/dev/null
 }
 else
 print_command_path()
 {
-    a='' type "$1" 2>/dev/null | sed -e 's|.* /|/|'
+    command -v "$1" 2>/dev/null
 }
 fi
 
@@ -2140,6 +2302,9 @@ esac
 
 # FIXME: some problems with multibased distros (Server Edition on CentOS and Desktop Edition on Ubuntu)
 case $DISTRIB_ID in
+    AlterOS)
+        CMD="yum-rpm"
+        ;;
     PCLinux)
         CMD="apt-rpm"
         ;;
@@ -2254,7 +2419,7 @@ pkgtype()
 
     case $VENDOR_ID in
         arch|manjaro)
-            echo "pkg.tar.xz" && return
+            echo "pkg.tar.zst" && return
             ;;
         ublinux)
             echo "pkg.tar.zst" && return
@@ -2266,7 +2431,7 @@ pkgtype()
         freebsd) echo "tbz" ;;
         sunos) echo "pkg.gz" ;;
         slackware|mopslinux) echo "tgz" ;;
-        archlinux|manjaro) echo "pkg.tar.xz" ;;
+        archlinux|manjaro) echo "pkg.tar.zst" ;;
         ublinux) echo "pkg.tar.zst" ;;
         gentoo) echo "tbz2" ;;
         windows) echo "exe" ;;
@@ -3032,7 +3197,7 @@ local orig=''
 local EV=''
 [ -n "$EPMVERSION" ] && EV="(EPM version $EPMVERSION) "
 cat <<EOF
-distro_info v$PROGVERSION $EV: Copyright © 2007-2025 Etersoft
+distro_info v$PROGVERSION $EV: Copyright © 2007-2026 Etersoft
 
                        Pretty name (--pretty): $(print_pretty_name)
            (--distro-name / --distro-version): $DISTRO_NAME / $DISTRIB_FULL_RELEASE$orig
@@ -3077,8 +3242,8 @@ print_help()
     echo " --distro-name          - print distro name"
     echo " --distro-version       - print full version of the distro"
     echo " --full-version         - print full version of the distro"
-    echo " --codename (obsoleted) - print distro codename (focal for Ubuntu 20.04)"
-    echo " -r|--repo-name         - print repository name (focal for Ubuntu 20.04)"
+    echo " --codename (obsoleted) - print distro codename (f.i., focal for Ubuntu 20.04)"
+    echo " -r|--repo-name         - print repository name (f.i., focal for Ubuntu 20.04)"
     echo " --build-id             - print a string uniquely identifying the system image originally used as the installation base"
     echo " -V                     - print the utility version"
     echo "Run without args to print all information."
@@ -3089,28 +3254,28 @@ print_eepm_env()
 {
 cat <<EOF
 # -d | --base-distro-name
-DISTRNAME="$(echo $DISTRIB_ID)"
+export DISTRNAME="$(echo $DISTRIB_ID)"
 # --distro-name
-FULLDISTRNAME="$(echo "$DISTRO_NAME")"
+export FULLDISTRNAME="$(echo "$DISTRO_NAME")"
 # -v | --base-version
-DISTRVERSION="$(echo "$DISTRIB_RELEASE")"
+export DISTRVERSION="$(echo "$DISTRIB_RELEASE")"
 # distro dependent arch
-DISTRARCH="$(get_distro_arch)"
+export DISTRARCH="$(get_distro_arch)"
 # -s | --vendor-name
-BASEDISTRNAME=$(pkgvendor)
+export BASEDISTRNAME=$(pkgvendor)
 # --repo-name
-DISTRREPONAME=$(print_repo_name)
+export DISTRREPONAME=$(print_repo_name)
 
 # -a
-SYSTEMARCH="$(get_arch)"
+export SYSTEMARCH="$(get_arch)"
 # -y | --service-manager
-DISTRCONTROL="$(get_service_manager)"
+export DISTRCONTROL="$(get_service_manager)"
 # -g
-PMTYPE="$(pkgmanager)"
+export PMTYPE="$(pkgmanager)"
 # -p | --package-type
-PKGFORMAT=$(pkgtype)
+export PKGFORMAT=$(pkgtype)
 # -m
-DISTRMEMORY="$(get_memory_size)"
+export DISTRMEMORY="$(get_memory_size)"
 
 # TODO: remove?
 PKGVENDOR=$(pkgvendor)
@@ -3389,6 +3554,9 @@ check_command()
     exists)                   # HELPCMD: check if the service is installed on the system
         serv_cmd=exists
         ;;
+    is-active|is-running)     # HELPCMD: check if the service is running (returns exit code 0 if running)
+        serv_cmd=is_active
+        ;;
     edit)                     # HELPCMD: edit service file overload (use --full to edit full file)
         serv_cmd=edit
         ;;
@@ -3465,8 +3633,28 @@ check_option()
     return 0
 }
 
+# Check if daemon-reload is needed and run it automatically
+check_daemon_reload()
+{
+        local service="$1"
+        [ -z "$service" ] && return 0
+        # Check NeedDaemonReload property (read-only, no sudo needed)
+        if $SYSTEMCTL $SYSTEMCTL_ARGS show -p NeedDaemonReload "$service" 2>/dev/null | grep -q "NeedDaemonReload=yes" ; then
+                info "Unit file changed, running daemon-reload..."
+                $SYSTEMCTL_RUNNER $SYSTEMCTL $SYSTEMCTL_ARGS daemon-reload
+        fi
+}
+
 run_systemctl()
 {
+        local cmd="$1"
+        local service="$2"
+        # Auto daemon-reload before start/restart/reload
+        case "$cmd" in
+                start|restart|reload|try-restart)
+                        check_daemon_reload "$service"
+                        ;;
+        esac
         $SYSTEMCTL_RUNNER $SYSTEMCTL $SYSTEMCTL_ARGS "$@"
 }
 

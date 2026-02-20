@@ -4,6 +4,7 @@
 echo "$EPM_OPTIONS" | grep -q -- "--force" && force="--force"
 echo "$EPM_OPTIONS" | grep -q -- "--auto" && auto="--auto"
 echo "$EPM_OPTIONS" | grep -q -- "--latest" && latest="true"
+echo "$EPM_OPTIONS" | grep -q -- "--print-url" && print_url="true"
 [ -n "$EGET_IPFS_DB" ] && ipfs="true"
 
 
@@ -23,27 +24,26 @@ info()
 cd_to_temp_dir()
 {
     PKGDIR=$(mktemp -d --tmpdir=$BIGTMPDIR)
-    trap "rm -fr $PKGDIR" EXIT
-    cd $PKGDIR || fatal
+    trap 'rm -fr "$PKGDIR"' EXIT
+    cd "$PKGDIR" || fatal
+}
+
+# detect bash
+is_bash()
+{
+    [ -n "$BASH_VERSION" ]
 }
 
 # print a path to the command if exists in $PATH
-if a= type -a type 2>/dev/null >/dev/null ; then
+if is_bash ; then
 print_command_path()
 {
-    a= type -fpP -- "$1" 2>/dev/null
-}
-elif a= which which 2>/dev/null >/dev/null ; then
-    # the best case if we have which command (other ways needs checking)
-    # TODO: don't use which at all, it is a binary, not builtin shell command
-print_command_path()
-{
-    a= which -- "$1" 2>/dev/null
+    type -fpP -- "$1" 2>/dev/null
 }
 else
 print_command_path()
 {
-    a= type "$1" 2>/dev/null | sed -e 's|.* /|/|'
+    command -v "$1" 2>/dev/null
 }
 fi
 
@@ -56,6 +56,13 @@ is_command()
 is_url()
 {
     echo "$1" | grep -q "^[filehtps]*:/"
+}
+
+# return major epm version (e.g. 3.64 from 3.64.49)
+epm_major_version()
+{
+    local ver="${EPMVERSION%%-*}"
+    echo "${ver%.*}"
 }
 
 
@@ -135,13 +142,17 @@ override_pkgname()
 install_pkgurl()
 {
     local repack=''
-    local pkgtype="$(epm print info -p)"
 
     # we have workaround for their postinstall script, so always repack rpm package
     # TODO: repack for deb systems too
-    [ "$pkgtype" = "rpm" ] && repack='--repack'
+    [ "$PKGFORMAT" = "rpm" ] && repack='--repack'
 
     [ -n "$PKGURL" ] || fatal "Can't get package URL. Try use epm play --latest <app> to get latest version."
+
+    if [ -n "$print_url" ] ; then
+        echo "$PKGURL"
+        exit 0
+    fi
 
     epm install $repack $PKGURL "$@" || exit
 }
@@ -150,13 +161,17 @@ install_pkgurl()
 install_pack_pkgurl()
 {
     local repack=''
-    local pkgtype="$(epm print info -p)"
 
     # we have workaround for their postinstall script, so always repack rpm package
     # TODO: repack for deb systems too
-    [ "$pkgtype" = "rpm" ] && repack='--repack'
+    [ "$PKGFORMAT" = "rpm" ] && repack='--repack'
 
     [ -n "$PKGURL" ] || fatal "Can't get package URL. Try use epm play --latest <app> to get latest version."
+
+    if [ -n "$print_url" ] ; then
+        echo "$PKGURL"
+        exit 0
+    fi
 
     epm pack $repack --install $PKGNAME "$PKGURL" "$@"
 }
@@ -191,19 +206,61 @@ snap_get_version()
     eget -O- -H Snap-Device-Series:16 https://api.snapcraft.io/v2/snaps/info/$SNAPNAME | parse_json_value '["channel-map",0,"version"]'
 }
 
-# return version only for the first package
-get_latest_version()
+# load VERSION and RELEASE from app-versions (sets global variables)
+load_latest_version()
 {
-    local ver
-    local epmver="$(epm --short --version 2>/dev/null)"
+    local line
+    local epmver="$(epm_major_version)"
     local URL
-    epmver=$(echo "$epmver" | sed -e 's|\.[0-9]*$||')
+    VERSION=""
+    RELEASE=""
     for URL in "https://eepm.ru/releases/$epmver/app-versions" ; do
         echo "Getting latest version from $URL/$1 ..." >&2
-        ver="$(eget -q -O- "$URL/$1" 2>/dev/null)" || continue
-        ver="$(echo "$ver" | head -n1 | cut -d" " -f1)"
-        [ -n "$ver" ] && echo "$ver" && return
+        line="$(eget -q -O- "$URL/$1" 2>/dev/null)" || continue
+        line="$(echo "$line" | head -n1)"
+        VERSION="$(echo "$line" | cut -d" " -f1)"
+        RELEASE="$(echo "$line" | cut -d" " -f2 -s)"
+        [ -n "$VERSION" ] && return 0
     done
+    return 1
+}
+
+# return version only for the first package (compatibility wrapper)
+get_latest_version()
+{
+    load_latest_version "$1"
+    [ -n "$VERSION" ] && echo "$VERSION"
+}
+
+# extract release suffix from package release field
+# epm1.repacked.b1 -> b1, epm1.repacked.1 -> 1
+get_release_suffix()
+{
+    echo "$1" | sed -n 's/epm[0-9]*\.repacked\.//p'
+}
+
+# build full version string for comparison: VERSION-RELEASE
+# usage: build_full_version VERSION [RELEASE]
+build_full_version()
+{
+    local ver="$1"
+    local rel="$2"
+    if [ -n "$rel" ] ; then
+        echo "$ver-$rel"
+    else
+        echo "$ver"
+    fi
+}
+
+# get full version of installed package (VERSION-RELEASE)
+# usage: get_installed_full_version PKGNAME
+get_installed_full_version()
+{
+    local pkg="$1"
+    local ver="$(epm print version for package $pkg | head -n1)"
+    local rel="$(epm print release for package $pkg | head -n1)"
+    local rel_suffix="$(get_release_suffix "$rel")"
+    build_full_version "$ver" "$rel_suffix"
 }
 
 # copied from epm-sh-functions
@@ -218,8 +275,8 @@ __convert_glob__to_regexp()
 get_github_release_info() {
     local url="$1"
     local user_and_repo=${url#https://github.com/}
-    
-    eget -O- "https://api.github.com/repos/${user_and_repo%/}/releases"
+
+    fetch_url "https://api.github.com/repos/${user_and_repo%/}/releases"
 }
 
 get_github_url()
@@ -454,37 +511,74 @@ is_repacked_packages()
     done
 }
 
+# Check if package is installed and managed by us (for --installed check)
+is_installed_by_play()
+{
+    local pkg="$1"
+    [ -n "$pkg" ] || pkg="$PKGNAME"
+    [ -n "$pkg" ] || return 1
+
+    # Check exact package first
+    if epm status --installed $pkg ; then
+        epm status --repacked $pkg && return 0
+    fi
+
+    # If BASEPKGNAME and PRODUCTALT are set, check only valid alternatives
+    [ -n "$BASEPKGNAME" ] || return 1
+    [ -n "$PRODUCTALT" ] || return 1
+    local i
+    for i in $PRODUCTALT ; do
+        if [ "$i" = "''" ] ; then
+            # Check base package without suffix
+            if epm status --installed "$BASEPKGNAME" ; then
+                epm status --repacked "$BASEPKGNAME" && return 0
+            fi
+        else
+            if epm status --installed "$BASEPKGNAME-$i" ; then
+                epm status --repacked "$BASEPKGNAME-$i" && return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 check_for_product_update()
 {
-    # HACK: check version only by first package (we assume all packages have the same version)
-    pkgver="$(epm print version for package $PKGNAME | head -n1)"
-    latestpkgver="$(get_latest_version $PKGNAME)"
+    # get installed version (VERSION-RELEASE format)
+    local fullpkgver="$(get_installed_full_version $PKGNAME)"
 
-    # ignore update if have no latest package version or the latest package version no more than installed one
-    [ -n "$pkgver" ] || return
+    # load latest version and release from app-versions
+    load_latest_version $PKGNAME
+    latestpkgver="$VERSION"
+    local fulllatestver="$(build_full_version "$VERSION" "$RELEASE")"
+
+    # ignore update if package is not installed
+    [ -n "$fullpkgver" ] || return
 
     if [ -z "$latestpkgver" ] ; then
-        echo "Can't get info about latest version of $PKGNAME, so skip updating installed version $pkgver."
+        echo "Can't get info about latest version of $PKGNAME, so skip updating installed version $fullpkgver."
         exit
     fi
-    # latestpkgver <= $pkgver
+    # fulllatestver <= fullpkgver
     if [ -z "$force" ] || [ -z "$latest" ] ; then
-        if [ "$(epm print compare package version $latestpkgver $pkgver)" != "1" ] ; then
-            if [ "$latestpkgver" = "$pkgver" ] ; then
-                echo "Latest available version of $PKGNAME $latestpkgver is already installed."
+        if [ "$(epm print compare package version $fulllatestver $fullpkgver)" != "1" ] ; then
+            if [ "$fulllatestver" = "$fullpkgver" ] ; then
+                echo "Latest available version of $PKGNAME $fulllatestver is already installed."
             else
-                echo "Latest available version of $PKGNAME: $latestpkgver, but you have a newer version installed: $pkgver."
+                echo "Latest available version of $PKGNAME: $fulllatestver, but you have a newer version installed: $fullpkgver."
             fi
             exit
         fi
     fi
 
-    #echo "Updating $PKGNAME from $pkgver to the latest available version (equal to $latestpkgver or newer) ..."
+    #echo "Updating $PKGNAME from $fullpkgver to the latest available version (equal to $fulllatestver or newer) ..."
     if [ -n "$force" ] || [ -z "$latest" ] ; then
-        echo "Updating $PKGNAME from $pkgver to latest available version ..."
+        echo "Updating $PKGNAME from $fullpkgver to latest available version ..."
     else
-        echo "Updating $PKGNAME from $pkgver to $latestpkgver version ..."
+        echo "Updating $PKGNAME from $fullpkgver to $fulllatestver version ..."
         VERSION="$latestpkgver"
+        # RELEASE already set by load_latest_version
     fi
 }
 
@@ -506,9 +600,8 @@ esac
 [ -n "$PRODUCTALT" ] && check_alternative_pkgname
 [ -n "$PKGNAME" ] || fatal "Can't get PKGNAME"
 
-pkgtype="$(epm print info -p)"
 # deb targets always in low case
-[ "$pkgtype" = "deb" ] && PKGNAME="$(echo $PKGNAME | tr "[A-Z]" "[a-z]")"
+[ "$PKGFORMAT" = "deb" ] && PKGNAME="$(echo $PKGNAME | tr "[A-Z]" "[a-z]")"
 
 
 case "$1" in
@@ -518,8 +611,7 @@ case "$1" in
         exit
         ;;
     "--installed")
-        #epm installed $PKGNAME
-        is_repacked_packages $PKGNAME
+        is_installed_by_play $PKGNAME
         exit
         ;;
 esac
@@ -544,11 +636,12 @@ case "$1" in
         exit
         ;;
     "--installed-version")
-        epm print version for package $PKGNAME | head -n1
+        get_installed_full_version $PKGNAME
         exit
         ;;
     "--available-version")
-        get_latest_version $PKGNAME
+        load_latest_version $PKGNAME
+        build_full_version "$VERSION" "$RELEASE"
         exit
         ;;
     "--update")
@@ -579,7 +672,7 @@ esac
 
 # --update/--run
 
-is_supported_arch "$(epm print info -a)" || fatal "Only '$SUPPORTEDARCHES' architectures is supported"
+is_supported_arch "$SYSTEMARCH" || fatal "Only '$SUPPORTEDARCHES' architectures is supported"
 
 #epm tool estrlist has_space "$PKGNAME" && fatal "play.d/common does not support a new packages in PKGNAME at all!"
 
@@ -587,16 +680,19 @@ is_supported_arch "$(epm print info -a)" || fatal "Only '$SUPPORTEDARCHES' archi
 is_repacked_packages $REPOPKGNAME || exit 0
 
 # hack for hplip
-[ "$PKGNAME" = "hplip-plugin" ] && VERSION="*"
+[ "$PKGNAME" = "hplip-plugin" ] && VERSION="*" && RELEASE="*"
 
 if [ -z "$VERSION" ] && [ -z "$force" ] && [ -z "$latest" ] ; then
-    # by default use latest known version to install
-    VERSION="$(get_latest_version $PKGNAME)"
+    # by default use latest known version to install (also sets RELEASE)
+    load_latest_version $PKGNAME
     CHECKED_VERSION="$VERSION"
+    # hack
+    [ -n "VERSION" ] && [ -z "$RELEASE" ] && RELEASE="1"
 fi
 
 # default version value (can be overrided with arg $2 or by update)
 [ -n "$VERSION" ] || VERSION="*"
+[ -n "$RELEASE" ] || RELEASE="*"
 
 echo
 echo "Installing $DESCRIPTION as $PKGNAME $pkgtext ..."

@@ -1,0 +1,148 @@
+#!/bin/sh
+#
+# Copyright (C) 2025  Etersoft
+# Copyright (C) 2025  Vitaly Lipatov <lav@etersoft.ru>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+# APT sources paths with test isolation support (EPM_APT_SOURCES_ROOT)
+APT_SOURCES_LIST="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list"
+APT_SOURCES_LIST_D="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list.d"
+APT_ALL_SOURCES_LIST="$APT_SOURCES_LIST_D/*.list $APT_SOURCES_LIST_D/*.sources $APT_SOURCES_LIST"
+
+# Convert deb822 .sources file to one-line deb format
+__convert_deb822_to_oneline()
+{
+    local types="" uris="" suites="" components="" enabled=""
+    while IFS= read -r line ; do
+        case "$line" in
+            Enabled:*) enabled="${line#Enabled: }" ;;
+            Types:*) types="${line#Types: }" ;;
+            URIs:*) uris="${line#URIs: }" ;;
+            Suites:*) suites="${line#Suites: }" ;;
+            Components:*) components="${line#Components: }" ;;
+            ""|"#"*)
+                if [ -n "$types" ] && [ -n "$uris" ] && [ -n "$suites" ] ; then
+                    local prefix=""
+                    [ "$enabled" = "no" ] && prefix="# "
+                    local t u s
+                    for t in $types ; do
+                        for u in $uris ; do
+                            for s in $suites ; do
+                                echo "${prefix}${t} ${u} ${s} ${components}"
+                            done
+                        done
+                    done
+                fi
+                types="" ; uris="" ; suites="" ; components="" ; enabled=""
+                ;;
+        esac
+    done < "$1"
+    # flush last block
+    if [ -n "$types" ] && [ -n "$uris" ] && [ -n "$suites" ] ; then
+        local prefix=""
+        [ "$enabled" = "no" ] && prefix="# "
+        local t u s
+        for t in $types ; do
+            for u in $uris ; do
+                for s in $suites ; do
+                    echo "${prefix}${t} ${u} ${s} ${components}"
+                done
+            done
+        done
+    fi
+}
+
+# Find .sources files matching pattern (by converted one-line content)
+__find_deb822_files_by_pattern()
+{
+    local pattern="$1"
+    local i
+    for i in $APT_SOURCES_LIST_D/*.sources ; do
+        test -r "$i" || continue
+        __convert_deb822_to_oneline "$i" | grep -q -i -- "$pattern" && echo "$i"
+    done
+}
+
+# Disable repos in a deb822 .sources file (set Enabled: no)
+__deb822_disable()
+{
+    local file="$1"
+    if grep -q "^Enabled:" "$file" ; then
+        sudocmd sed -i -e 's/^Enabled:.*/Enabled: no/' "$file"
+    else
+        sudocmd sed -i -e '/^Types:/i Enabled: no' "$file"
+    fi
+}
+
+# Enable repos in a deb822 .sources file (remove Enabled: no)
+__deb822_enable()
+{
+    local file="$1"
+    sudocmd sed -i -e '/^Enabled:[[:space:]]*no/d' "$file"
+}
+
+# Remove a deb822 .sources file
+__deb822_remove()
+{
+    sudocmd rm -v "$1"
+}
+
+# Filter stdin by patterns (AND logic, case insensitive)
+# Supports glob (* ?) and exclusion (~pattern)
+# Usage: echo "$lines" | __filter_repos_list pattern1 pattern2 ~exclude
+__filter_repos_list()
+{
+    local i
+    [ -z "$*" ] && cat && return
+
+    # Check if this is a full repo line (rpm or deb) - use literal matching for the entire string
+    if echo "$1" | grep -q '^rpm\|^deb' && [ $# -eq 1 ] ; then
+        grep -F -i -- "$1"
+        return
+    fi
+
+    local list=""
+    local listN=""
+    for i in "$@" ; do
+        case "$i" in
+            ~*)
+                listN="$listN ${i#\~}"
+                ;;
+            *)
+                list="$list $i"
+                ;;
+        esac
+    done
+
+    # convert glob to regexp
+    list=$(__convert_glob__to_regexp "$list")
+    listN=$(__convert_glob__to_regexp "$listN")
+
+    listN=$(strip_spaces $listN | sed -e 's/ /|/g')
+
+    local result
+    result="$(cat)"
+
+    # exclude patterns
+    [ -n "$listN" ] && result="$(echo "$result" | grep -E -i -v -- "$listN")"
+
+    # include patterns (AND)
+    for i in $list ; do
+        result="$(echo "$result" | grep -E -i -- "$i")"
+    done
+
+    [ -n "$result" ] && echo "$result"
+}

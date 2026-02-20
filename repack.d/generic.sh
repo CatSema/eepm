@@ -1,4 +1,7 @@
 #!/bin/sh -x
+
+# Generic repack script. Called before special script.
+
 # It will run with two args: buildroot spec
 BUILDROOT="$1"
 SPEC="$2"
@@ -8,6 +11,11 @@ SUBGENERIC="$5"
 
 # firstly, pack $PRODUCTDIR if used
 . $(dirname $0)/common.sh
+
+# Security: reject packages containing .eepm.yaml (could be used for command injection)
+if find "$BUILDROOT" -name "*.eepm.yaml" 2>/dev/null | grep -q . ; then
+    fatal "Package contains .eepm.yaml file which is not allowed (security risk)"
+fi
 
 # commented out: conflicts with already installed package
 # drop %dir for existed system dirs
@@ -60,7 +68,7 @@ __get_icons_gnome_list()
 # drop forbidded paths
 # https://bugzilla.altlinux.org/show_bug.cgi?id=38842
 for i in / /etc /etc/init.d /etc/systemd /bin /opt /usr /usr/bin /usr/lib /usr/lib64 /usr/share /usr/share/doc /var /var/log /var/run \
-        /etc/cron.daily /usr/share/icons/usr/share/pixmaps /usr/share/man /usr/share/man/man1 /usr/share/appdata /usr/share/applications /usr/share/menu \
+        /etc/cron.daily /usr/share/pixmaps /usr/share/man /usr/share/man/man1 /usr/share/appdata /usr/share/applications /usr/share/menu \
         /usr/share/mime /usr/share/mime/packages /usr/share/icons \
         /usr/share/icons/gnome $(__get_icons_gnome_list) \
         /usr/share/icons/hicolor $(__get_icons_hicolor_list) ; do
@@ -87,6 +95,12 @@ for i in lib/python3 lib/python2.7 ; do
         subst "s|/usr/$i/dist-packages|/usr/$t/site-packages|" $SPEC
     fi
 done
+
+# move Debian multiarch lib paths to standard paths (not needed for deb target)
+if [ "$(epm print info -p)" != "deb" ] ; then
+    move_dir /usr/lib/x86_64-linux-gnu /usr/lib64
+    move_dir /usr/lib/i386-linux-gnu /usr/lib
+fi
 
 for i in $BUILDROOT/usr/bin/* ; do
     [ -L "$i" ] && continue
@@ -148,15 +162,10 @@ set_rpm_field()
 # FIXME: where is a source of the bug with empty Summary?
 summary="$(grep "^Summary: " $SPEC | sed -e "s|Summary: ||g" | head -n1)"
 [ -n "$summary" ] || set_rpm_field "Summary" "$PRODUCT (fixme: was empty Summary after alien)"
-# clean version
-subst "s|^\(Version: .*\)~.*|\1|" $SPEC
-# add our prefix to release
-subst "s|^Release: |Release: epm1.repacked.|" $SPEC
 set_rpm_field "Distribution" "EEPM"
 
-# TODO: check the yaml file!!!
 if [ -r "$PKG.eepm.yaml" ] ; then
-    eval $(epm tool yaml $PKG.eepm.yaml | grep -E '^(summary|description|upstream_file|upstream_url|url|appname|arch|group|license|version)=' ) #'
+    yaml_load_vars "$PKG.eepm.yaml" name summary description upstream_file upstream_url url appname arch group license version
     # for tarballs fix permissions
     chmod $verbose -R a+rX *
     [ -n "$name" ] && [ "$name" != "$PRODUCT" ] && warning "name $name in $PKG.eepm.yaml is not equal to PRODUCT $PRODUCT"
@@ -174,6 +183,16 @@ else
     [ -f "$exya" ] && warning "$PKG.eepm.yaml is missed, but $exya is exists"
     subst "s|^\((Converted from a\) \(.*\) \(package.*\)|(Repacked from binary \2 package with EPM $(epm --short --version))\n\1 \2 \3|" $SPEC
 fi
+
+# for appimage/tar: replace dash with tilde in version suffix (like -b1 -> ~b1) for correct version comparison
+# for rpm/deb: suffix is already in Release field
+version=$(grep "^Version:" $SPEC | sed 's/Version: //')
+if [ -n "$SUBGENERIC" ] && echo "$version" | grep -q '-' ; then
+    new_version=$(echo "$version" | sed 's/-/~/')
+    subst "s|^Version: $version|Version: $new_version|" $SPEC
+fi
+# add our prefix to release (preserves original release for rpm/deb)
+subst "s|^Release: |Release: epm1.repacked.|" $SPEC
 
 if ! grep "^%defattr" $SPEC ; then
     subst "s|^%files$|%files\n%defattr(-,root,root,755)|" $SPEC

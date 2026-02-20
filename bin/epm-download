@@ -188,7 +188,6 @@ __epm_print_url_alt_check()
     local tm
     tm="$(mktemp)" || fatal
     remove_on_exit $tm
-    assure_exists curl
     load_helper epm-site
     quiet=1
     local buildtime=$(paoapi packages/$pkg | get_pao_var buildtime)
@@ -208,7 +207,7 @@ __epm_print_url_alt_check()
 __epm_alt_get_package_url()
 {
     #sudocmd apt-get install -y --print-uris --reinstall "$pkg" | cut -f1 -d " " | grep ".rpm'$" | sed -e "s|^'||" -e "s|'$||"
-    sudocmd apt-get -y --force-yes --print-uris "$@" | grep -E -o -e "(ht|f)tp://[^\']+"
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y --force-yes --print-uris "$@" | grep -E -o -e "(https?|ftp)://[^']+"
 }
 
 
@@ -217,7 +216,7 @@ __epm_alt_download_to_cache()
 {
     if [ -n "$print_url" ] ; then
         __epm_alt_get_package_url "$@"
-        return
+        exit
     fi
 
     local urls="$(__epm_alt_get_package_url "$@")" || fatal "Can't get URL"
@@ -240,25 +239,25 @@ __epm_download_alt()
     fi
 
     load_helper epm-sh-altlinux
+    load_helper epm-installed
 
     # TODO: enable if install --download-only will works
-    if tasknumber "$@" >/dev/null ; then
-        load_helper epm-addrepo
-        load_helper epm-reposave
-        load_helper epm-removerepo
-        load_helper epm-Install
+    if is_taskarg "$@" ; then
+        load_helper epm-sh-backend
+        local task_numbers=""
+        local arg
+        for arg in "$@" ; do
+            local tn="$(get_tasknumber_from_arg "$arg")"
+            [ -n "$tn" ] && task_numbers="$task_numbers $tn"
+        done
 
         local installlist="$(get_task_packages $*)"
         installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
         [ -n "$verbose" ] && info 'Packages from task(s): $installlist'
 
-        try_change_alt_repo
-        epm_addrepo "$@"
-        epm update
-        [ -n "$verbose" ] && epm repo list
-        docmd epm download $print_url $installlist
-        epm_removerepo "$@"
-        end_change_alt_repo
+        __use_tmp_apt_for_tasks $task_numbers || return 1
+        [ -n "$verbose" ] && cat "$__EPM_APT_TMPDIR/sources.list"
+        epm_download $installlist
 
         return
     fi
@@ -270,6 +269,7 @@ __epm_download_alt()
 startwith_inlist()
 {
     local str="$1"
+    shift
     local i
     for i in "$@" ; do
         startwith "$str" "$i" && return
@@ -277,9 +277,15 @@ startwith_inlist()
     return 1
 }
 
-    # old systems ignore reinstall ?
+    # Split packages: --reinstall only works for already installed packages
+    separate_installed "$@"
+
+    local urls=""
+    [ -n "$pkg_noninstalled" ] && urls="$(__epm_alt_get_package_url install $pkg_noninstalled)"
+    [ -n "$pkg_installed" ] && urls="$urls $(__epm_alt_get_package_url install --reinstall $pkg_installed)"
+    [ -z "$urls" ] && return 1
     local url
-    for url in $(__epm_alt_get_package_url install --reinstall "$@") ; do
+    for url in $urls ; do
         startwith_inlist "$(basename "$url")" "$@" || continue
         [ -n "$print_url" ] && echo "$url" && continue
         # TODO: download together

@@ -1,5 +1,7 @@
 #!/bin/sh -x
 
+# Post script, called after special (or default) script.
+
 # It will run with two args: buildroot spec
 BUILDROOT="$1"
 SPEC="$2"
@@ -11,16 +13,32 @@ PKG="$4"
 # add libs requires (after all ignore_lib_requires calls)
 add_libs_requires
 
-# remove temp file used by ignore_lib_requires
+# remove temp files
 rm -f "$BUILDROOT/.eepm_ignore_lib_requires"
+rm -f "$BUILDROOT/.eepm_stop_libs_requires"
 
-# drop forbidded paths
+# remove forbidden paths owned by the filesystem package to avoid conflicts
 # https://bugzilla.altlinux.org/show_bug.cgi?id=38842
-for i in / /etc /etc/init.d /etc/systemd /bin /opt /usr /usr/bin /usr/lib /usr/lib64 /usr/share /usr/share/doc /var /var/log /var/run \
-        /etc/cron.daily /usr/share/icons/usr/share/pixmaps /usr/share/man /usr/share/man/man1 /usr/share/appdata /usr/share/applications /usr/share/menu \
-        /usr/share/mime /usr/share/mime/icons /usr/share/mime/packages /usr/share/icons \
-        /usr/share/icons/gnome \
-        /usr/share/icons/hicolor ; do
+for i in / /bin /sbin /opt \
+        /etc /etc/init.d /etc/systemd /etc/opt /etc/sysconfig /etc/default /etc/cron.daily \
+        /etc/xdg /etc/xdg/autostart \
+        /lib /lib64 /lib/systemd /lib/systemd/system \
+        /usr /usr/bin /usr/sbin /usr/lib /usr/lib64 /usr/libexec \
+        /usr/share /usr/share/doc /usr/share/fonts /usr/share/info /usr/share/sounds \
+        /usr/share/pixmaps /usr/share/man /usr/share/man/man1 /usr/share/appdata /usr/share/applications /usr/share/menu \
+        /usr/share/mime /usr/share/mime/icons /usr/share/mime/packages \
+        /usr/share/icons /usr/share/icons/gnome /usr/share/icons/hicolor \
+        /usr/share/icons/hicolor/16x16 /usr/share/icons/hicolor/16x16/apps \
+        /usr/share/icons/hicolor/32x32 /usr/share/icons/hicolor/32x32/apps \
+        /usr/share/icons/hicolor/48x48 /usr/share/icons/hicolor/48x48/apps \
+        /usr/share/polkit-1 /usr/share/polkit-1/actions /usr/share/polkit-1/rules.d \
+        /usr/share/dbus-1 /usr/share/dbus-1/system.d /usr/share/dbus-1/services /usr/share/dbus-1/system-services \
+        /usr/share/bash-completion /usr/share/bash-completion/completions \
+        /usr/share/fish /usr/share/fish/vendor_completions.d \
+        /usr/share/zsh /usr/share/zsh/site-functions \
+        /usr/share/licenses \
+        /usr/lib/systemd /usr/lib/systemd/system /usr/lib/sysusers.d \
+        /var /var/cache /var/lib /var/log /var/opt /var/run ; do
     sed \
         -e "s|/\./|/|" \
         -e "s|^%dir[[:space:]]\"$i/*\"$||" \
@@ -29,6 +47,7 @@ for i in / /etc /etc/init.d /etc/systemd /bin /opt /usr /usr/bin /usr/lib /usr/l
         -e "s|^$i/*$||" \
         < $SPEC > $SPEC.new
     diff -u $SPEC $SPEC.new || warning "There was some introduced system paths in the spec file"
+    mv $SPEC.new $SPEC
 done
 
 for DESKTOPFILE in $BUILDROOT/usr/share/applications/*.desktop ; do

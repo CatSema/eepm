@@ -68,6 +68,7 @@ __get_app_package()
 __get_resolved_app_package()
 {
     local basepkgname
+    local productalt
     local pkglist="$2"
 
     #if [ "$BASEDISTRNAME" != "alt" ] ; then
@@ -78,9 +79,22 @@ __get_resolved_app_package()
     basepkgname="$(grep -oP "^BASEPKGNAME=[\"']*\K[^\"']+" "$psdir/$1.sh")"
     # lithium construct PKGNAME
     [ -z "$basepkgname" ] && __get_app_package "$1" && return # || fatal "Missed both PKGNAME and BASEPKGNAME in the play script $1."
-    # fixme: space at the end?
+
+    # Check exact base package name first
     grep -o -m1 -E "^$basepkgname[ $]" $pkglist && return
-    grep -o -m1 -E "^$basepkgname-[a-z0-9-]*[ $]" $pkglist && return
+
+    # If PRODUCTALT is defined, check only those specific alternatives
+    productalt="$(grep -oP "^PRODUCTALT=[\"']*\K[^\"']+" "$psdir/$1.sh")"
+    if [ -n "$productalt" ] ; then
+        local alt
+        for alt in $productalt ; do
+            [ "$alt" = "''" ] && continue
+            grep -o -m1 -E "^$basepkgname-$alt[ $]" $pkglist && return
+        done
+    else
+        # Fallback: match any suffix (for scripts without PRODUCTALT)
+        grep -o -m1 -E "^$basepkgname-[a-z0-9-]*[ $]" $pkglist && return
+    fi
 }
 
 __list_all_packages()
@@ -254,8 +268,10 @@ Options:
     --remove <app>        - uninstall <app>
     --update [<app>|all]  - update <app> (or all installed apps) if there is new version
     --latest <app>        - forced to install the latest version of the application
+    --print-url <app>     - print download URL for the app (do not install)
     --list                - list all installed apps
     --list-all            - list all available apps
+    --search <pattern>    - search available apps by name or description
     --list-scripts        - list all available scripts
     --short (with --list) - list names only
     --installed <app>     - check if the app is installed
@@ -293,6 +309,11 @@ __epm_play_update()
             if ! __is_app_installed "$i" ; then
                 continue
             fi
+            local pkgname="$(__get_app_package "$i")"
+            if [ -n "$pkgname" ] && epm mark checkhold "$pkgname" 2>/dev/null ; then
+                info "Skipping $i: package $pkgname is on hold"
+                continue
+            fi
         prescription="$i"
         if ! has_play_script $prescription ; then
             warning "Can't find executable play script for $prescription. Try epm play --remove $prescription if you don't need it anymore."
@@ -317,7 +338,19 @@ __epm_play_install_one()
     else
         local opsdir=$psdir
         psdir=$prsdir
-        has_play_script "$prescription" || fatal "We have no idea how to play $prescription (checked in $opsdir and $prsdir)"
+        if ! has_play_script "$prescription" ; then
+            psdir=$opsdir
+            echo "Unknown app '$prescription'." >&2
+            [ -n "$verbose" ] && echo "Checked in $opsdir and $prsdir" >&2
+            local selected
+            selected="$(__epm_play_suggest_similar_apps "$prescription")"
+            if [ -n "$selected" ] ; then
+                info "Installing selected: $selected"
+                __epm_play_install_one "$selected" "$@"
+                return $?
+            fi
+            return 1
+        fi
         __epm_play_run "$prescription" --run "$@" || fatal "There was some error during run $prescription script."
     fi
 }
@@ -404,6 +437,22 @@ __epm_play_install()
    local i RES
    RES=0
 
+   # Handle --installed flag when passed after app name (e.g., "epm play app --installed")
+   local has_installed=0
+   for i in $* ; do
+       [ "$i" = "--installed" ] && has_installed=1 && break
+   done
+
+   if [ "$has_installed" = "1" ] ; then
+       local RES=0
+       while [ -n "$1" ] ; do
+           [ "$1" = "--installed" ] && break
+           __is_app_installed "$1" || RES=1
+           shift
+       done
+       return $RES
+   fi
+
    load_helper epm-check_updated_repo
 
    update_repo_if_needed
@@ -427,15 +476,23 @@ __epm_play_install()
        esac
        local p="$1"
        local v=''
-       # drop spaces
+       local r=''
+       # drop spaces (disable glob to protect *)
+       set -f
        n="$(echo $2)"
+       set +f
        if [ "$n" = "=" ] ; then
            v="$3"
+           # split version-release (last - separates release)
+           if echo "$v" | grep -q '-' ; then
+               r="${v##*-}"
+               v="${v%-*}"
+           fi
            shift 3
        else
            shift
        fi
-       __epm_play_install_one "$p" "$v" $options || RES=1
+       __epm_play_install_one "$p" "$v" "$r" $options || RES=1
    done
 
    return $RES
@@ -472,7 +529,7 @@ __epm_play_initialize_ipfs()
 
     # download and merge with local db
     local t
-    t=$(mktemp) || fatal
+    t=$(mktemp -u) || fatal
     remove_on_exit $t
     __epm_play_download_epm_file "$t" "eget-ipfs-db.txt" || warning "Can't update IPFS DB"
     if [ -s "$t" ] && [ -z "$EPM_IPFS_DB_UPDATE_SKIPPING" ] ; then
@@ -596,6 +653,13 @@ case "$1" in
         exit
         ;;
 
+    --search)
+        shift
+        [ -n "$1" ] || fatal "Search pattern is required"
+        __epm_play_search "$1"
+        exit
+        ;;
+
     --list-scripts)
         [ -n "$short" ] || [ -n "$quiet" ] || echo "Run with a name of a play script to run:"
         __epm_play_list $prsdir
@@ -610,8 +674,13 @@ case "$1" in
         shift
         export latest="true"
         ;;
+    --print-url)
+        shift
+        export EPM_OPTIONS="$EPM_OPTIONS --print-url"
+        ;;
     -*)
-        fatal "Unknown option $1"
+        opt="$1"
+        fatal 'Unknown option $opt'
         ;;
      *)
         break

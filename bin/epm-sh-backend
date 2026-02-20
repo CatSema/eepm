@@ -1,0 +1,261 @@
+#!/bin/sh
+#
+# Copyright (C) 2012-2020, 2025  Etersoft
+# Copyright (C) 2012-2020, 2025  Vitaly Lipatov <lav@etersoft.ru>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
+
+# Check if args contain backend:package syntax (snap:pkg, nix:pkg)
+__has_backend_syntax()
+{
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z]*:'
+}
+
+# Check if args contain repo/package syntax (p10/pkg, sisyphus/pkg)
+__has_repo_syntax()
+{
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9]*/'
+}
+
+__get_tpmtype() {
+    local arg="$1"
+    local tpmtype="$(echo "$arg" | cut -d: -f1)"
+
+    # need first three chars
+    echo "$arg" | grep -q "^[a-z][a-z][a-z-]*:" || return
+
+    # aliases
+    [ "$tpmtype" = "pkcon" ] && tpmtype="packagekit"
+    # use same suffix as current PMTYPE for ambiguous backends
+    [ "$tpmtype" = "apt" ] && tpmtype="apt-${PMTYPE#*-}"
+
+    echo "$VALID_BACKENDS" | tr ' ' '\n' | grep -w "^$tpmtype" | head -1
+}
+
+# TODO: get list
+VALID_BRANCH="p8 p9 p10 p11 Sisyphus c10f2"
+
+__get_repo_name() {
+    local arg="$1"
+    local trepo="$(echo "$arg" | cut -d/ -f1)"
+
+    # ALT Linux branches
+    [ "$trepo" = "sisyphus" ] && trepo="Sisyphus"
+    [ "$trepo" = "SS" ] && trepo="Sisyphus"
+    [ "$trepo" = "archive" ] && repo="archive $(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
+
+    # Fedora Copr: copr/owner/project/package
+    if [ "$trepo" = "copr" ] ; then
+        repo="copr/$(echo "$arg" | cut -d/ -f2)/$(echo "$arg" | cut -d/ -f3)"
+        name="$(echo "$arg" | cut -d/ -f4)"
+        return
+    fi
+
+    trepo="$(echo "$VALID_BRANCH" | tr ' ' '\n' | grep -w "^$trepo")"
+    [ -n "$trepo" ] && repo="$trepo" && name=$(echo "$arg" | cut -d/ -f2) && return
+
+    # Arch Linux AUR
+    if [ "$(echo "$arg" | cut -d/ -f1)" = "aur" ] && [ "$PMTYPE" = "pacman" ] ; then
+        repo="aur"
+        name=$(echo "$arg" | cut -d/ -f2)
+    fi
+}
+
+# call: __process_backend_arguments <function> args...
+__process_backend_arguments() {
+    local func="$1"
+    shift
+    local pmtype
+    local name
+    local arg
+    local package_groups
+    declare -A package_groups
+    for arg in "$@"; do
+        pmtype=$PMTYPE
+        name="$arg"
+        case "$arg" in
+            *:*)
+                local tpmtype="$(__get_tpmtype "$arg")"
+                if [ -n "$tpmtype" ] ; then
+                    pmtype=$tpmtype
+                    # copied from distr_info
+                    if [ "$pmtype" = "dnf-rpm" ] && a= dnf --version | grep -qi "dnf5" ; then
+                        pmtype="dnf5-rpm"
+                    fi
+                    name=$(echo "$arg" | cut -d: -f2)
+                fi
+                ;;
+        esac
+        package_groups["$pmtype"]+="$name "
+    done
+
+    for pmtype in "${!package_groups[@]}"; do
+        (PMTYPE="$pmtype" PPARGS=1 $func ${package_groups[$pmtype]})
+    done
+}
+
+# Generate sources.list content for a given ALT branch
+# Usage:
+#   __generate_alt_sourceslist <branch>                    - for branch (p10, Sisyphus, c10f2, ...)
+#   __generate_alt_sourceslist archive <branch> <datestr>  - for archive repo
+__generate_alt_sourceslist()
+{
+    local baseurl
+    local repopart
+    local repolo
+
+    if [ "$1" = "archive" ] ; then
+        local archbranch="$2"
+        local datestr="$3"
+        repolo="$(echo "$archbranch" | tr "[:upper:]" "[:lower:]")"
+        baseurl="http://ftp.altlinux.org/pub/distributions"
+        repopart="archive/$repolo/date/$datestr"
+    else
+        local repo="$1"
+        repolo="$(echo "$repo" | tr "[:upper:]" "[:lower:]")"
+        baseurl="http://ftp.basealt.ru/pub/distributions"
+        [ "$repolo" = "sisyphus" ] && repopart="Sisyphus" || repopart="$repo/branch"
+        repopart="ALTLinux/$repopart"
+    fi
+
+    # sign logic from __get_sign in epm-addrepo
+    local sign=""
+    if rhas "$repolo" "^c[0-9]" ; then
+        sign="[cert8]"
+    else
+        [ "$repolo" = "sisyphus" ] && local signname="alt" || local signname="$repolo"
+        # alt c* distr has no alt vendor
+        rhas "$DISTRVERSION" "^c[0-9]" || sign="[$signname]"
+    fi
+
+    local arch
+    for arch in noarch $DISTRARCH ; do
+        echo "rpm $sign $baseurl $repopart/$arch classic"
+    done
+    case $DISTRARCH in
+        x86_64)
+            echo "rpm $sign $baseurl $repopart/x86_64-i586 classic"
+            ;;
+    esac
+}
+
+# Create a temporary APT directory for isolated repo operations
+__setup_tmp_apt_dir()
+{
+    __EPM_APT_TMPDIR="$(mktemp -d)" || fatal
+    remove_on_exit "$__EPM_APT_TMPDIR"
+    mkdir -p "$__EPM_APT_TMPDIR/lists/partial" "$__EPM_APT_TMPDIR/sourceparts"
+    cat > "$__EPM_APT_TMPDIR/apt.conf" <<EOF
+Dir::Etc::sourcelist "$__EPM_APT_TMPDIR/sources.list";
+Dir::Etc::sourceparts "$__EPM_APT_TMPDIR/sourceparts";
+Dir::State::lists "$__EPM_APT_TMPDIR/lists";
+Dir::Cache::pkgcache "$__EPM_APT_TMPDIR/pkgcache.bin";
+Dir::Cache::srcpkgcache "$__EPM_APT_TMPDIR/srcpkgcache.bin";
+EOF
+    __EPM_APT_REPO_OPTIONS="-c $__EPM_APT_TMPDIR/apt.conf"
+}
+
+# Output current system sources.list content to stdout
+__get_system_sourceslist()
+{
+    cat /etc/apt/sources.list 2>/dev/null
+    local f
+    for f in /etc/apt/sources.list.d/*.list ; do
+        [ -s "$f" ] || continue
+        cat "$f"
+    done
+}
+
+# Generate sources.list entries for ALT task repos
+# args: task_number [task_number ...]
+__generate_task_sourceslist()
+{
+    local tn
+    for tn in "$@" ; do
+        local url="https://git.altlinux.org/tasks/$tn/build/repo"
+        url="$(eget --get-real-url "$url")" || { warning "Can't access task $tn repo" ; continue ; }
+        local arch
+        for arch in noarch $DISTRARCH $([ "$DISTRARCH" = "x86_64" ] && echo "x86_64-i586") ; do
+            eget --check-url "$url/$arch/base/" 2>/dev/null || continue
+            local rd="$(eget --list "$url/$arch/RPMS.*" 2>/dev/null)"
+            [ -n "$rd" ] || continue
+            local comp="$(echo "$rd" | sed -e 's|/*$||' -e 's|.*\.||')"
+            [ "$comp" = "*" ] && continue
+            echo "rpm $url $arch $comp"
+        done
+    done
+}
+
+# Setup temporary APT directory with branch repo and run update
+# args: same as __generate_alt_sourceslist
+__use_tmp_apt_for_branch()
+{
+    load_helper epm-update
+    __setup_tmp_apt_dir
+    __generate_alt_sourceslist "$@" > "$__EPM_APT_TMPDIR/sources.list"
+    __epm_update || { warning "Failed to update package index for $1" ; return 1 ; }
+}
+
+# Setup temporary APT directory with system repos + task repos and run update
+# args: task_number [task_number ...]
+__use_tmp_apt_for_tasks()
+{
+    load_helper epm-update
+    __setup_tmp_apt_dir
+    { __get_system_sourceslist ; __generate_task_sourceslist "$@" ; } > "$__EPM_APT_TMPDIR/sources.list"
+    # tolerate partial failures (some system repos may have broken GPG keys etc.)
+    __epm_update || warning "Some repos failed to update, but continuing anyway"
+}
+
+# call: __process_repo_arguments <function> args...
+__process_repo_arguments() {
+    local func="$1"
+    shift
+    local repo
+    local name
+    local arg
+    local repo_groups
+    declare -A repo_groups
+    for arg in "$@"; do
+        repo="."
+        name="$arg"
+        case "$arg" in
+            */*)
+                __get_repo_name "$arg"
+                ;;
+        esac
+        repo_groups["$repo"]+="$name "
+    done
+
+    for repo in "${!repo_groups[@]}"; do
+        if [ "$repo" = '.' ] ; then
+            (PPARGS=1 $func ${repo_groups[$repo]})
+        elif [ "$repo" = 'aur' ] ; then
+            # Arch Linux AUR
+            (PMTYPE=aur-pacman PPARGS=1 $func ${repo_groups[$repo]})
+        elif startwith "$repo" "copr/" ; then
+            # Fedora Copr: enable repo, then install
+            epm repo add "$repo"
+            epm update
+            (PPARGS=1 $func ${repo_groups[$repo]})
+        else
+            # ALT Linux: use temporary APT directory instead of modifying system repos
+            __use_tmp_apt_for_branch "$repo" || return 1
+            (PPARGS=1 $func ${repo_groups[$repo]})
+        fi
+    done
+}

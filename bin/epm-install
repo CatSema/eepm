@@ -19,9 +19,9 @@
 
 load_helper epm-sh-altlinux
 load_helper epm-sh-install
+load_helper epm-sh-backend
 load_helper epm-query
 load_helper epm-assure
-load_helper epm-repack
 load_helper epm-requires
 load_helper epm-check_updated_repo
 load_helper epm-sh-warmup
@@ -65,111 +65,20 @@ __separate_sudocmd()
     return 0
 }
 
-VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
-__get_tpmtype() {
-    local arg="$1"
-    local tpmtype="$(echo "$arg" | cut -d: -f1)"
-
-    # need first three chars
-    echo "$arg" | grep -q "^[a-z][a-z][a-z-]*:" || return
-
-    echo "$VALID_BACKENDS" | tr ' ' '\n' | grep -w "^$tpmtype"
-}
-
-# TODO: get list
-VALID_BRANCH="p8 p9 p10 p11 Sisyphus c10f2"
-__set_repo_name() {
-    local arg="$1"
-    local trepo="$(echo "$arg" | cut -d/ -f1)"
-
-    [ "$trepo" = "sisyphus" ] && trepo="Sisyphus"
-    [ "$trepo" = "SS" ] && trepo="Sisyphus"
-    [ "$trepo" = "archive" ] && repo="archive $(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
-
-    trepo="$(echo "$VALID_BRANCH" | tr ' ' '\n' | grep -w "^$trepo")"
-    [ -n "$trepo" ] && repo="$trepo" && name=$(echo "$arg" | cut -d/ -f2)
-}
-
-
-process_package_arguments() {
-    local pmtype
-    local name
-    local arg
-    local package_groups
-    declare -A package_groups
-    for arg in "$@"; do
-        pmtype=$PMTYPE
-        name="$arg"
-        case "$arg" in
-            *:*)
-                local tpmtype="$(__get_tpmtype "$arg")"
-                if [ -n "$tpmtype" ] ; then
-                    pmtype=$tpmtype
-                    # copied from distr_info
-                    if [ "$pmtype" = "dnf-rpm" ] && a= dnf --version | grep -qi "dnf5" ; then
-                        pmtype="dnf5-rpm"
-                    fi
-                    name=$(echo "$arg" | cut -d: -f2)
-                fi
-                ;;
-        esac
-        package_groups["$pmtype"]+="$name "
-    done
-
-    for pmtype in "${!package_groups[@]}"; do
-        (PMTYPE="$pmtype" PPARGS=1 epm_install_names ${package_groups[$pmtype]})
-    done
-}
-
-
-process_repo_arguments() {
-    local repo
-    local name
-    local arg
-    local repo_groups
-    declare -A repo_groups
-    for arg in "$@"; do
-        repo="."
-        name="$arg"
-        case "$arg" in
-            */*)
-                __set_repo_name "$arg"
-                ;;
-        esac
-        repo_groups["$repo"]+="$name "
-    done
-
-    for repo in "${!repo_groups[@]}"; do
-        if [ "$repo" = '.' ] ; then
-            (PPARGS=1 epm_install_names ${repo_groups[$repo]})
-        else
-            load_helper epm-update
-            load_helper epm-reposave
-            try_change_alt_repo
-            docmd epm --auto repo set $repo
-            __epm_update
-            (PPARGS=1 epm_install_names ${repo_groups[$repo]})
-            docmd epm repo restore
-            end_change_alt_repo
-        fi
-    done
-}
-
-
 # copied from etersoft-build-utils/share/eterbuild/functions/rpmpkg
 epm_install_names()
 {
     [ -z "$1" ] && return
 
-    # check some like nix: prefix, PPARGS for stop possible recursion. TODO
-    if echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z]*:' && [ -z "$PPARGS" ] ; then
-        process_package_arguments "$@"
+    # check backend:package syntax (snap:pkg, nix:pkg)
+    if __has_backend_syntax "$@" ; then
+        __process_backend_arguments epm_install_names "$@"
         return
     fi
 
-    # check some like repo/package, PPARGS for stop possible recursion. TODO
-    if echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9]*/' && [ -z "$PPARGS" ] ; then
-        process_repo_arguments "$@"
+    # check repo/package syntax (p10/pkg, sisyphus/pkg)
+    if __has_repo_syntax "$@" ; then
+        __process_repo_arguments epm_install_names "$@"
         return
     fi
 
@@ -210,8 +119,20 @@ epm_install_names()
                 __epm_alt_download_to_cache $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
             fi
 
-            sudocmd apt-get $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@ && save_installed_packages $@
-            return ;;
+            sudocmd apt-get $__EPM_APT_REPO_OPTIONS $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
+            local res=$?
+            if [ "$res" = 0 ] ; then
+                save_installed_packages $@
+            elif [ "$res" = 100 ] ; then
+                local selected
+                selected="$(__epm_suggest_similar_packages_by_list $@)"
+                if [ -n "$selected" ] ; then
+                    info "Installing selected: $selected"
+                    epm_install_names $selected
+                    return $?
+                fi
+            fi
+            return $res ;;
         apm-rpm)
             sudocmd apm system install $@
             local res=$?
@@ -243,6 +164,10 @@ epm_install_names()
             return ;;
         pacman)
             sudocmd pacman -S $nodeps $@
+            return ;;
+        aur-pacman)
+            load_helper epm-install-arch
+            __epm_install_from_aur $@
             return ;;
         yay)
             docmd yay $nodeps $@
@@ -336,11 +261,31 @@ epm_ni_install_names()
 
     case $PMTYPE in
         apt-rpm)
-            sudocmd apt-get -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            return ;;
+            sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
+            local res=$?
+            if [ "$res" = 100 ] ; then
+                local selected
+                selected="$(__epm_suggest_similar_packages_by_list $@)"
+                if [ -n "$selected" ] ; then
+                    info "Installing selected: $selected"
+                    epm_ni_install_names $selected
+                    return $?
+                fi
+            fi
+            return $res ;;
         apt-dpkg)
             sudocmd env ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive apt-get -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            return ;;
+            local res=$?
+            if [ "$res" = 100 ] ; then
+                local selected
+                selected="$(__epm_suggest_similar_packages_by_list $@)"
+                if [ -n "$selected" ] ; then
+                    info "Installing selected: $selected"
+                    epm_ni_install_names $selected
+                    return $?
+                fi
+            fi
+            return $res ;;
         apm-rpm)
             sudocmd apm system install $@
             return ;;
@@ -374,6 +319,10 @@ epm_ni_install_names()
             return ;;
         pacman)
             sudocmd pacman -S --noconfirm $nodeps $@
+            return ;;
+        aur-pacman)
+            load_helper epm-install-arch
+            __epm_ni_install_from_aur $@
             return ;;
         yay)
             docmd yay --noconfirm $nodeps $@
@@ -488,12 +437,13 @@ epm_install_files()
         epm_install_names $files
         return
     elif is_dirpath "$1" && [ ! -f "$1" ] ; then
-        fatal "Can't install non-existent file '$1'"
+        file="$1"
+        fatal 'Can not install non-existent file $file'
     fi
 
-    # TODO: check read permissions
-    # sudo test -r FILE
-    # do not fallback to install_names if we have no permissions
+    # repack and install if there are packages not in native format
+    __epm_repack_if_needed $files && return
+
     case "$BASEDISTRNAME" in
         "alt")
             load_helper epm-install-alt
@@ -584,10 +534,10 @@ epm_install_files()
 epm_install()
 {
     if [ "$BASEDISTRNAME" = "alt" ] ; then
-        if tasknumberprefix $pkg_names; then
+        if is_taskarg $pkg_names; then
             load_helper epm-install-alt
             if [ -n "$interactive" ] ; then
-                confirm_info "You are about to install $pkg_names task(s) from https://git.altlinux.org."
+                confirm_info 'You are about to install $pkg_names task(s) from https://git.altlinux.org.'
             fi
             epm_install_alt_tasks $pkg_names
             return
@@ -597,17 +547,23 @@ epm_install()
            echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/archive/done/_[0-9]+/[0-9]+/*$" ; then
             load_helper epm-install-alt
             local task="$(basename "$pkg_urls")"
+            local taskurl="$(dirname "$pkg_urls")"
             pkg_urls=""
             if [ -n "$interactive" ] ; then
-                confirm_info "You are about to install $task task from $(dirname "$pkg_urls")."
+                confirm_info 'You are about to install task $task from $taskurl.'
             fi
             epm_install_alt_tasks "$task"
             return
         fi
     fi
 
+    if [ -n "$update_repo" ] ; then
+        load_helper epm-update
+        epm_update || { [ -n "$force" ] || return ; }
+    fi
+
     if [ -n "$manual_requires" ] ; then
-        local pkg_names="$pkg_names $(short=1 epm_requires $pkg_names)"
+        local pkg_names="$pkg_names $(docmd epm requires --short $pkg_names)"
     fi
 
     if [ -n "$show_command_only" ] ; then
@@ -619,7 +575,8 @@ epm_install()
     fi
 
     if [ -n "$interactive" ] && [ -n "$pkg_names$pkg_files$pkg_urls" ] ; then
-        confirm_info "You are about to install $(echo $pkg_names $pkg_files $pkg_urls) package(s)."
+        local pkgs="$pkg_names $pkg_files $pkg_urls"
+        confirm_info 'You are about to install $pkgs package(s).'
         # TODO: for some packages with dependencies apt will ask later again
     fi
 
@@ -679,8 +636,8 @@ epm_install()
 
     if [ -n "$repack" ] ; then
         # repack binary files if asked
-        __epm_repack $files || return
-        files="$repacked_pkgs"
+        epm repack --install $files
+        return
     fi
 
     epm_install_files $files

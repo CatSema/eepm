@@ -18,120 +18,119 @@
 #
 
 load_helper epm-sh-altlinux
+load_helper epm-sh-repo
+
+epm_repolist_help()
+{
+    message 'epm repo list - list package repositories
+Usage: epm repo list [options] [pattern]'
+    echo ''
+    echog 'Options:'
+    get_help HELPOPT $SHAREDIR/epm-repolist
+}
+
+# Output apt sources lines from one file
+# Usage: __cat_apt_sources_list grep_pattern file
+__cat_apt_sources_list()
+{
+    local pattern="$1"
+    local file="$2"
+    test -r "$file" || return
+    if echo "$file" | grep -q '\.sources$' ; then
+        __convert_deb822_to_oneline "$file" | grep -- "$pattern" | grep -v -- "^ *\$"
+    else
+        grep -- "$pattern" "$file" | grep -v -- "^ *\$"
+    fi
+}
 
 __print_apt_sources_list()
 {
-    local grepflags="$1"
-    local regexp="$2"
-    shift 2
     local i
-    local res=1
-    [ -n "$regexp" ] || res=0
-    for i in $@ ; do
-        test -r "$i" || continue
-        grep -v -- "^.*#" $i
-    done | grep -v -- "^ *\$" | grep $grepflags "$regexp" && res=0
-    return $res
+    for i in "$@" ; do
+        __cat_apt_sources_list "^[^#]*rpm" "$i"
+    done
 }
 
 __print_apt_sources_list_full()
 {
-    local grepflags="$1"
-    local regexp="$2"
-    shift 2
     local i
-    local res=1
-    [ -n "$regexp" ] || res=0
-    for i in $@ ; do
-        test -r "$i" || continue
-        grep -- "^[[:space:]]*#*[[:space:]]*rpm" $i
-    done | grep -v -- "^ *\$" | grep $grepflags "$regexp" && res=0
-    return $res
-}
-
-# TODO: remove
-# print lists with active values
-__print_apt_sources_list_list()
-{
-    local i
-    for i in $@ ; do
-        test -r "$i" || continue
-        grep -v -- "^.*#" $i | grep -v -- "^ *\$" | grep -q . && echo "$i"
+    for i in "$@" ; do
+        __cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*rpm" "$i"
     done
 }
 
-__info_cyan()
+__print_apt_sources_list_disabled()
 {
-        set_boldcolor $CYAN
-        echo "$*" >&2
-        restore_color
+    local i
+    for i in "$@" ; do
+        __cat_apt_sources_list "^[[:space:]]*#[[:space:]]*rpm" "$i"
+    done
 }
 
+__print_file_header()
+{
+    set_boldcolor $CYAN
+    echo "$1:" >&2
+    restore_color
+}
+
+# repo_filter_patterns is set by print_apt_sources_list
 __print_apt_sources_list_verbose()
 {
-    local grepflags="$1"
-    local regexp="$2"
-    shift 2
-    local i
-    local res=1
-    [ -n "$regexp" ] || res=0
-    for i in $@ ; do
-        test -r "$i" || continue
-        grep -v -- "^.*#" $i | grep -v -- "^ *\$" | grep -q . && __info_cyan "$i:" || continue
-        grep -v -- "^.*#" $i | grep -v -- "^ *\$" | sed -e 's|^|    |' | grep $grepflags --color "$regexp" && res=0
+    local i content
+    for i in "$@" ; do
+        content="$(__cat_apt_sources_list "^[^#]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        [ -n "$content" ] || continue
+        __print_file_header "$i"
+        echo "$content" | sed -e 's|^|    |'
     done
-    return $res
 }
 
 __print_apt_sources_list_verbose_full()
 {
-    local grepflags="$1"
-    local regexp="$2"
-    shift 2
-    local i
-    local res=1
-    [ -n "$regexp" ] || res=0
-    for i in $@ ; do
-        test -r "$i" || continue
-        grep -- "^[[:space:]]*#*[[:space:]]*rpm" $i | grep -v -- "^ *\$" | grep -q . && echo && __info_cyan "$i:" || continue
-        grep -- "^[[:space:]]*#*[[:space:]]*rpm" $i | grep -v -- "^ *\$" | sed -e 's|^|    |' -e "s|\(.*#.*\)|$(set_color $WHITE)\1$(restore_color)|" | grep $grepflags --color "$regexp" && res=0
+    local i content
+    for i in "$@" ; do
+        content="$(__cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        [ -n "$content" ] || continue
+        __print_file_header "$i"
+        # highlight commented lines
+        echo "$content" | sed -e 's|^|    |' -e "s|^\(    #.*\)|$(set_color $WHITE)\1$(restore_color)|"
     done
-    return $res
+}
+
+__print_apt_sources_list_verbose_disabled()
+{
+    local i content
+    for i in "$@" ; do
+        content="$(__cat_apt_sources_list "^[[:space:]]*#[[:space:]]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        [ -n "$content" ] || continue
+        __print_file_header "$i"
+        echo "$content" | sed -e 's|^|    |'
+    done
 }
 
 print_apt_sources_list()
 {
-    local LISTS='/etc/apt/sources.list /etc/apt/sources.list.d/*.list'
-
-    local flagall=''
-    if [ "$1" = "-a" ] || [ "$1" = "--all" ] ; then
-        flagall='--all'
-        shift
-    fi
-
-    local wc="$*"
-    local grepflags=""
-    if echo "$wc" | grep -q -E "^(deb|rpm) " ; then
-        grepflags="-F"
-    else
-        echo "$wc" | grep -q "\.[*?]" && warning "Only glob symbols * and ? are supported. Don't use regexp here!"
-        wc="$(__convert_glob__to_regexp "$wc")"
-        grepflags="-E"
-    fi
-
-    if [ -n "$flagall" ] ; then
-        if [ -n "$quiet" ] ; then
-            __print_apt_sources_list_full "$grepflags" "$wc" $LISTS
-        else
-            __print_apt_sources_list_verbose_full "$grepflags" "$wc" $LISTS
-        fi
-        return
-    fi
+    local LISTS="$APT_ALL_SOURCES_LIST"
+    # flagall, flagdisabled are set by epm_repolist()
 
     if [ -n "$quiet" ] ; then
-        __print_apt_sources_list "$grepflags" "$wc" $LISTS
+        if [ -n "$flagall" ] ; then
+            __print_apt_sources_list_full $LISTS | __filter_repos_list "$@"
+        elif [ -n "$flagdisabled" ] ; then
+            __print_apt_sources_list_disabled $LISTS | __filter_repos_list "$@"
+        else
+            __print_apt_sources_list $LISTS | __filter_repos_list "$@"
+        fi
     else
-        __print_apt_sources_list_verbose "$grepflags" "$wc" $LISTS
+        repo_filter_patterns="$*"
+        if [ -n "$flagall" ] ; then
+            __print_apt_sources_list_verbose_full $LISTS
+        elif [ -n "$flagdisabled" ] ; then
+            __print_apt_sources_list_verbose_disabled $LISTS
+        else
+            __print_apt_sources_list_verbose $LISTS
+        fi
     fi
 }
 
@@ -139,17 +138,37 @@ print_apt_sources_list()
 epm_repolist()
 {
 
+flagall=''
+flagdisabled=''
+
+while [ -n "$1" ] ; do
+    case "$1" in
+        -h|--help)            # HELPOPT: show this help
+            epm_repolist_help
+            return
+            ;;
+        -a|--all)             # HELPOPT: show all repos (including disabled/commented)
+            flagall=1
+            ;;
+        -d|--disabled)        # HELPOPT: show only disabled (commented) repos
+            flagdisabled=1
+            ;;
+        --regex|--regexp)     # HELPOPT: use pattern as raw regex (no glob conversion)
+            # handled globally in epm via $regexp variable
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
 # TODO
 [ -z "$*" ] || [ "$PMTYPE" = "apt-rpm" ] || [ "$PMTYPE" = "apm-rpm" ] || [ "$PMTYPE" = "apt-dpkg" ] || fatal "No arguments are allowed here"
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        if tasknumber "$1" >/dev/null ; then
-            # FIXME: unexpectedly, a list of packages instead of repositories.
-            get_task_packages "$@"
-        else
-            print_apt_sources_list "$@"
-        fi
+        print_apt_sources_list "$@"
         ;;
     deepsolver-rpm)
         docmd ds-conf

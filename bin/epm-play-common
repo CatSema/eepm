@@ -75,7 +75,8 @@ __epm_play_run()
     [ -n "$debug" ] && bashopt='-x'
     #info "Running $($script --description 2>/dev/null) ..."
     [ "$PROGDIR" = "/usr/bin" ] && SCPATH="$PATH" || SCPATH="$PROGDIR:$PATH"
-    ( export EPM_OPTIONS="$EPM_OPTIONS $addopt" export PATH=$SCPATH ; docmd $CMDSHELL $bashopt $script "$@" )
+    showcmd $script "$@"
+    ( export EPM_OPTIONS="$EPM_OPTIONS $addopt" export PATH=$SCPATH ; $CMDSHELL $bashopt $script "$@" )
 }
 
 
@@ -119,6 +120,46 @@ __get_fast_int_list_app()
     [ "$arch" = "x86_64" ] && IGNOREi586='NoNo' || IGNOREi586='i586-'
     grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" $psdir/*.sh | xargs grep -oP "^DESCRIPTION=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1$RIFS|" | grep -v -E "(^$IGNOREi586|^common|#.*$)"
 }
+
+# Suggest similar apps using fzf fuzzy search
+# Args: app_name
+# Returns: selected app name (if interactive) or empty
+__epm_play_suggest_similar_apps()
+{
+    local app="$1"
+    local arch="$SYSTEMARCH"
+    local count="${suggest_count:-7}"
+
+    # need fzf for fuzzy search
+    is_command fzf || return 1
+
+    local list
+    list="$(__get_fast_short_list_app $arch)"
+    [ -z "$list" ] && return 1
+
+    [ -n "$verbose" ] && showcmd fzf -i -f "$app"
+    local similar
+    similar="$(echo "$list" | fzf -i -f "$app" 2>/dev/null | head -$count)"
+    [ -z "$similar" ] && return 1
+
+    # Interactive selection if enabled (via config or --interactive flag)
+    if [ -n "$suggest_interactive$interactive" ] && inputisatty ; then
+        local selected
+        selected="$(echo "$similar" | fzf --prompt="$(eval_gettext "Select app"): " --height=10 --reverse)"
+        if [ -n "$selected" ] ; then
+            echo "$selected"
+            return 0
+        fi
+        return 1
+    fi
+
+    # Non-interactive: just show suggestions (to stderr)
+    echo "" >&2
+    echog "Perhaps you meant:" >&2
+    echo "$similar" | sed 's/^/  /' >&2
+    return 1
+}
+
 
 __epm_play_list()
 {
@@ -165,5 +206,17 @@ __epm_play_list()
                 fi
             done
         fi
+    done
+}
+
+
+__epm_play_search()
+{
+    local pattern="$1"
+    local arch="$SYSTEMARCH"
+    local RIFS=$'\x1E'
+
+    __get_fast_int_list_app $arch | grep -i "$pattern" | while IFS=$'\x1E' read -r app desc; do
+        printf "  %-25s - %s\n" "$app" "$desc"
     done
 }

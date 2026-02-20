@@ -109,11 +109,13 @@ __epm_print_warning_for_nonalt_packages()
         fi
 
         if epm_status_thirdparty "$i" ; then
+            [ "$allow_thirdparty_install" = "0" ] && fatal "Installing package $i from third-party source is forbidden by allow_thirdparty_install=0 in $CONFIGDIR/eepm.conf"
             warning '%%% You are trying install package $i from third-party software source. Use it at your own risk. %%%'
             continue
         fi
 
         if ! epm_status_original "$i" ; then
+            [ "$allow_thirdparty_install" = "0" ] && fatal "Installing package $i not from official repository is forbidden by allow_thirdparty_install=0 in $CONFIGDIR/eepm.conf"
             warning '%%% You are trying install package $i not from official $DISTRNAME/$DISTRVERSION repository. Use it at your own risk. %%%'
             continue
         fi
@@ -169,5 +171,17 @@ __epm_check_vendor()
         warning 'Scripts are DISABLED for package $bi from outside vendor $vendor. Use --scripts if you need run scripts from such packages.'
         noscripts="--noscripts"
     done
+}
+
+# Check if all packages are in native format, repack and install if not
+# Returns 1 if no repack needed, otherwise exec to epm repack --install
+__epm_repack_if_needed()
+{
+    local f
+    for f in "$@" ; do
+        [ "$(get_package_type "$f")" = "$PKGFORMAT" ] && continue
+        docmd exec epm repack --install "$@"
+    done
+    return 1
 }
 

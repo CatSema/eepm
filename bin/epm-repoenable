@@ -18,25 +18,30 @@
 #
 
 load_helper epm-sh-altlinux
-#load_helper epm-repolist
-
-alt_LISTS='/etc/apt/sources.list /etc/apt/sources.list.d/*.list'
+load_helper epm-sh-repo
 
 
 __epm_repoenable_alt()
 {
+    assure_root
     local rl
     # ^rpm means full string
     if rhas "$1" "\^rpm" ; then
         rl="$(echo "$1" | sed -e 's|\^||')"
+        # check if this exact line exists as a comment
+        if ! grep -q -E "^[[:space:]]*#[[:space:]]*$(sed_escape "$rl")" $APT_ALL_SOURCES_LIST 2>/dev/null ; then
+            return 1
+        fi
     else
-        rl="$( epm --quiet repolist --all 2>/dev/null | grep -F "$1" | head -n1 | sed -e 's|[[:space:]]*#[[:space:]]*||' )"
+        rl="$( epm --quiet repolist --all 2>/dev/null | grep -F "$1" | sed -e 's|[[:space:]]*#[[:space:]]*||' )"
         [ -z "$rl" ] && warning 'Can'\''t find commented $1 in the repos (see # epm repolist output)' && return 1
-        [ -z "$rl" ] && warning "Can't find commented '"$1"' in the repos (see # epm repolist output)" && return 1
     fi
+    local apt_lists
+    apt_lists="$(filter_glob_list $APT_ALL_SOURCES_LIST)"
+    [ -z "$apt_lists" ] && return 0
     echo "$rl" | while read rp ; do
         [ -n "$dryrun" ] && message 'will uncomment $rp' && continue
-        sed -i -e "s|^[[:space:]]*#[[:space:]]*\($(sed_escape "$rl")\)|\1|" $alt_LISTS
+        sed -i -e "s|^[[:space:]]*#[[:space:]]*\($(sed_escape "$rp")\)|\1|" $apt_lists
     done
 }
 
@@ -46,11 +51,20 @@ epm_repoenable()
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        assure_root
         __epm_repoenable_alt "$@"
         ;;
     apt-dpkg|aptitude-dpkg)
-        print_apt_sources_list
+        local files
+        files="$(__find_deb822_files_by_pattern "$1")"
+        if [ -n "$files" ] ; then
+            assure_root
+            echo "$files" | while read f ; do
+                info "Enabling $f ..."
+                __deb822_enable "$f"
+            done
+        else
+            __epm_repoenable_alt "$@"
+        fi
         ;;
     yum-rpm)
         docmd yum repolist $verbose

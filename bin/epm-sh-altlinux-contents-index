@@ -33,7 +33,9 @@ get_alt_repo_path()
     local BN3=$(basename $DN3) # ALTLinux/
 
     [ "$BN1" = "branch" ] && echo "$BN3/$BN2/$BN1/$BN0" && return
-    [ "$BN1" = "Sisyphus" ] && echo "$BN2/$BN1/$BN0"
+    [ "$BN1" = "Sisyphus" ] && echo "$BN2/$BN1/$BN0" && return
+    # Fallback for non-standard repos: use last 4 path components
+    echo "$BN3/$BN2/$BN1/$BN0"
 }
 
 # convert "http://download.etersoft.ru/pub/ALTLinux/p8/branch x86_64" to /tmp/epm/ALTLinux/p8/branch/x86_64
@@ -84,7 +86,7 @@ eget_alt_contents_index()
     local TD="$2"
     local res
     [ -n "$USER" ] && [ -f $TD ] && sudorun chown -R $USER $TD
-    eget --compressed -O $TD $URL
+    eget --timestamping --compressed -O $TD $URL
     res=$?
     [ -f "$TD" ] && sudorun chmod a+rw "$TD"
     return $res
@@ -103,9 +105,14 @@ get_url_to_etersoft_mirror()
 # "comment" "file"
 __add_to_contents_index_list()
 {
-    [ -n "$verbose" ] && info "Put $1 -> $2"
-    [ -s "$2" ] || return
-    echo "$2" >>$ALT_CONTENTS_INDEX_LIST
+    local comment="$1"
+    local file="$2"
+    [ -n "$verbose" ] && info 'Put $comment -> $file'
+    [ -s "$file" ] || return
+    if rhas "$file" "\." && ! erc test "$file" 2>/dev/null ; then
+        warning "Broken contents_index: $file" ; rm -f "$file" ; return 1
+    fi
+    echo "$file" >>$ALT_CONTENTS_INDEX_LIST
 }
 
 # "comment" file file2

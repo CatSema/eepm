@@ -17,14 +17,18 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-PROGDIR="$(dirname "$0")"
 PROGNAME="$(basename "$0")"
 [ -n "$EPMCURDIR" ] || export EPMCURDIR="$(pwd)"
 CMDENV="/usr/bin/env"
 [ -x "$CMDENV" ] && CMDSHELL="/usr/bin/env bash" || CMDSHELL="$SHELL"
+# Resolve symlinks to find real script location
 # is_command is not yet available
 if type realpath >/dev/null 2>/dev/null ; then
-    PROGDIR="$(realpath $PROGDIR)"
+    PROGDIR="$(dirname "$(realpath "$0")")"
+elif type readlink >/dev/null 2>/dev/null && readlink -f "$0" >/dev/null 2>/dev/null ; then
+    PROGDIR="$(dirname "$(readlink -f "$0")")"
+else
+    PROGDIR="$(dirname "$0")"
 fi
 if [ "$0" = "/dev/stdin" ] || [ "$0" = "sh" ] ; then
     PROGDIR=""
@@ -95,28 +99,29 @@ check_tty
 
 phelp()
 {
-    echo "$Descr
-$Usage
-
-$(message "Options:")
-$(get_help HELPOPT)
-
-$(message "Short commands:")
-$(get_help HELPSHORT)
-
-$(get_help HELPCMD)
-
-$(message "
-Examples:
+    echo "$Descr"
+    echo "$Usage"
+    echo ""
+    message "Options:"
+    get_help HELPOPT
+    echo ""
+    message "Short commands:"
+    get_help HELPSHORT
+    echo ""
+    get_help HELPCMD
+    echo ""
+    message "Examples:
     $ epmi etckeeper      install etckeeper package
     $ epmqp lib           print out all installed packages with 'lib' in a name
     $ epmqf ip            print out a package the command 'ip' from is
-")"
+"
 }
 
 print_version()
 {
-        message 'EPM package manager version $EPMVERSION  Telegram: https://t.me/useepm  https://wiki.etersoft.ru/Epm
+        local tg_link=$(make_osc8_link "https://t.me/useepm")
+        local wiki_link=$(make_osc8_link "https://wiki.etersoft.ru/Epm")
+        message 'EPM package manager version $EPMVERSION  Telegram: $tg_link  $wiki_link
                  Running on $DISTRNAME/$DISTRVERSION ($PMTYPE package manager uses $PKGFORMAT package format)
                  Copyright (c) Etersoft 2012-2025
                  This program may be freely redistributed under the terms of the GNU AGPLv3.'
@@ -152,6 +157,7 @@ interactive=
 force_yes=
 skip_installed=
 skip_missed=
+update_repo=
 show_command_only=
 manual_requires=
 epm_cmd=
@@ -164,6 +170,7 @@ pkg_options=
 quoted_args=
 direct_args=
 ipfs=
+exclude=
 force_overwrite=
 
 epm_vardir=/var/lib/eepm
@@ -172,16 +179,23 @@ eget_ipfs_db=$epm_vardir/eget-ipfs-db.txt
 
 # load system wide config
 for i in $CONFIGDIR/eepm.conf $CONFIGDIR/conf.d/*.conf ; do
-    [ -f $CONFIGDIR/$i ] && . $CONFIGDIR/$i
+    [ -f "$i" ] && . "$i"
 done
 
+# export proxy settings if set in config
+# Note: apt may require /etc/apt/apt.conf.d/ config, see https://bugzilla.altlinux.org/38543
+[ -n "$http_proxy" ] && export http_proxy
+[ -n "$https_proxy" ] && export https_proxy
+[ -n "$ftp_proxy" ] && export ftp_proxy
+[ -n "$no_proxy" ] && export no_proxy
 
 case $PROGNAME in
     epmi)                      # HELPSHORT: alias for epm install
         epm_cmd=install
         ;;
     epmI)                      # HELPSHORT: alias for epm Install
-        epm_cmd=Install
+        epm_cmd=install
+        update_repo="--update"
         ;;
     epme)                      # HELPSHORT: alias for epm remove
         epm_cmd=remove
@@ -191,6 +205,11 @@ case $PROGNAME in
         ;;
     epmp)                      # HELPSHORT: alias for epm play
         epm_cmd=play
+        direct_args=1
+        ;;
+    epmps)                     # HELPSHORT: alias for epm play --search
+        epm_cmd=play
+        quoted_args="--search"
         direct_args=1
         ;;
     epms)                      # HELPSHORT: alias for epm search
@@ -211,6 +230,7 @@ case $PROGNAME in
         ;;
     epmqf)                     # HELPSHORT: alias for epm belongs
         epm_cmd=query_file
+        direct_args=1
         ;;
     epmqa)                     # HELPSHORT: alias for epm packages
         epm_cmd=packages
@@ -231,7 +251,7 @@ case $PROGNAME in
         epm_cmd=update
         direct_args=1
         ;;
-    epm|upm|eepm)              # HELPSHORT: other aliases for epm command
+    epm|eepm)
         ;;
     epm.sh)
         ;;
@@ -275,7 +295,8 @@ check_command()
         epm_cmd=reinstall
         ;;
     Install)                  # HELPCMD: perform update package repo info and install package(s) via install command
-        epm_cmd=Install
+        epm_cmd=install
+        update_repo="--update"
         ;;
     -q|q|query)               # HELPCMD: check presence of package(s) and print this name (also --short is supported)
         epm_cmd=query
@@ -296,7 +317,7 @@ check_command()
     -cl|cl|changelog)         # HELPCMD: show changelog for package
         epm_cmd=changelog
         ;;
-    -qi|qi|info|show)         # HELPCMD: print package detail info
+    -qi|qi|info|show)         # HELPCMD: print package detail info (see epm info --help)
         epm_cmd=info
         ;;
     requires|deplist|depends|req|depends-on)     # HELPCMD: print package requires
@@ -462,6 +483,7 @@ check_command()
         ;;
     ei|ik|epminstall|epm-install|selfinstall) # HELPCMD: install package(s) from Korinf (eepm by default)
         epm_cmd=epm_install
+        direct_args=1
         ;;
     print)                    # HELPCMD: print various info, run epm print help for details
         epm_cmd=print
@@ -499,7 +521,7 @@ check_command()
         direct_args=1
         ;;
 
-    -V|checkpkg|integrity)    # HELPCMD: check package file integrity (checksum)
+    checkpkg|integrity)       # HELPCMD: check package file integrity (checksum)
         epm_cmd=checkpkg
         ;;
     -h|--help|help)           # HELPOPT: print this help
@@ -529,12 +551,15 @@ check_option()
     case $1 in
     -v|--version)         # HELPOPT: print version
         [ -n "$epm_cmd" ] && return 1
+        # check --short in all args
+        echo "$ALL_ARGS" | grep -q " --short " && short="--short"
         [ -n "$short" ] && echo "$EPMVERSION" | sed -e 's|-.*||' && exit 0
         print_version
         exit 0
         ;;
     --verbose)            # HELPOPT: verbose mode
         verbose="--verbose"
+        quiet=''
         ;;
     --debug)              # HELPOPT: more debug output mode
         debug="--debug"
@@ -596,6 +621,9 @@ check_option()
     --put-to-repo=*)          # HELPOPT: put the package after all transformations to the repo (--put-to-repo=/path/to/repo)
         put_to_repo="$(echo "$1" | sed -e 's|--put-to-repo=||')"
         ;;
+    --update)              # HELPOPT: run update before install/upgrade
+        update_repo="--update"
+        ;;
     --download-only)       # HELPOPT: download only the package/tarball (before any transformation)
         download_only="--download-only"
         ;;
@@ -604,6 +632,10 @@ check_option()
         ;;
     --parallel)            # HELPOPT: simultaneous downloading of packages
         parallel="--parallel"
+        ;;
+    --exclude=*)           # HELPOPT: exclude package(s) from upgrade/downgrade (comma separated)
+        _excl="$(echo "$1" | sed -e 's|--exclude=||' -e 's|,| |g')"
+        exclude="$exclude $_excl"
         ;;
     -y|--auto|--assumeyes|--non-interactive|--disable-interactivity)  # HELPOPT: non interactive mode
         non_interactive="--auto"
@@ -640,19 +672,24 @@ check_filenames()
 {
     local opt
     for opt in "$@" ; do
-        # files can be with full path or have extension via .
-        if [ -f "$opt" ] && rhas "$opt" "[/\.]" ; then
-            has_space "$opt" && warning 'There are space(s) in filename $opt, it is not supported. Skipped' && continue
-            [ -n "$pkg_files" ] && pkg_files="$pkg_files $opt" || pkg_files="$opt"
-        elif [ -d "$opt" ] ; then
+        if [ -d "$opt" ] ; then
             has_space "$opt" && warning 'There are space(s) in directory path $opt, it is not supported. Skipped' && continue
             [ -n "$pkg_dirs" ] && pkg_dirs="$pkg_dirs $opt" || pkg_dirs="$opt"
         elif is_url "$opt" ; then
             has_space "$opt" && warning 'There are space(s) in URL $opt, it is not supported. Skipped' && continue
             [ -n "$pkg_urls" ] && pkg_urls="$pkg_urls $opt" || pkg_urls="$opt"
-        # hack, TODO: reasons
-        elif is_abs_path "$opt" && ! rhas "$opt" "[()]" ; then
+        # files can be with full path or have extension via .
+        # hack for abs path: TODO: reasons
+        elif { [ -f "$opt" ] && rhas "$opt" "[/\.]" ; } || { is_abs_path "$opt" && ! rhas "$opt" "[()]" ; } ; then
             has_space "$opt" && warning 'There are space(s) in filename $opt, it is not supported. Skipped' && continue
+            # resolve symlinks for correct access check by root
+            local resolved
+            resolved="$(realpath "$opt" 2>/dev/null)" || continue
+            if has_space "$resolved" ; then
+                warning "Resolved path of $opt has space(s), using symlink path"
+            else
+                opt="$resolved"
+            fi
             [ -n "$pkg_files" ] && pkg_files="$pkg_files $opt" || pkg_files="$opt"
         else
             has_space "$opt" && warning 'There are space(s) in package name $opt, it is not supported. Skipped.' && continue
@@ -669,6 +706,8 @@ for opt in $EPM_OPTIONS ; do
 done
 
 FLAGENDOPTS=
+# save all args for lookahead in check_option
+ALL_ARGS=" $* "
 # NOTE: can't use while read here: set vars inside
 for opt in "$@" ; do
 
@@ -696,7 +735,7 @@ fi
 export EPM_OPTIONS="$nodeps $force $full $verbose $debug $quiet $interactive $non_interactive $parallel $save_only $download_only $force_overwrite $manual_requires $noscripts $scripts $dryrun"
 
 # if input is not console and run script from file, get pkgs from stdin too
-if [ ! -n "$inscript" ] && [ -p /dev/stdin ] && [ "$EPMMODE" != "pipe" ] ; then
+if [ -z "$direct_args" ] && [ ! -n "$inscript" ] && [ -p /dev/stdin ] && [ "$EPMMODE" != "pipe" ] ; then
     for opt in $(withtimeout 10 cat) ; do
         # FIXME: do not work
         # workaround against # yes | epme
@@ -749,13 +788,13 @@ fi
 
 # Use eatmydata for write specific operations
 case $epm_cmd in
-    update|upgrade|Upgrade|install|reinstall|Install|remove|autoremove|kernel_update|release_upgrade|release_downgrade|check)
+    update|upgrade|Upgrade|install|reinstall|remove|autoremove|kernel_update|release_upgrade|release_downgrade|check)
         set_eatmydata
         ;;
 esac
 
 case $epm_cmd in
-    upgrade|Upgrade|install|reinstall|Install|release_upgrade|release_downgrade)
+    upgrade|Upgrade|install|reinstall|release_upgrade|release_downgrade)
         if [ -n "$parallel" ] && [ -z "$eget_backend" ] ; then
             is_command aria2 && eget_backend=aria2 && echo "Use installed aria2 to parallel package downloading."
             [ -z "$eget_backend" ] && is_command axel && eget_backend=axel && echo "Use installed axel to parallel package downloading."

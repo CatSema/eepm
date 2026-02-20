@@ -39,10 +39,8 @@ __check_upgrade_conditions()
 
 epm_upgrade_alt_tasks()
 {
-    load_helper epm-addrepo
-    load_helper epm-reposave
-    load_helper epm-removerepo
-    load_helper epm-Install
+    load_helper epm-sh-backend
+    load_helper epm-install
 
     local installlist="$(get_task_packages "$@")"
 
@@ -63,18 +61,38 @@ epm_upgrade_alt_tasks()
         return 22
     fi
 
+    local task_numbers=""
+    local arg
+    for arg in "$@" ; do
+        local tn="$(get_tasknumber_from_arg "$arg")"
+        [ -n "$tn" ] && task_numbers="$task_numbers $tn"
+    done
+
     local res
-    try_change_alt_repo
-    epm_addrepo "$@"
-    __epm_update
+    __use_tmp_apt_for_tasks $task_numbers || return 1
     (pkg_names="$installlist" epm_install)
     res=$?
-    epm_removerepo "$@"
-    end_change_alt_repo
     return $res
 }
 
 epm_upgrade()
+{
+    if [ -n "$exclude" ] ; then
+        load_helper epm-mark
+        __epm_exclude_apply
+    fi
+
+    __epm_upgrade_do "$@"
+    local _ret=$?
+
+    if [ -n "$exclude" ] ; then
+        __epm_exclude_restore
+    fi
+
+    return $_ret
+}
+
+__epm_upgrade_do()
 {
     local CMD
 
@@ -85,7 +103,7 @@ epm_upgrade()
 
     if [ "$BASEDISTRNAME" = "alt" ] ; then
         load_helper epm-sh-altlinux
-        if tasknumber "$@" >/dev/null ; then
+        if is_taskarg "$@" ; then
             epm_upgrade_alt_tasks "$@"
             return
         fi
@@ -145,7 +163,7 @@ epm_upgrade()
             __epm_alt_download_to_cache $APTOPTIONS dist-upgrade
         fi
 
-        CMD="apt-get $APTOPTIONS $noremove $force_yes dist-upgrade"
+        CMD="apt-get $__EPM_APT_REPO_OPTIONS $APTOPTIONS $noremove $force_yes dist-upgrade"
         ;;
     apm-rpm)
         CMD="apm system upgrade"

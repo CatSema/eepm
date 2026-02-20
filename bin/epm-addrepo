@@ -18,6 +18,7 @@
 #
 
 load_helper epm-sh-altlinux
+load_helper epm-sh-repo
 
 ETERSOFTPUBURL=http://download.etersoft.ru/pub
 ALTLINUXPUBURL=http://ftp.altlinux.org/pub/distributions
@@ -238,6 +239,8 @@ __add_line_to_file()
 
 
 # like apt-add-repository on deb systems
+# For sources.list.d/*.list: uncomment if commented line exists
+# Otherwise: add to specified file
 __epm_addrepo_to_file()
 {
     local file="$1"
@@ -251,6 +254,11 @@ __epm_addrepo_to_file()
 
     if [ -n "$dryrun" ] ; then
         echo "$repo"
+        return
+    fi
+
+    # try to uncomment in sources.list.d first
+    if epm repo enable "^$repo" 2>/dev/null ; then
         return
     fi
 
@@ -378,9 +386,12 @@ __epm_addrepo_altlinux()
             ;;
     esac
 
-    if tasknumber "$repo" >/dev/null ; then
-        for i in $repo ; do
-            epm repo add "https://git.altlinux.org/tasks/$i/build/repo"
+    if is_taskarg $repo ; then
+        local arg tn
+        for arg in $repo ; do
+            is_taskarg "$arg" || continue
+            tn=$(get_tasknumber_from_arg "$arg")
+            epm repo add "https://git.altlinux.org/tasks/$tn/build/repo"
         done
         return
     fi
@@ -407,7 +418,7 @@ __epm_addrepo_altlinux()
 
     # when add correct sources.list string
     if echo "$repo" | grep -q "^rpm " ; then
-        __epm_addrepo_to_file /etc/apt/sources.list "$repo"
+        __epm_addrepo_to_file $APT_SOURCES_LIST "$repo"
         return
     fi
 
@@ -420,6 +431,7 @@ __epm_addrepo_altlinux()
 __epm_addrepo_astra()
 {
     local repo="$*"
+    local distrname="$1"
 
     if [ -z "$repo" ] || [ "$repo" = "--help" ]; then
         message 'Add repo. You can use follow params:
@@ -433,7 +445,7 @@ __epm_addrepo_astra()
 
     # keywords
     # https://wiki.astralinux.ru/pages/viewpage.action?pageId=3276859
-    case "$1-$reponame" in
+    case "$distrname-$reponame" in
         astra-1.7_x86-64)
             # TODO epm repo change http / https
             epm install --skip-installed apt-transport-https ca-certificates || fatal
@@ -467,11 +479,11 @@ __epm_addrepo_astra()
             return
             ;;
         astra-*)
-            fatal 'Unsupported distro version $1-$reponame, see # epm print info output.'
+            fatal 'Unsupported distro version $distrname-$reponame, see # epm print info output.'
             ;;
     esac
 
-    __epm_addrepo_to_file /etc/apt/sources.list "$repo"
+    __epm_addrepo_to_file $APT_SOURCES_LIST "$repo"
     return
 }
 
@@ -527,11 +539,11 @@ __epm_addrepo_deb()
         # FIXME: quotes in showcmd/sudocmd
         showcmd apt-add-repository "$repo"
         sudorun apt-add-repository "$repo"
-        info "Check file /etc/apt/sources.list if needed"
+        info "Check file $APT_SOURCES_LIST if needed"
         return
     else
-        warning "apt-add-repository is not installed, use file /etc/apt/sources.list directly"
-        __epm_addrepo_to_file /etc/apt/sources.list "$repo"
+        warning "apt-add-repository is not installed, use file $APT_SOURCES_LIST directly"
+        __epm_addrepo_to_file $APT_SOURCES_LIST "$repo"
     fi  
 
 }
@@ -539,6 +551,30 @@ __epm_addrepo_deb()
 epm_addrepo()
 {
 local repo="$*"
+
+# Handle copr/owner/project syntax for Fedora/RHEL
+case "$1" in
+    copr/*)
+        local owner_project="$(echo "$1" | sed 's|^copr/||')"
+        case $PMTYPE in
+            dnf-rpm)
+                assure_exists dnf-plugins-core
+                sudocmd dnf copr enable -y "$owner_project"
+                ;;
+            dnf5-rpm)
+                sudocmd dnf copr enable -y "$owner_project"
+                ;;
+            yum-rpm)
+                assure_exists yum-plugin-copr
+                sudocmd yum copr enable -y "$owner_project"
+                ;;
+            *)
+                fatal "Copr repos are only supported on Fedora/RHEL systems (dnf/yum)"
+                ;;
+        esac
+        return
+        ;;
+esac
 
 case $PMTYPE in
     stplr)
@@ -566,7 +602,7 @@ case $PMTYPE in
         __epm_addrepo_deb "$@"
         ;;
     aptitude-dpkg)
-        info "You need manually add repo to /etc/apt/sources.list (TODO)"
+        info "You need manually add repo to $APT_SOURCES_LIST (TODO)"
         ;;
     yum-rpm)
         assure_exists yum-utils

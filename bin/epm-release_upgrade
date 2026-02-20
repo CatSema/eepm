@@ -126,7 +126,8 @@ __detect_alt_release_by_repo()
 
 __get_conflict_release_pkg()
 {
-    epm qf --quiet --short /etc/fedora-release | head -n1
+    # check both files as branding packages may own either
+    epm qf --quiet --short /etc/fedora-release /etc/altlinux-release 2>/dev/null | head -n1
 }
 
 get_fix_release_pkg()
@@ -210,8 +211,12 @@ __check_system()
     fi
 
     if [ "$TO" != "Sisyphus" ] ; then
-        # note: we get --base-version directy to get new version
-        if [ "$($DISTRVENDOR --base-version)" != "$TO" ] || epm installed altlinux-release-sisyphus >/dev/null ; then
+        # skip if /etc/altlinux-release is owned by a branding package
+        local release_pkg="$(__get_conflict_release_pkg)"
+        if [ -n "$release_pkg" ] && rhas "$release_pkg" "^branding-" ; then
+            info 'Skipping altlinux-release-$TO install: /etc/altlinux-release is owned by $release_pkg'
+        elif [ "$($DISTRVENDOR --base-version)" != "$TO" ] || epm installed altlinux-release-sisyphus >/dev/null ; then
+            # note: we get --base-version directly to get new version
             warning 'Current distro still is not $TO, or altlinux-release-sisyphus package is installed.'
             warning 'Trying to fix with altlinux-release-$TO'
             docmd epm install altlinux-release-$TO
@@ -300,7 +305,8 @@ __do_upgrade()
     docmd epm $non_interactive $force_yes upgrade && return
     docmd epm $non_interactive $force_yes fix
     docmd epm $non_interactive $force_yes upgrade && return
-    fatal "Check the errors and run '# $0' after fix."
+    local cmd="$0"
+    fatal 'Check the errors and run "# $cmd" after fix.'
 }
 
 # TODO: install new conf without signs?
@@ -314,7 +320,7 @@ __switch_alt_to_distro()
 
     case "$*" in
         "p6"|"p6 p7"|"t6 p7"|"c6 c7")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             __switch_repo_to $TO
             docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -324,7 +330,7 @@ __switch_alt_to_distro()
             info "Run epm release-upgrade again for update to p8"
             ;;
         "p7"|"p7 p8"|"t7 p8"|"c7 c8")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             __switch_repo_to $TO
             docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -335,7 +341,7 @@ __switch_alt_to_distro()
             info "Run epm release-upgrade again for update to p9"
             ;;
         "c8"|"c8.1"|"c8.2"|"c8 c8.1"|"c8.1 c8.2"|"c8 c8.2")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             __switch_repo_to $TO
             docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -345,7 +351,7 @@ __switch_alt_to_distro()
             docmd epm update-kernel || fatal
             ;;
         "p8 c8"|"p8 c8.1"|"p8 c8.2")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             __switch_repo_to $TO
             docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -360,7 +366,7 @@ __switch_alt_to_distro()
             docmd epm update-kernel || fatal
             ;;
         "p8"|"p8 p9"|"t8 p9"|"c8 c9"|"c8 p9"|"c8.1 p9"|"c8.2 p9"|"p9 p9"|"p9 c9f2")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             info "Workaround for https://bugzilla.altlinux.org/show_bug.cgi?id=35492 ..."
             if epm installed gdb >/dev/null ; then
@@ -377,7 +383,7 @@ __switch_alt_to_distro()
         "p9"|"p9 p10"|"p10 p10")
             info "Upgrade all packages to current $FROM repository"
             __do_upgrade
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             if [ $TO = "p11" ]; then __p11_upgrade_fix; fi
             __switch_repo_to $TO
@@ -390,7 +396,7 @@ __switch_alt_to_distro()
         "p10 p11")
             info "Upgrade all packages to current $FROM repository"
             __do_upgrade
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             __p11_upgrade_fix
             __switch_repo_to $TO
@@ -404,7 +410,7 @@ __switch_alt_to_distro()
         "c10f1 c10f2"|"c10f2 c10f3")
             info "Upgrade all packages to current $FROM repository"
             __do_upgrade
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             #__p11_upgrade_fix
             __switch_repo_to $TO
@@ -417,7 +423,7 @@ __switch_alt_to_distro()
             docmd epm update-kernel || fatal
             ;;
         "p9 p8"|"c8.1 c8"|"c8.1 p8"|"p8 p8")
-            confirm_info "Downgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install $(get_fix_release_pkg "$FROM")
             __switch_repo_to $TO
             docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -431,7 +437,7 @@ __switch_alt_to_distro()
             docmd epm upgrade || fatal
             ;;
         "p9 c8"|"p9 c8.1"|"p9 c8.2")
-            confirm_info "Downgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install $(get_fix_release_pkg "$FROM")
             __switch_repo_to $TO
             docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -445,7 +451,7 @@ __switch_alt_to_distro()
             docmd epm upgrade || fatal
             ;;
         "p10 p9"|"p11 p9")
-            confirm_info "Downgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install $(get_fix_release_pkg "$FROM")
             __switch_repo_to $TO
             docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
@@ -455,7 +461,7 @@ __switch_alt_to_distro()
             docmd epm upgrade || fatal
             ;;
         "Sisyphus p8"|"Sisyphus p9"|"Sisyphus p10"|"Sisyphus p11"|"Sisyphus c8"|"Sisyphus c8.1"|"Sisyphus c9f2"|"Sisyphus c10f1"|"Sisyphus c10f2"|"Sisyphus c10f3")
-            confirm_info "Downgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install $(get_fix_release_pkg "$FROM")
             if [ $TO = "p11" ]; then __sisyphus_downgrade_fix; fi
             __switch_repo_to $TO
@@ -466,7 +472,7 @@ __switch_alt_to_distro()
             docmd epm upgrade || fatal
             ;;
         "p8 Sisyphus"|"p9 Sisyphus"|"p10 Sisyphus"|"p11 Sisyphus"|"Sisyphus Sisyphus")
-            confirm_info "Upgrade $DISTRNAME from $FROM to $TO ..."
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
             docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
             docmd epm upgrade || fatal
             # TODO: epm_reposwitch??
@@ -565,7 +571,7 @@ epm_release_upgrade()
         return
         ;;
     "ROSA")
-        sudocmd dnf --refresh upgrade || fatal
+        sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
         #sudocmd dnf clean all
         DV=$(echo "$DISTRVERSION" | sed -e "s|\..*||")
         [ "$DV" = "2021" ] && DV=12
@@ -640,19 +646,20 @@ epm_release_upgrade()
         fi
 
         if [ "$DISTRNAME" = "RockyLinux" ] ; then
-            sudocmd dnf --refresh upgrade || fatal
+            sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
             #sudocmd dnf clean all
-            info "Check https://www.centlinux.com/2022/07/upgrade-your-servers-from-rocky-linux-8-to-9.html"
-            info "For upgrading your yum repositories from Rocky Linux 8 to 9 ..."
-            epm install "https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-gpg-keys*.rpm" || fatal
-            epm install "https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos*.rpm" "https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-release*.rpm" || fatal
 
-            # hack (TODO)
             DV=$(echo "$DISTRVERSION" | sed -e "s|\..*||")
             local RELEASEVER="$1"
             [ -n "$RELEASEVER" ] || RELEASEVER=$(($DV + 1))
             confirm_info 'Upgrade to $DISTRNAME/$RELEASEVER'
 
+            local ROCKY_URL="https://download.rockylinux.org/pub/rocky/$RELEASEVER/BaseOS/x86_64/os/Packages/r"
+            info 'Upgrading Rocky Linux repositories from $DV to $RELEASEVER ...'
+            epm install "$ROCKY_URL/rocky-gpg-keys*.rpm" || fatal
+            sudocmd rpm --import "/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-$RELEASEVER"
+
+            epm install --nodeps "$ROCKY_URL/rocky-repos*.rpm" "$ROCKY_URL/rocky-release*.rpm" || fatal
             sudocmd dnf distro-sync -y --releasever=$RELEASEVER --allowerasing --setopt=deltarpm=false
             sudocmd rpm --rebuilddb
             epm upgrade
@@ -663,10 +670,10 @@ epm_release_upgrade()
 
         info "Check https://fedoraproject.org/wiki/DNF_system_upgrade for an additional info"
         #docmd epm install epel-release yum-utils
-        sudocmd dnf --refresh upgrade || fatal
+        sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
         #sudocmd dnf clean all
         assure_exists dnf-plugin-system-upgrade
-        sudocmd dnf upgrade --refresh
+        sudocmd dnf $(subst_option non_interactive -y) upgrade --refresh
         local RELEASEVER="$1"
         [ -n "$RELEASEVER" ] || RELEASEVER=$(($DISTRVERSION + 1))
         #[ -n "$RELEASEVER" ] || fatal "Run me with new version"

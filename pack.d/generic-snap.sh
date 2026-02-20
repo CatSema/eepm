@@ -11,17 +11,15 @@ if ! rhas "$TAR" "\.snap$" ; then
 fi
 
 alpkg=$(basename $TAR)
+BASEDIR=$(basename $TAR .snap)
 
-# improve me
-epm assure unsquashfs squashfs-tools || fatal
-a= unsquashfs $TAR || fatal
-
+erc unpack $TAR || fatal
 
 # name: plex-desktop
 # version: 1.69.1
 # summary: Plex for Linux
 # description:
-eval $(epm tool yaml squashfs-root/meta/snap.yaml | grep -E "^(name|version|summary|description)=") #"
+yaml_load_vars $BASEDIR/meta/snap.yaml name version summary description
 
 [ -n "$name" ] || fatal "Can't get name from snap.yaml"
 [ -n "$version" ] || fatal "Can't get version from snap.yaml"
@@ -36,7 +34,7 @@ version="$(echo $version | sed 's/-/./g')"
 
 
 mkdir -p opt/
-mv squashfs-root opt/$name
+mv $BASEDIR opt/$name
 
 PKGNAME=$name-$version.tar
 
@@ -50,10 +48,31 @@ generic_repack: snap
 EOF
 
 test -d opt/$name || fatal "Can't find opt/$name"
-install_file opt/$name/meta/gui/icon.png usr/share/pixmaps/$name.png
-install_file opt/$name/meta/gui/*.desktop usr/share/applications/$name.desktop
-subst "s|^Icon=.*|Icon=$name|" usr/share/applications/$name.desktop
-subst "s|^Comment=$|Comment=$summary|" usr/share/applications/$name.desktop
+
+# Install all icons
+for f in opt/$name/meta/gui/icon.png opt/$name/meta/gui/*.svg opt/$name/meta/gui/*.png ; do
+    [ -f "$f" ] || continue
+    bn="$(basename "$f")"
+    case "$bn" in
+        *.svg) install_file "$f" "usr/share/icons/hicolor/scalable/apps/$bn" ;;
+        *)     install_file "$f" "usr/share/pixmaps/$bn" ;;
+    esac
+done
+
+# Install all desktop files
+# Prefer usr/share/applications/ (has actual binary names in Exec=)
+# Fall back to meta/gui/ (has snap wrapper names like appname.command)
+desktop_src="opt/$name/meta/gui"
+if ls opt/$name/usr/share/applications/*.desktop >/dev/null 2>&1 ; then
+    desktop_src="opt/$name/usr/share/applications"
+fi
+for f in $desktop_src/*.desktop ; do
+    [ -f "$f" ] || continue
+    bn="$(basename "$f")"
+    install_file "$f" "usr/share/applications/$bn"
+    subst "s|^Icon=.*[$/].*/\([^/]*\)\$|Icon=\1|" "usr/share/applications/$bn"
+    subst "s|^Comment=$|Comment=$summary|" "usr/share/applications/$bn"
+done
 
 erc pack $PKGNAME opt/$name usr/share
 

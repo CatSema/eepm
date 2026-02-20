@@ -19,12 +19,76 @@
 
 load_helper epm-print
 
+epm_whatprovides_help()
+{
+    message 'epm whatprovides - print packages that provide the given target
+Usage: epm whatprovides [options] <target>
+'
+    get_help HELPOPT $SHAREDIR/epm-whatprovides
+}
+
+__epm_whatprovides_installed()
+{
+    local pkg="$*"
+
+    case $PMTYPE in
+        *-rpm)
+            if [ -n "$short" ] ; then
+                docmd rpm -q --whatprovides --queryformat '%{name}\n' $pkg
+            else
+                docmd rpm -q --whatprovides $pkg
+            fi
+            ;;
+        *-dpkg)
+            # get providers list from apt-cache and filter to installed
+            local providers
+            providers="$(apt-cache showpkg $pkg 2>/dev/null | sed -n '/^Reverse Provides:/,$ {/^Reverse Provides:/d; p}' | awk '{print $1}' | sort -u)"
+            [ -n "$providers" ] || return 1
+            local p
+            for p in $providers ; do
+                dpkg -l "$p" 2>/dev/null | grep -q '^ii' || continue
+                if [ -n "$short" ] ; then
+                    echo "$p"
+                else
+                    dpkg-query -W "--showformat=\${Package}-\${Version}\n" "$p" 2>/dev/null
+                fi
+            done
+            ;;
+        pacman)
+            if [ -n "$short" ] ; then
+                docmd pacman -Q $pkg | sed -e 's| .*||'
+            else
+                docmd pacman -Q $pkg
+            fi
+            ;;
+        *)
+            fatal 'Have no suitable command for $PMTYPE in __epm_whatprovides_installed()'
+            ;;
+    esac
+}
+
 epm_whatprovides()
 {
     local CMD
     [ -n "$pkg_url" ] && fatal "whatprovides does not handle URLs"
+
+    case "$pkg_options" in
+        -h|--help)            # HELPOPT: show this help
+            epm_whatprovides_help
+            return
+            ;;
+        --installed)          # HELPOPT: search only installed packages
+            shift
+            ;;
+    esac
+
     [ -n "$pkg_files$pkg_names" ] || fatal "whatprovides: package name is missed"
     local pkg=$(print_name $pkg_files $pkg_names)
+
+    if [ "$pkg_options" = "--installed" ] ; then
+        __epm_whatprovides_installed $pkg
+        return
+    fi
 
 # by package name
 case $PMTYPE in

@@ -18,12 +18,13 @@
 #
 
 load_helper epm-query
+load_helper epm-sh-repo
 
 
 __replace_text_in_alt_repo()
 {
     local i
-    for i in /etc/apt/sources.list /etc/apt/sources.list.d/*.list ; do
+    for i in $APT_ALL_SOURCES_LIST ; do
         [ -s "$i" ] || continue
         # TODO: don't change file if untouched
         #grep -q -- "$1" "$i" || continue
@@ -198,21 +199,32 @@ __fix_alt_sources_list()
 }
 
 
+# Convert mirror URL to sed pattern for matching
+# https://download.etersoft.ru/pub/ALTLinux -> //download.etersoft.ru/pub/* ALTLinux
+__url_to_sed_pattern()
+{
+    echo "$1" | sed -e 's|^https:||' -e 's|/\([^/]*\)$|/* \1|'
+}
+
+# Substitute known mirror URL with new one
+# Uses mirror database from epm-repomirrors
 __subst_with_repo_url()
 {
-    local NURL="$2"
-    echo "$1" | sed \
-        -e "s|//mirror.yandex.ru/* altlinux|$NURL|" \
-        -e "s|//ftp.altlinux.org/pub/distributions/* ALTLinux|$NURL|" \
-        -e "s|//ftp.basealt.ru/pub/distributions/* ALTLinux|$NURL|" \
-        -e "s|//update.altsp.su/pub/distributions/* ALTLinux|$NURL|" \
-        -e "s|//ftp.etersoft.ru/pub/* ALTLinux|$NURL|" \
-        -e "s|//mirror.datacenter.by/pub/* ALTLinux|$NURL|" \
-        -e "s|//mirror.truenetwork.ru/* altlinux|$NURL|" \
-        -e "s|//mirror.cs.msu.ru/* alt|$NURL|" \
-        -e "s|//download.etersoft.ru/pub/* ALTLinux|$NURL|" \
-        -e "s|//mirror.eterfund.org/download.etersoft.ru/pub/* ALTLinux|$NURL|"
+    __load_alt_mirror_db
+    local input="$1"
+    local new_pattern="$2"
+
+    local name url pattern
+    while read -r name url ; do
+        [ -z "$name" ] && continue
+        pattern=$(__url_to_sed_pattern "$url")
+        input=$(echo "$input" | sed -e "s|$pattern|$new_pattern|")
+    done <<EOF
+$__ALT_MIRROR_DB
+EOF
+    echo "$input"
 }
+
 
 __change_repo()
 {
@@ -228,37 +240,24 @@ __change_repo()
 
 __epm_repochange_alt()
 {
-    case "$1" in
+    load_helper epm-repomirrors
+
+    local current_mirror mirror
+    current_mirror=$(__get_current_mirror)
+    mirror="$1"
+
+    case "$mirror" in
         "--list")
-            [ -z "$quiet" ] && message "Possible targets:"
-            echo "etersoft datacenter.by truenetwork msu eterfund.org yandex basealt altlinux.org"
-            ;;
-        "etersoft")
-            __change_repo "//download.etersoft.ru/pub ALTLinux"
-            ;;
-        "datacenter.by")
-            __change_repo "//mirror.datacenter.by/pub ALTLinux"
-            ;;
-        "truenetwork")
-            __change_repo "//mirror.truenetwork.ru altlinux"
-            ;;
-        "msu")
-            __change_repo "//mirror.cs.msu.ru alt"
-            ;;
-        "eterfund.org")
-            __change_repo "//mirror.eterfund.org/download.etersoft.ru/pub ALTLinux"
-            ;;
-        "yandex")
-            __change_repo "//mirror.yandex.ru altlinux"
-            ;;
-        "basealt")
-            __change_repo "//ftp.basealt.ru/pub/distributions ALTLinux"
-            ;;
-        "altlinux.org")
-            __change_repo "//ftp.altlinux.org/pub/distributions ALTLinux"
+            __list_mirrors "$current_mirror" "$short"
             ;;
         *)
-            fatal 'Unsupported change key $1'
+            local pattern
+            pattern="$(__alt_mirror_change_pattern "$mirror")"
+            if [ -n "$pattern" ] ; then
+                __change_repo "$pattern"
+            else
+                fatal 'Unsupported mirror: $mirror. Use --list to see available mirrors.'
+            fi
             ;;
     esac
 }
@@ -287,8 +286,8 @@ case $BASEDISTRNAME in
         [ -n "$quiet" ] || docmd epm repo list
         assure_root
 
-        __fix_alt_sources_list /etc/apt/sources.list
-        __fix_alt_sources_list /etc/apt/sources.list.d/*.list
+        __fix_alt_sources_list $APT_SOURCES_LIST
+        __fix_alt_sources_list $APT_SOURCES_LIST_D/*.list
 
         [ -n "$quiet" ] || docmd epm repo list
         return

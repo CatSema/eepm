@@ -1,12 +1,12 @@
 #!/bin/sh
-# 2007-2023 (c) Vitaly Lipatov <lav@etersoft.ru>
-# 2007-2023 (c) Etersoft
-# 2007-2023 Public domain
+# 2007-2026 (c) Vitaly Lipatov <lav@etersoft.ru>
+# 2007-2026 (c) Etersoft
+# 2007-2026 Public domain
 
 # You can set ROOTDIR to root system dir
 #ROOTDIR=
 
-PROGVERSION="20250206"
+PROGVERSION="20260206"
 
 # TODO: check /etc/system-release
 
@@ -26,24 +26,22 @@ has()
     grep "$*" "$DISTROFILE" >/dev/null 2>&1
 }
 
-# copied from epm-sh-functions
-# print a path to the command if exists in $PATH
-if a='' which which 2>/dev/null >/dev/null ; then
-    # the best case if we have which command (other ways needs checking)
-    # TODO: don't use which at all, it is binary, not builtin shell command
-print_command_path()
+# detect bash
+is_bash()
 {
-    a='' which -- "$1" 2>/dev/null
+    [ -n "$BASH_VERSION" ]
 }
-elif a='' type -a type 2>/dev/null >/dev/null ; then
+
+# print a path to the command if exists in $PATH
+if is_bash ; then
 print_command_path()
 {
-    a='' type -fpP -- "$1" 2>/dev/null
+    type -fpP -- "$1" 2>/dev/null
 }
 else
 print_command_path()
 {
-    a='' type "$1" 2>/dev/null | sed -e 's|.* /|/|'
+    command -v "$1" 2>/dev/null
 }
 fi
 
@@ -159,6 +157,9 @@ esac
 
 # FIXME: some problems with multibased distros (Server Edition on CentOS and Desktop Edition on Ubuntu)
 case $DISTRIB_ID in
+    AlterOS)
+        CMD="yum-rpm"
+        ;;
     PCLinux)
         CMD="apt-rpm"
         ;;
@@ -273,7 +274,7 @@ pkgtype()
 
     case $VENDOR_ID in
         arch|manjaro)
-            echo "pkg.tar.xz" && return
+            echo "pkg.tar.zst" && return
             ;;
         ublinux)
             echo "pkg.tar.zst" && return
@@ -285,7 +286,7 @@ pkgtype()
         freebsd) echo "tbz" ;;
         sunos) echo "pkg.gz" ;;
         slackware|mopslinux) echo "tgz" ;;
-        archlinux|manjaro) echo "pkg.tar.xz" ;;
+        archlinux|manjaro) echo "pkg.tar.zst" ;;
         ublinux) echo "pkg.tar.zst" ;;
         gentoo) echo "tbz2" ;;
         windows) echo "exe" ;;
@@ -1051,7 +1052,7 @@ local orig=''
 local EV=''
 [ -n "$EPMVERSION" ] && EV="(EPM version $EPMVERSION) "
 cat <<EOF
-distro_info v$PROGVERSION $EV: Copyright © 2007-2025 Etersoft
+distro_info v$PROGVERSION $EV: Copyright © 2007-2026 Etersoft
 
                        Pretty name (--pretty): $(print_pretty_name)
            (--distro-name / --distro-version): $DISTRO_NAME / $DISTRIB_FULL_RELEASE$orig
@@ -1096,8 +1097,8 @@ print_help()
     echo " --distro-name          - print distro name"
     echo " --distro-version       - print full version of the distro"
     echo " --full-version         - print full version of the distro"
-    echo " --codename (obsoleted) - print distro codename (focal for Ubuntu 20.04)"
-    echo " -r|--repo-name         - print repository name (focal for Ubuntu 20.04)"
+    echo " --codename (obsoleted) - print distro codename (f.i., focal for Ubuntu 20.04)"
+    echo " -r|--repo-name         - print repository name (f.i., focal for Ubuntu 20.04)"
     echo " --build-id             - print a string uniquely identifying the system image originally used as the installation base"
     echo " -V                     - print the utility version"
     echo "Run without args to print all information."
@@ -1108,28 +1109,28 @@ print_eepm_env()
 {
 cat <<EOF
 # -d | --base-distro-name
-DISTRNAME="$(echo $DISTRIB_ID)"
+export DISTRNAME="$(echo $DISTRIB_ID)"
 # --distro-name
-FULLDISTRNAME="$(echo "$DISTRO_NAME")"
+export FULLDISTRNAME="$(echo "$DISTRO_NAME")"
 # -v | --base-version
-DISTRVERSION="$(echo "$DISTRIB_RELEASE")"
+export DISTRVERSION="$(echo "$DISTRIB_RELEASE")"
 # distro dependent arch
-DISTRARCH="$(get_distro_arch)"
+export DISTRARCH="$(get_distro_arch)"
 # -s | --vendor-name
-BASEDISTRNAME=$(pkgvendor)
+export BASEDISTRNAME=$(pkgvendor)
 # --repo-name
-DISTRREPONAME=$(print_repo_name)
+export DISTRREPONAME=$(print_repo_name)
 
 # -a
-SYSTEMARCH="$(get_arch)"
+export SYSTEMARCH="$(get_arch)"
 # -y | --service-manager
-DISTRCONTROL="$(get_service_manager)"
+export DISTRCONTROL="$(get_service_manager)"
 # -g
-PMTYPE="$(pkgmanager)"
+export PMTYPE="$(pkgmanager)"
 # -p | --package-type
-PKGFORMAT=$(pkgtype)
+export PKGFORMAT=$(pkgtype)
 # -m
-DISTRMEMORY="$(get_memory_size)"
+export DISTRMEMORY="$(get_memory_size)"
 
 # TODO: remove?
 PKGVENDOR=$(pkgvendor)

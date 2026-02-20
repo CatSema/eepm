@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# Copyright (C) 2013, 2019  Etersoft
-# Copyright (C) 2013, 2019  Vitaly Lipatov <lav@etersoft.ru>
+# Copyright (C) 2012-2025  Etersoft
+# Copyright (C) 2012-2025  Vitaly Lipatov <lav@etersoft.ru>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -17,20 +17,9 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-load_helper epm-update
-load_helper epm-install
+load_helper serv-status
 
-epm_Install()
+serv_is_active()
 {
-    # copied from epm_install
-    local names="$(echo $pkg_names | filter_out_installed_packages)"
-    local files="$(echo $pkg_files | filter_out_installed_packages)"
-
-    [ -z "$files$names" ] && info "Install: Empty install list was skipped." && return 22
-
-    epm_update || { [ -n "$force" ] || return ; }
-
-    epm_install_names $names || return
-
-    epm_install_files $files
+    is_service_running "$1"
 }

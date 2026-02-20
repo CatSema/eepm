@@ -23,18 +23,23 @@ alpkg=$(basename $TAR)
 PRODUCT="$(basename $alpkg .AppImage)"
 
 # unpack AppImage
-[ -x "$TAR" ] || chmod u+x $verbose "$TAR"
-$TAR --appimage-extract >/dev/null || fatal
+erc unpack $TAR || fatal
+
+# BASEDIR is the unpacked directory (full name without extension)
+BASEDIR="$PRODUCT"
+
+# strip architecture suffix from PRODUCT name
+PRODUCT="${PRODUCT/-x86_64/}"
+PRODUCT="${PRODUCT/-aarch64/}"
+PRODUCT="${PRODUCT/-arm64/}"
 
 # try separate VERSION from PRODUCT
 if [ -z "$VERSION" ] ; then
-    PRODUCT="${PRODUCT/-x86_64/}"
-    VERSION="$(echo "$PRODUCT" | grep -o -P "[-_.]([0-9v])([0-9])*([.]*[0-9])*" | head -n1 | sed -e 's|^[-_.a-zA-Z]||' -e 's|--|-|g' )"  #"
+    # match version with optional suffix like -b1, -rc1, -beta
+    VERSION="$(echo "$PRODUCT" | grep -o -P "[-_.](v?[0-9]+(?:\.[0-9]+)*(?:-[a-zA-Z]+[0-9]*)?)" | head -n1 | sed -e 's|^[-_.]||' -e 's|^v||')"
     [ -n "$VERSION" ] && PRODUCT="$(echo "$PRODUCT" | sed -e "s|[-_.]$VERSION.*||")"
     [ -n "$VERSION" ] && VERSION="$(echo "$VERSION" | sed -e 's|^v||')"
 fi
-
-BASEDIR="squashfs-root"
 [ -L "$BASEDIR" ] && [ -d "AppDir" ] && BASEDIR="AppDir"
 
 # try get version from X-AppImage-Version

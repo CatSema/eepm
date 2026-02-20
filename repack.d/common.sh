@@ -20,6 +20,21 @@ warning()
     echo "WARNING: $*" >&2
 }
 
+# Load YAML fields into shell variables safely (prevents command injection)
+# Usage: yaml_load_vars file.yaml field1 field2 field3 ...
+yaml_load_vars()
+{
+    local file="$1"
+    shift
+    local data field value
+    data="$(epm tool yaml "$file" 2>/dev/null)"
+    for field in "$@" ; do
+        value="$(printf '%s\n' "$data" | grep "^${field}=" | head -n1 | sed "s/^[^=]*=\"\(.*\)\"$/\1/")"
+        # Use single quotes to prevent command execution in values
+        eval "$field='$(printf '%s' "$value" | sed "s/'/'\\\\''/g")'"
+    done
+}
+
 # compatibility layer
 
 # check if <arg> is a real command
@@ -118,6 +133,20 @@ move_file()
     true
 }
 
+# Move dir contents to a new place (replaces paths in spec)
+move_dir()
+{
+    local from="$1"
+    local to="$2"
+    [ -d "$BUILDROOT$from" ] || return
+    mkdir -p "$BUILDROOT$to"
+    echo "Moving $from/* to $to/ ..."
+    mv -v "$BUILDROOT$from"/* "$BUILDROOT$to/"
+    rmdir "$BUILDROOT$from" 2>/dev/null || rm -rv "$BUILDROOT$from"
+    subst "s|$from|$to|g" $SPEC
+    true
+}
+
 # Remove dir (recursively) from the file system and from spec
 remove_dir()
 {
@@ -158,6 +187,36 @@ has_wildcard()
     [ "${1/\*/}" != "$1" ]
 }
 
+# Patch binary file: replace old_string with new_string (padded with nulls)
+# Usage: patch_binary <file> <old_string> <new_string>
+patch_binary()
+{
+    local file="$1"
+    local old="$2"
+    local new="$3"
+
+    [ -f "$file" ] || return 1
+
+    local old_len=${#old}
+    local new_len=${#new}
+
+    if [ $new_len -gt $old_len ] ; then
+        fatal "patch_binary: new string ($new_len chars) is longer than old string ($old_len chars)"
+    fi
+
+    # Calculate padding (nulls needed)
+    local pad_len=$((old_len - new_len))
+    local padding=""
+    local i=0
+    while [ $i -lt $pad_len ] ; do
+        padding="${padding}\\x00"
+        i=$((i + 1))
+    done
+
+    # Use printf to generate sed script with proper null bytes, pipe to sed -f -
+    printf 's|%s|%s%s|g' "$old" "$new" "$padding" | sed -i -f - "$file"
+}
+
 # Add file to spec (if missed)
 # Usage: pack_file <path_to_file>
 pack_file()
@@ -176,9 +235,12 @@ pack_dir()
 {
     local file="$1"
     [ -n "$file" ] || return
-    # FIXME assisant
+    # Check if already listed as %dir (quoted or unquoted)
     grep -q "^%dir[[:space:]]$file/*$" $SPEC && return
     grep -q "^%dir[[:space:]]\"$file/*\"$" $SPEC && return
+    # Check if listed as file entry (will be converted to %dir later by generic.sh)
+    grep -q "^\"$file\"$" $SPEC && return
+    grep -q "^$file$" $SPEC && return
     has_space "$file" && file="\"$file\""
     subst "s|%files|%files\n%dir $file|" $SPEC
 }
@@ -202,7 +264,7 @@ install_file()
         dest="$(basename "$src")"
     else
         mkdir -p "$BUILDROOT/$(dirname "$dest")" || return
-        [ -L "$BUILDROOT$dest" ] && rm -v "$BUILDROOT$dest"
+        rm -f "$BUILDROOT$dest" 2>/dev/null
     fi
 
     if is_url "$src" ; then
@@ -249,8 +311,6 @@ __check_target_bin()
         # if target is a relative, skiping when /usr/bin/$name exists
         [ -e "$BUILDROOT/usr/bin/$name" ] && echo "Skipping /usr/bin/$name with relative target $target ..." && return 1
     fi
-    # allow override existed links
-    [ -L "$BUILDROOT/usr/bin/$name" ] && rm -f "$BUILDROOT/usr/bin/$name"
     return 0
 }
 
@@ -263,8 +323,8 @@ add_bin_link_command()
     [ "$name" = "$target" ] && return
 
     __check_target_bin "$name" "$target" || return 0
-    mkdir -p $BUILDROOT/usr/bin/
-    ln -sf "$target" "$BUILDROOT/usr/bin/$name" || return
+    mkdir -p "$BUILDROOT/usr/bin/"
+    ln -snf "$target" "$BUILDROOT/usr/bin/$name" || return
     pack_file "/usr/bin/$name"
 }
 
@@ -414,6 +474,12 @@ add_provides()
     __add_tag_after_d "Provides: $*"
 }
 
+add_obsoletes()
+{
+    [ -n "$1" ] || return
+    __add_tag_after_d "Obsoletes: $*"
+}
+
 # for checking in epm-repack-rpm
 add_forced_requires()
 {
@@ -474,13 +540,6 @@ add_electron_deps()
     fix_chrome_sandbox
 
     add_unirequires "file grep sed which xdg-utils xprop"
-    add_unirequires "libpthread.so.0 libstdc++.so.6"
-    add_unirequires "libX11.so.6 libXcomposite.so.1 libXdamage.so.1 libXext.so.6 libXfixes.so.3 libXrandr.so.2 libxcb.so.1 libxkbcommon.so.0"
-    add_unirequires "libasound.so.2 libatk-1.0.so.0 libatk-bridge-2.0.so.0 libatspi.so.0"
-    add_unirequires "libcairo.so.2 libcups.so.2 libdbus-1.so.3"
-    add_unirequires "libdrm.so.2 libexpat.so.1 libfontconfig.so.1 libgbm.so.1"
-    add_unirequires "libgio-2.0.so.0 libglib-2.0.so.0 libgobject-2.0.so.0 libgtk-3.so.0 libpango-1.0.so.0"
-    add_unirequires "libnspr4.so libnss3.so libnssutil3.so libsmime3.so"
 }
 
 __get_binary_requires()
@@ -658,8 +717,7 @@ fix_cpio_bug_links()
         rlink="$(readlink "$link")"
         echo "$rlink" | grep -E "^(etc|var|opt|usr)/" || continue
         echo "Fixing cpio ALT bug 42189 in $link <- $rlink" >&2
-        rm -v $link
-        ln -sv /$rlink $link
+        ln -snfv "/$rlink" "$link"
     done
 }
 
@@ -670,9 +728,8 @@ use_system_xdg()
     [ -n "$prod" ] || prod="$PRODUCTDIR"
     # replace embedded xdg tools
     for i in $prod/{xdg-mime,xdg-settings} ; do
-        [ -s $BUILDROOT$i ] || continue
-        rm -v $BUILDROOT$i
-        ln -s /usr/bin/$(basename $i) $BUILDROOT$i
+        [ -s "$BUILDROOT$i" ] || continue
+        ln -snfv "/usr/bin/$(basename "$i")" "$BUILDROOT$i"
     done
 }
 

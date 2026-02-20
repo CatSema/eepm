@@ -55,13 +55,16 @@ epm_full_upgrade()
             "--no-snap")           # HELPCMD: skip snap update during full upgrade
                 full_upgrade_no_snap=1
                 ;;
+            "--no-stplr")          # HELPCMD: skip stplr update during full upgrade
+                full_upgrade_no_stplr=1
+                ;;
             "--no-kernel-update")  # HELPCMD: skip kernel update during full upgrade
                 full_upgrade_no_kernel_update=1
                 ;;
             "--no-clean")          # HELPCMD: no clean after upgrade
                 full_upgrade_no_clean=1
                 ;;
-            "--no-epm-update-check")          # HELPCMD: skip epm update during full upgrade
+            "--no-epm-update-check")          # HELPCMD: skip checking for epm updates during full upgrade
                 full_upgrade_no_epm_update_check=1
                 ;;
         esac
@@ -71,17 +74,7 @@ epm_full_upgrade()
 confirm_action()
 {
     [ -n "$interactive" ] || return 0
-    local response
-    # call with a prompt string or use a default
-    read -r -p "${1:-$(eval_gettext 'Are you sure? [Y/n]')} " response
-    case $response in
-        [yY][eE][sS]|[yY]|"")
-            true
-            ;;
-        *)
-            false
-            ;;
-    esac
+    confirm_yes "$1"
 }
 
     atomic=
@@ -101,14 +94,16 @@ confirm_action()
     confirm_action "Do upgrade epm? [Y/n]" || full_upgrade_no_epm_update_check=1
     if [ -z "$full_upgrade_no_epm_update_check" ] ; then
         if [ "$BASEDISTRNAME" = "alt" ] && epm status --original eepm ; then
-            [ -n "$quiet" ] || info "Checking for new eepm package in the repo..."
-            epm_version_before=$(epmq eepm &>/dev/null)
+            info "Checking for new eepm package in the repo..."
+            epm_version_before=$(epmq eepm 2>/dev/null)
             docmd epm $dryrun install eepm &>/dev/null
-            epm_version_after=$(epmq eepm &>/dev/null)
+            epm_version_after=$(epmq eepm 2>/dev/null)
             if [ "$epm_version_before" != "$epm_version_after" ] ; then
                 info "An update for epm has been found, restarting epm full-upgrade..."
                 exec $PROGDIR/$PROGNAME full-upgrade $orig_args
                 exit 0
+            else
+                info "epm is up to date ($epm_version_before)"
             fi
         else
             load_helper epm-update
@@ -171,7 +166,7 @@ confirm_action()
         confirm_action "Upgrade installed stplr packages? [Y/n]" || full_upgrade_no_stplr=1
         if [ -z "$full_upgrade_no_stplr" ] ; then
             [ -n "$quiet" ] || echo
-            docmd stplr upgrade
+            sudocmd stplr upgrade
         fi
     fi
 

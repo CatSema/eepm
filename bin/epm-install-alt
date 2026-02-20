@@ -17,6 +17,12 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
+# Load use_local_repo from environment variable if set
+[ -n "$EPM_USE_LOCAL_REPO" ] && use_local_repo="$EPM_USE_LOCAL_REPO"
+
+# Enable local repo for ALT Atomic systems
+[ "$FULLDISTRNAME" = "ALT Atomic" ] && use_local_repo=1
+
 epm_install_files_alt_via_repo()
 {
     local files="$*"
@@ -57,22 +63,15 @@ epm_install_files_alt()
 
     __epm_print_warning_for_nonalt_packages $files
 
-    # do repack if needed
-    if __epm_repack_if_needed $files ; then
-        [ -n "$repacked_pkgs" ] || fatal 'Can'\''t convert $files'
-        files="$repacked_pkgs"
-    fi
-
     if [ -n "$save_only" ] ; then
         echo
         cp -v $files "$EPMCURDIR"
         return
     fi
 
-    # install packages via apm on ALT Atomic
-    #if [ "$PMTYPE" = "apm-rpm" ] ; then
-    if [ "$FULLDISTRNAME" = "ALT Atomic" ] ; then
-        [ -n "$nodeps" ] || fatal "Option --nodeps is not supported in apm"
+    # install packages via local repo if enabled
+    if [ -n "$use_local_repo" ] ; then
+        [ -n "$nodeps" ] && warning "Option --nodeps is not supported with local repo, ignored"
         epm_install_files_alt_via_repo $files
         return
     fi
@@ -85,10 +84,8 @@ epm_install_files_alt()
 
     __epm_check_if_src_rpm $files
 
-    if [ -z "$repacked_pkgs" ] ; then
-        __epm_check_vendor $files
-        __epm_check_if_needed_repack $files
-    fi
+    __epm_check_vendor $files
+    epm repack --check-repack-rule $files
 
     # --replacepkgs: Install the Package Even If Already Installed
     local replacepkgs="$(__epm_get_replacepkgs $files)"
@@ -144,6 +141,34 @@ get_current_kernel_flavour()
     rflv=${rrel#*-}
     rflv=${rflv%-*}
     echo "$rflv"
+}
+
+# extract kernel flavour from package name
+# kernel-image-6.12 -> 6.12
+# kernel-image-std-def -> std-def
+# kernel-image-6.12.10-6.12-alt1 -> 6.12
+# kernel-image-5.10.123-std-def-alt1 -> std-def
+get_flavour_from_kernel_package()
+{
+    local pkg="$1"
+    # remove kernel-image- prefix if present
+    pkg="${pkg#kernel-image-}"
+
+    # if just flavour (no dots or single segment like "std-def" or "6.12")
+    case "$pkg" in
+        *-*-alt*)
+            # full version like 6.12.10-6.12-alt1 or 5.10.123-std-def-alt1
+            # extract flavour using same logic as get_current_kernel_flavour
+            local flv
+            flv="${pkg#*-}"   # 6.12-alt1 or std-def-alt1
+            flv="${flv%-*}"   # 6.12 or std-def
+            echo "$flv"
+            ;;
+        *)
+            # short form: 6.12 or std-def
+            echo "$pkg"
+            ;;
+    esac
 }
 
 # std-def 1.2.3-alt1 -> 1.2.3-std-def-alt1
@@ -247,7 +272,16 @@ epm_install_alt_kernel_module()
 
 epm_install_alt_names()
 {
+    [ -z "$1" ] && return
+
+    # check repo/package syntax (p10/pkg, sisyphus/pkg)
+    if __has_repo_syntax "$@" ; then
+        __process_repo_arguments epm_install_alt_names "$@"
+        return
+    fi
+
     local kmlist=''
+    local kilist=''
     local installnames=''
 
     while [ -n "$1" ] ; do
@@ -264,6 +298,11 @@ epm_install_alt_names()
             else
                 kmlist="$kmlist $kmn"
             fi
+        elif echo "$pkgname" | grep -v "#" | grep -q "^kernel-image-" ; then
+            # kernel-image-6.12 or kernel-image-std-def or full kernel-image-6.12.10-6.12-alt1
+            local flavour
+            flavour="$(get_flavour_from_kernel_package "$pkgname")"
+            kilist="$kilist $flavour"
         else
             installnames="$installnames $pkgname"
         fi
@@ -272,6 +311,15 @@ epm_install_alt_names()
 
     epm_install_names $installnames || return
     epm_install_alt_kernel_module $kmlist || return
+
+    # install kernel images via update-kernel (handles modules automatically)
+    if [ -n "$kilist" ] ; then
+        load_helper epm-kernel_update
+        local flavour
+        for flavour in $kilist ; do
+            epm_kernel_update -t "$flavour" || return
+        done
+    fi
 }
 
 # Unused hack for apt-repo
@@ -293,15 +341,12 @@ apt_repo_after()
     $SUDO rm /etc/apt/apt.conf.d/eepm-apt-noninteractive.conf 2>/dev/null
 }
 
-# Process arguments in TASK or TASK:package format
+# Process arguments in TASK or TASK/package format
 prepare_task_packages()
 {
     # Sets global vars:
     #   installlist  — final list of packages to install
     #   unique_tasks — unique task names from args
-    #
-    # Local vars:
-    #   seen_tasks, task_packages, task, pkg
 
     installlist=""
     unique_tasks=""
@@ -309,30 +354,11 @@ prepare_task_packages()
     local task_packages=""
 
     for arg in "$@"; do
-        # Parse argument into task and package
-        # Supported formats: 123456, 123456/pkg, task/123456, task/123456/pkg
-        local task=""
-        local pkg=""
-        case "$arg" in
-            task/*/*)
-                # task/123456/pkg
-                task=$(printf "%s" "$arg" | cut -d/ -f2)
-                pkg=$(printf "%s" "$arg" | cut -d/ -f3)
-                ;;
-            task/*)
-                # task/123456
-                task=$(printf "%s" "$arg" | cut -d/ -f2)
-                ;;
-            */*)
-                # 123456/pkg
-                task=$(printf "%s" "$arg" | cut -d/ -f1)
-                pkg=$(printf "%s" "$arg" | cut -d/ -f2)
-                ;;
-            *)
-                # 123456
-                task="$arg"
-                ;;
-        esac
+        # Parse argument: 123456, 123456/pkg, task/123456, task/123456/pkg
+        local task="$(get_tasknumber_from_arg "$arg")"
+        local pkg="$(get_pkgname_from_taskarg "$arg")"
+
+        [ -n "$task" ] || continue
 
         # Fetch task packages once per unique task
         if ! echo " $seen_tasks " | grep -q " $task "; then
@@ -353,10 +379,7 @@ prepare_task_packages()
 # copied from epm_upgrade_alt_tasks()
 epm_install_alt_tasks()
 {
-    load_helper epm-addrepo
-    load_helper epm-reposave
-    load_helper epm-removerepo
-    load_helper epm-Install
+    load_helper epm-install
 
     prepare_task_packages "$@"
 
@@ -383,12 +406,8 @@ epm_install_alt_tasks()
     fi
 
     local res
-    try_change_alt_repo
-    epm_addrepo $unique_tasks
-    __epm_update
+    __use_tmp_apt_for_tasks $unique_tasks || return 1
     (pkg_names="$installlist" epm_install)
     res=$?
-    epm_removerepo $unique_tasks
-    end_change_alt_repo
     return $res
 }

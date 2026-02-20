@@ -61,7 +61,7 @@ get_value()
     local de_name="$1"
     local key="$2"
 
-    get_json $de_name | parse_json_value "$key"
+    get_json_value "$(get_json $de_name)" "$key"
 }
 
 
@@ -71,7 +71,7 @@ get_values()
     local de_name="$1"
     local key="$2"
 
-    get_json $de_name | parse_json_values "$key" | xargs
+    get_json_values "$(get_json $de_name)" "$key" | xargs
 }
 
 
@@ -79,7 +79,8 @@ get_values()
 __get_api_url()
 {
     local package_name="$1"
-    echo "https://rdb.altlinux.org/api/package/package_info?name=$package_name&arch=$DISTRARCH&source=false&branch=$DISTRVERSION&full=false"
+    local branch="$(echo "$DISTRVERSION" | tr '[:upper:]' '[:lower:]')"
+    echo "https://rdb.altlinux.org/api/package/package_info?name=$package_name&arch=$DISTRARCH&source=false&branch=$branch&full=false"
 }
 
 # de
@@ -123,21 +124,48 @@ is_de_installed()
 }
 
 
+# args: de_name
+get_available_variants()
+{
+    local de_name="$1"
+    parse_json_object_keys metapackage_variants < "$(get_json $de_name)" | xargs
+}
+
+# args: de_name [variant]
 install_de_meta()
 {
-    local metapackages="$(get_values "$de_name" "metapackages")"
+    local de_name="$1"
+    local variant="$2"
+    local metapackages
+
+    if [ -n "$variant" ] ; then
+        # get metapackage from metapackage_variants using JSON path
+        metapackages="$(get_json_value "$(get_json $de_name)" '["metapackage_variants","'$variant'"]')"
+        if [ -z "$metapackages" ] ; then
+            local available="$(get_available_variants "$de_name")"
+            if [ -z "$available" ] ; then
+                fatal "$de_name does not support variants"
+            else
+                fatal "Unknown variant '$variant' for $de_name. Available variants: $available"
+            fi
+        fi
+    else
+        metapackages="$(get_values "$de_name" "metapackages")"
+    fi
 
     # silent skip missed metapackages
     [ -n "$metapackages" ] || return 0
 
     # we really want mark all installed packages as manually installed?
-    epm install --manual-requires $metapackages
+    docmd epm install --manual-requires $metapackages
 }
 
 
+# args: de_name [variant]
 install_de()
 {
     local de_name="$1"
+    local variant="$2"
 
     if [ -z "$force" ] && is_de_installed $de_name ; then
         message "$de_name is already installed."
@@ -146,13 +174,17 @@ install_de()
 
     local dependencies="$(get_values "$de_name" "dependencies")"
 
-    message "Installing $de_name with dependencies: $dependencies"
+    if [ -n "$variant" ] ; then
+        message "Installing $de_name ($variant) with dependencies: $dependencies"
+    else
+        message "Installing $de_name with dependencies: $dependencies"
+    fi
 
-    if ! install_de_meta ; then
+    if ! install_de_meta "$de_name" "$variant" ; then
         fatal "Failed to install metapackage(s) for $de_name."
     fi
 
-    if ! epm install $dependencies ; then
+    if ! docmd epm install $dependencies ; then
         fatal "Failed to install $de_name."
     fi
 
@@ -176,7 +208,7 @@ remove_de()
     message "Removing $de_name with dependencies: $dependencies"
 
     # We hope that metapackages will removed by dependency
-    if ! epm remove $dependencies ; then
+    if ! docmd epm remove $dependencies ; then
         fatal "Failed to remove $de_name."
     fi
 
@@ -201,11 +233,13 @@ get_de_info()
         return
     fi
 
+    local variants="$(get_available_variants "$de_name")"
     message "Information for $de_name:
     Name: $(get_value $de_name name)
     Version: $version
     Installed: $installed
     Description: $(get_value $de_name description)"
+    [ -n "$variants" ] && message "    Variants: $variants"
 }
 
 
@@ -235,6 +269,16 @@ list_des()
     echo ']'
 }
 
+
+list_installed_des()
+{
+    local de de_name
+    for de in $CONFIGDIR/desktop.d/*.json ; do
+        de_name="$(basename "$de" .json)" || fatal
+        is_de_installed "$de_name" && echo "$de_name"
+    done
+}
+
 epm_desktop_help()
 {
     message 'Usage: epm desktop <command> [--json] [option]'
@@ -242,6 +286,7 @@ epm_desktop_help()
     message '
 Examples:
   epm desktop install kde
+  epm desktop install kde=small
 '
 }
 
@@ -266,9 +311,16 @@ epm_desktop()
             epm_desktop_help
             return
             ;;
-        install)                      # HELPCMD: <de_name>   Install a desktop environment
-            check_if_de_exists "$1"
-            install_de "$1"
+        install)                      # HELPCMD: <de_name>[=variant]   Install a desktop environment
+            local de_arg="$1"
+            local de_name="${de_arg%%=*}"
+            local variant=""
+            # parse de=variant
+            if [ "$de_arg" != "$de_name" ] ; then
+                variant="${de_arg#*=}"
+            fi
+            check_if_de_exists "$de_name"
+            install_de "$de_name" "$variant"
             ;;
         remove)                       # HELPCMD: <de_name>   Remove a desktop environment
             check_if_de_exists "$1"
@@ -278,8 +330,11 @@ epm_desktop()
             check_if_de_exists "$1"
             get_de_info "$1" $json_flag
             ;;
-        list)                         # HELPCMD:             List all available desktop environments'
+        list)                         # HELPCMD:             List all available desktop environments
             list_des $json_flag
+            ;;
+        list-installed)               # HELPCMD:             List installed desktop environments
+            list_installed_des
             ;;
         installed)
             is_de_installed "$1"

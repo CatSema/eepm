@@ -18,9 +18,26 @@
 #
 
 load_helper epm-sh-altlinux
+load_helper epm-sh-repo
+
+
+# Remove repo line from sources.list (delete line)
+__apt_delete_repo_line()
+{
+    local repo="$1"
+
+    local sc="sudocmd"
+    [ -z "$quiet" ] || sc="sudorun"
+
+    # touch file only when it is needed
+    grep -q -F "$repo" "$APT_SOURCES_LIST" || return
+    $sc sed -i -e "\|$(sed_escape "$repo")|d" "$APT_SOURCES_LIST"
+}
 
 
 # like apt-add-repository --remove on deb systems
+# For /etc/apt/sources.list: delete lines
+# For /etc/apt/sources.list.d/*.list: comment lines via epm repo disable
 __epm_removerepo_apt()
 {
     local repo="$*"
@@ -31,17 +48,11 @@ __epm_removerepo_apt()
         return
     fi
 
-    local sc="sudocmd"
-    [ -z "$quiet" ] || sc="sudorun"
+    # main sources.list: delete lines (first, so disable won't touch it)
+    __apt_delete_repo_line "$repo"
 
-    local i
-    for i in /etc/apt/sources.list /etc/apt/sources.list.d/*.list ; do
-        [ -s "$i" ] || continue
-        # touch file only when it is needed
-        grep -q -F "$repo" $i || continue
-        
-        $sc sed -i -e "\|$(sed_escape "$repo")|d" $i
-    done
+    # sources.list.d: comment lines instead of deleting
+    epm repo disable "^$repo" 2>/dev/null
 }
 
 
@@ -51,8 +62,9 @@ __epm_grep_repo_list()
         epm --quiet repo list
         return
     fi
+    # use --regex for raw regex patterns
     while [ -n "$1" ] ; do
-        epm --quiet repo list "$1"
+        epm --quiet repo list --regex "$1"
         shift
     done
 }
@@ -64,8 +76,9 @@ __epm_removerepo_alt_grepremove()
 
     rl="$(__epm_grep_repo_list "$@" 2>/dev/null)"
     if [ -z "$rl" ] ; then
-        [ -n "$verbose" ] && warning 'Can'\''t find '$*' in the repos list (see # epm repolist output)'
-        return 1
+        # not an error - repo may be already removed (idempotency)
+        [ -n "$verbose" ] && info 'Repo '$*' is not in the repos list'
+        return 0
     fi
 
     echo "$rl" | while read rp ; do
@@ -78,9 +91,11 @@ __epm_removerepo_alt()
     local repo="$*"
     [ -n "$repo" ] || fatal "No such repo or task. Use epm repo remove <regexp|autoimports|archive|tasks|TASKNUMBER>"
 
-    if tasknumber "$repo" >/dev/null ; then
-        local tn
-        for tn in $(tasknumber "$repo") ; do
+    if is_taskarg $repo ; then
+        local arg tn
+        for arg in $repo ; do
+            is_taskarg "$arg" || continue
+            tn=$(get_tasknumber_from_arg "$arg")
             __epm_removerepo_alt_grepremove " repo/$tn/" "/tasks/$tn " "/$tn[ /]build/repo"
         done
         return
@@ -138,6 +153,25 @@ __epm_removerepo_alt()
 epm_removerepo()
 {
 
+# Handle copr/owner/project syntax for Fedora/RHEL
+case "$1" in
+    copr/*)
+        local owner_project="$(echo "$1" | sed 's|^copr/||')"
+        case $PMTYPE in
+            dnf-rpm|dnf5-rpm)
+                sudocmd dnf copr disable "$owner_project"
+                ;;
+            yum-rpm)
+                sudocmd yum copr disable "$owner_project"
+                ;;
+            *)
+                fatal "Copr repos are only supported on Fedora/RHEL systems (dnf/yum)"
+                ;;
+        esac
+        return
+        ;;
+esac
+
 case $BASEDISTRNAME in
     "alt")
         __epm_removerepo_alt "$@"
@@ -153,10 +187,19 @@ esac;
 
 case $PMTYPE in
     apt-dpkg)
-        assure_exists apt-add-repository software-properties-common
-        # FIXME: it is possible there is troubles to pass the args
-        sudocmd apt-add-repository --remove "$*"
-        info "Check file /etc/apt/sources.list if needed"
+        local files
+        files="$(__find_deb822_files_by_pattern "$1")"
+        if [ -n "$files" ] ; then
+            assure_root
+            echo "$files" | while read f ; do
+                __deb822_remove "$f"
+            done
+        else
+            assure_exists apt-add-repository software-properties-common
+            # FIXME: it is possible there is troubles to pass the args
+            sudocmd apt-add-repository --remove "$*"
+            info "Check file /etc/apt/sources.list if needed"
+        fi
         ;;
     aptitude-dpkg)
         info "You need remove repo from /etc/apt/sources.list"

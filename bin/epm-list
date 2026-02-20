@@ -19,16 +19,11 @@
 
 epm_list_help()
 {
-    message '
-epm list - list packages
-Usage: epm list [options] [package]
-
-Options:
-  --available           list only available packages
-  --installed           list only installed packages
-  --upgradable          list only upgradable packages
+    message 'epm list - list packages
+Usage: epm list [options] [package]|[TASK]
 '
-#  --all                 list all packages (default)
+    get_help HELPOPT $SHAREDIR/epm-list
+    get_help HELPCMD $SHAREDIR/epm-list
 }
 
 epm_list()
@@ -37,41 +32,49 @@ epm_list()
 
     if [ -z "$1" ] ; then
         # locally installed packages by default
-        load_helper epm-packages
-        epm_packages "$@"
+        load_helper epm-list_installed
+        epm_list_installed "$@"
         return
     fi
 
     shift
 
     case "$option" in
-        -h|--help)
+        -h|--help)                # HELPOPT: show this help
             epm_list_help
             return
             ;;
-        #--all)
-        #    # TODO: exclude locally installed?
-        #    epm_list_available
-        #    return
-        #    ;;
-        --available)
-            # TODO: exclude locally installed?
+        --available)              # HELPOPT: list only available packages
             load_helper epm-list_available
             epm_list_available "$@"
             return
             ;;
-        --installed)
-            load_helper epm-packages
-            epm_packages "$@"
+        --installed)              # HELPOPT: list only installed packages
+            load_helper epm-list_installed
+            epm_list_installed "$@"
             return
             ;;
-        --upgradable)
-            # TODO: exclude locally installed?
+        --upgradable)             # HELPOPT: list only upgradable packages
             load_helper epm-list_upgradable
             epm_list_upgradable "$@"
             return
             ;;
+        --programs)               # HELPOPT: list packages that have GUI (.desktop files)
+            load_helper epm-programs
+            epm_programs "$@"
+            return
+            ;;
+        TASK)                     # HELPCMD: list packages from ALT task (e.g., 404628 or task/404628)
+            ;;
         *)
+            # check if it's a task number (e.g., 404628 or task/404628)
+            load_helper epm-sh-altlinux
+            if is_taskarg "$option" ; then
+                local task="$(get_tasknumber_from_arg "$option")"
+                [ -n "$task" ] || fatal "Can't extract task number from '$option'"
+                get_task_packages "$task"
+                return
+            fi
             fatal 'Unknown option $option, use epm list --help to get info'
             ;;
     esac

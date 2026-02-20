@@ -12,7 +12,8 @@ TDIR=$LOGDIR/epm-play-versions
 EDIR=$LOGDIR/epm-errors
 LDIR=$LOGDIR/epm-logs
 RDIR=$LOGDIR/epm-requires
-mkdir -p $TDIR/ $EDIR/ $LDIR/ $RDIR/
+FDIR=$LOGDIR/epm-filelist
+mkdir -p $TDIR/ $EDIR/ $LDIR/ $RDIR/ $FDIR/
 
 rm -f $EDIR/errors.txt
 
@@ -35,9 +36,16 @@ install_app()
     mv -f $EDIR/$applog $LDIR/$applog
 
     local pkgname="$($EPM play --package-name $app $alt)"
-    $EPM print version for package $pkgname > $TDIR/$pkgname 2>$EDIR/$pkgname && rm -f $EDIR/$pkgname
+    # get version and release from installed package
+    local version="$($EPM print version for package $pkgname)"
+    local release="$($EPM print release for package $pkgname)"
+    # extract RELEASE (everything after epm1.repacked.)
+    local pkgrel=$(echo "$release" | sed -n 's/epm1\.repacked\.//p')
+    # write "VERSION RELEASE" format
+    echo "$version $pkgrel" > $TDIR/$pkgname 2>$EDIR/$pkgname && rm -f $EDIR/$pkgname
     [ -s $TDIR/$pkgname ] || echo "empty file $TDIR/$pkgname" >>$EDIR/errors.txt
     $EPM req $pkgname >$RDIR/$applog
+    $EPM ql $pkgname >$FDIR/$applog
 }
 
 install_app_alt()
@@ -101,6 +109,7 @@ commit_git $TDIR
 commit_git $EDIR
 commit_git $LDIR
 commit_git $RDIR
+commit_git $FDIR
 
 cd $TMP
 rm -rf tmp.* rpm-tmp.*

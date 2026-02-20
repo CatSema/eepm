@@ -17,6 +17,15 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
+__epm_mark_resolve()
+{
+    local i pkg
+    for i in "$@" ; do
+        pkg="$(epm query --short "$i" 2>/dev/null)" || { warning "Package '$i' is not installed" ; continue ; }
+        echo "$pkg"
+    done
+}
+
 __alt_mark_hold_package()
 {
         local pkg="$1"
@@ -89,6 +98,11 @@ case $BASEDISTRNAME in
         ;;
 esac
 
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
+
 case $PMTYPE in
     apt-dpkg)
         sudocmd apt-mark hold "$@"
@@ -123,6 +137,11 @@ case $BASEDISTRNAME in
         exit
         ;;
 esac
+
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
 
 case $PMTYPE in
     apt-dpkg)
@@ -212,6 +231,11 @@ epm_mark_showhold | grep -q "^$1$"
 epm_mark_auto()
 {
 
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
+
 case $BASEDISTRNAME in
     "alt")
         sudocmd apt-mark auto "$@"
@@ -223,8 +247,11 @@ case $PMTYPE in
     apt-dpkg)
         sudocmd apt-mark auto "$@"
         ;;
-    dnf-rpm|dnf5-rpm)
+    dnf-rpm)
         sudocmd dnf mark remove "$@"
+        ;;
+    dnf5-rpm)
+        sudocmd dnf mark dependency "$@"
         ;;
     pacman)
             sudocmd pacman -D --asdeps "$@"
@@ -243,6 +270,11 @@ esac
 epm_mark_manual()
 {
 
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
+
 case $BASEDISTRNAME in
     "alt")
         sudocmd apt-mark manual "$@"
@@ -254,8 +286,11 @@ case $PMTYPE in
     apt-dpkg)
         sudocmd apt-mark manual "$@"
         ;;
-    dnf-rpm|dnf5-rpm)
+    dnf-rpm)
         sudocmd dnf mark install "$@"
+        ;;
+    dnf5-rpm)
+        sudocmd dnf mark user "$@"
         ;;
     pacman)
             sudocmd pacman -D --asexplicit "$@"
@@ -319,14 +354,55 @@ esac
 
 }
 
+__epm_exclude_apply()
+{
+    [ -n "$exclude" ] || return 0
+    __epm_exclude_holdlist=""
+    local i
+    for i in $exclude ; do
+        if epm_mark_checkhold "$i" ; then
+            info "Package $i is already on hold, skipping"
+        else
+            info "Putting package $i on hold ..."
+            ( epm_mark_hold "$i" )
+            __epm_exclude_holdlist="$__epm_exclude_holdlist $i"
+        fi
+    done
+    __epm_exclude_holdlist="$(strip_spaces "$__epm_exclude_holdlist")"
+    [ -n "$__epm_exclude_holdlist" ] || return 0
+    # chain EXIT trap: save previous handler
+    __epm_exclude_prev_handler="$(trap -p EXIT | sed -n "s/^trap -- '\(.*\)' EXIT$/\1/p")"
+    trap '__epm_exclude_restore; '"$__epm_exclude_prev_handler" EXIT
+    trap '__epm_exclude_restore; exit 1' INT TERM
+}
+
+__epm_exclude_restore()
+{
+    [ -n "$__epm_exclude_holdlist" ] || return 0
+    local i
+    for i in $__epm_exclude_holdlist ; do
+        info "Removing hold from package $i ..."
+        ( epm_mark_unhold "$i" )
+    done
+    __epm_exclude_holdlist=""
+    # restore previous trap
+    trap - INT TERM
+    if [ -n "$__epm_exclude_prev_handler" ] ; then
+        trap "$__epm_exclude_prev_handler" EXIT
+    else
+        trap - EXIT
+    fi
+}
+
 epm_mark_help()
 {
     message "mark is the interface for marking packages"
+            get_help HELPOPT $SHAREDIR/epm-mark
             get_help HELPCMD $SHAREDIR/epm-mark
     message '
 Examples:
   epm mark hold mc
-  epm manual mc
+  epm mark manual mc
 '
 }
 
@@ -335,7 +411,7 @@ epm_mark()
     local CMD="$1"
     [ -n "$CMD" ] && shift
     case "$CMD" in
-    ""|"-h"|"--help"|help)               # HELPCMD: help
+    ""|"-h"|"--help"|help)               # HELPOPT: help
         epm_mark_help
         ;;
     hold)                             # HELPCMD: mark the given package(s) as held back

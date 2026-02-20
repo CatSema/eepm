@@ -61,6 +61,9 @@ __epm_repack_copy()
     local abspkg="$1"
     local target="$2"
 
+    # skip if source and target are the same file
+    [ "$abspkg" -ef "$target" ] && return 0
+
     # if source file is not writable, try CoW or fallback to ordinal copy
     #if [ ! -w "$abspkg" ] ; then
     #    cp --reflink=auto $verbose $abspkg $target 2>/dev/null && return
@@ -168,7 +171,7 @@ __prepare_source_package()
     # they will fill $returntarname
 
     if __check_packrule "$alpkg" ; then
-        __epm_pack_run_handler ${__PACKRULE} "$pkg"
+        __epm_pack_run_handler ${__PACKRULE} "$pkg" "$pkgversion" "$pkg_urls_downloaded"
     elif rihas "$alpkg" "\.AppImage$" ; then
         # big hack with $pkg_urls_downloaded (it can be a list, not a single url)
         __epm_pack_run_handler generic-appimage "$pkg" "$pkgversion" "$pkg_urls_downloaded"
@@ -227,7 +230,7 @@ __epm_repack_single()
                 __epm_repack_to_deb "$pkg" || return
             fi
             ;;
-        pkg.tar.xz)
+        pkg.tar.xz|pkg.tar.zst)
             load_helper epm-repack-arch
             __epm_repack_to_arch "$pkg" || return
             ;;
@@ -256,17 +259,32 @@ __epm_repack()
 }
 
 
-__epm_repack_if_needed()
+epm_repack_help()
 {
-    # return 1 if there is a package in host package format
-    __epm_split_by_pkg_type $PKGFORMAT "$@" && return 1
-
-    __epm_repack "$@"
-    return 0
+    message "epm repack - repack packages to native format"
+    message "Usage: epm repack [options] <package files>"
+    message ""
+    message "Options:"
+    message "  --install              install repacked packages"
+    message "  --check-repack-rule    warn if there is a repack rule for the package"
 }
 
 epm_repack()
 {
+    local opt
+    for opt in $pkg_options ; do
+        case "$opt" in
+            -h|--help)
+                epm_repack_help
+                return
+                ;;
+            --check-repack-rule)
+                __epm_check_if_needed_repack $pkg_files
+                return
+                ;;
+        esac
+    done
+
     # if possible, it will put pkg_urls into pkg_files and reconstruct pkg_filenames
     if [ -n "$pkg_urls" ] ; then
         load_helper epm-download
@@ -278,11 +296,14 @@ epm_repack()
     [ -z "$pkg_files" ] && info "Empty repack list was skipped" && return 22
     if __epm_repack $pkg_files && [ -n "$repacked_pkgs" ] ; then
         if [ -n "$install" ] ; then
+            [ "$allow_repack_install" = "0" ] && fatal "Installing repacked packages is forbidden by allow_repack_install=0 in $CONFIGDIR/eepm.conf"
             epm install $repacked_pkgs
             return
         fi
 
-        cp $repacked_pkgs "$EPMCURDIR"
+        for i in $repacked_pkgs ; do
+            [ "$i" -ef "$EPMCURDIR/$(basename "$i")" ] || cp $i "$EPMCURDIR"
+        done
         if [ -z "$quiet" ] ; then
             echo
             message "Adapted packages:"

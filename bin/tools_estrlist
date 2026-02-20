@@ -31,21 +31,33 @@ fatal()
         exit 1
 }
 
-filter_strip_spaces()
+strip()
 {
-        # possible use just
-        #xargs echo
-        sed -e "s| \+| |g" -e "s|^ ||" -e "s| \$||"
+        set -f
+        set -- $@
+        echo "$*"
+        set +f
 }
 
+# legacy
 strip_spaces()
 {
-        echo "$*" | filter_strip_spaces
+        strip "$@"
+}
+
+# deprecated: use 'strip' instead
+# legacy, line-by-line processing
+filter_strip_spaces()
+{
+        local line
+        while read -r line ; do
+                strip "$line"
+        done
 }
 
 is_empty()
 {
-        [ "$(strip_spaces "$*")" = "" ]
+        [ "$(strip "$*")" = "" ]
 }
 
 isempty()
@@ -55,12 +67,21 @@ isempty()
 
 first()
 {
-        echo "$*" | cut -f1 -d" "
+        set -f
+        set -- $@
+        echo "$1"
+        set +f
 }
 
 last()
 {
-        echo "$*" | xargs -n1 echo 2>/dev/null | tail -n1
+        local i last
+        set -f
+        for i in $@ ; do
+                last="$i"
+        done
+        set +f
+        echo "$last"
 }
 
 firstupper()
@@ -79,9 +100,12 @@ tolower()
 
 has_space()
 {
-        # not for dash:
-        # [ "$1" != "${1/ //}" ]
-        [ "$(echo "$*" | sed -e "s| ||")" != "$*" ]
+        local res
+        set -f
+        set -- $@
+        [ $# -gt 1 ]; res=$?
+        set +f
+        return $res
 }
 
 list()
@@ -97,14 +121,15 @@ list()
 count()
 {
         set -f
-        list $@ | wc -l
+        set -- $@
+        echo $#
         set +f
 }
 
 union()
 {
         set -f
-        strip_spaces $(list $@ | sort -u)
+        strip $(list $@ | sort -u)
         set +f
 }
 
@@ -112,12 +137,14 @@ intersection()
 {
         local RES=""
         local i j
+        set -f
         for i in $2 ; do
             for j in $1 ; do
                 [ "$i" = "$j" ] && RES="$RES $i"
             done
         done
-        strip_spaces "$RES"
+        set +f
+        strip "$RES"
 }
 
 uniq()
@@ -151,7 +178,7 @@ reg_remove()
                 echo "$i" | grep -q "^$1$" || RES="$RES $i"
         done
         set +f
-        strip_spaces "$RES"
+        strip "$RES"
 }
 
 # remove_from_list "1." "11 12 21 22" -> "21 22"
@@ -164,17 +191,19 @@ reg_wordremove()
                 echo "$i" | grep -q -w "$1" || RES="$RES $i"
         done
         set +f
-        strip_spaces "$RES"
+        strip "$RES"
 }
 
 reg_rqremove()
 {
         local i
         local RES=""
+        set -f
         for i in $2 ; do
                 [ "$i" = "$1" ] || RES="$RES $i"
         done
-        strip_spaces "$RES"
+        set +f
+        strip "$RES"
 }
 
 # Args: LIST1 LIST2
@@ -189,43 +218,34 @@ exclude()
                 RES="$(reg_rqremove "$i" "$RES")"
         done
         set +f
-        strip_spaces "$RES"
+        strip "$RES"
 }
 
 # regexclude_list "22 1." "11 12 21 22" -> "21"
 reg_exclude()
 {
-        local i
-        local RES="$2"
         set -f
-        for i in $1 ; do
-                RES="$(reg_remove "$i" "$RES")"
-        done
+        # Each pattern as separate line with ^...$ anchors (BRE, not ERE)
+        strip "$(list $2 | grep -vf <(list $1 | sed 's/.*/^&$/') | tr '\n' ' ')"
         set +f
-        strip_spaces "$RES"
 }
 
 # regexclude_list "22 1." "11 12 21 22" -> "21"
 reg_wordexclude()
 {
-        local i
-        local RES="$2"
         set -f
-        for i in $1 ; do
-                RES=$(reg_wordremove "$i" "$RES")
-        done
+        # Each pattern as separate line for grep -f (BRE, not ERE)
+        strip "$(list $2 | grep -vwf <(list $1) | tr '\n' ' ')"
         set +f
-        strip_spaces "$RES"
 }
 
+# internal function
 if_contain()
 {
         local i
-        set -f
         for i in $2 ; do
             [ "$i" = "$1" ] && return
         done
-        set +f
         return 1
 }
 
@@ -241,29 +261,41 @@ difference()
             if_contain $i "$1" || RES="$RES $i"
         done
         set +f
-        strip_spaces "$RES"
+        strip "$RES"
 }
 
 
-# FIXME:
 # reg_include "1." "11 12 21 22" -> "11 12"
 reg_include()
 {
-        local i
-        local RES=""
         set -f
-        for i in $2 ; do
-                echo "$i" | grep -q -w "$1" && RES="$RES $i"
-        done
+        # Each pattern as separate line with ^...$ anchors (BRE, not ERE)
+        strip "$(list $2 | grep -f <(list $1 | sed 's/.*/^&$/') | tr '\n' ' ')"
         set +f
-        strip_spaces "$RES"
+}
+
+# reg_wordinclude "1." "11 12 21 22" -> "11 12"
+reg_wordinclude()
+{
+        set -f
+        # Each pattern as separate line for grep -f (BRE, not ERE)
+        strip "$(list $2 | grep -wf <(list $1) | tr '\n' ' ')"
+        set +f
 }
 
 contains()
 {
-    #estrlist has "$1" "$2"
-    local res="$(reg_wordexclude "$1" "$2")"
-    [ "$res" != "$2" ]
+    local word item found
+    set -f
+    for word in $1 ; do
+        found=0
+        for item in $2 ; do
+            [ "$item" = "$word" ] && found=1 && break
+        done
+        [ "$found" = 0 ] && set +f && return 1
+    done
+    set +f
+    return 0
 }
 
 example()
@@ -285,18 +317,18 @@ help()
         echo "estrlist developed for string list operations. See also cut, join, paste..."
         echo "Usage: $0 <command> [args]"
         echo "Commands:"
-        echo "  strip_spaces [args]               - remove extra spaces"
-# TODO: add filter
-#        echo "  filter_strip_spaces               - remove extra spaces from words from standart input"
+        echo "  strip [args]                      - remove extra spaces"
 #        echo "  reg_remove  <PATTERN> [word list] - remove words containing a match to the given PATTERN (grep notation)"
 #        echo "  reg_wordremove  <PATTERN> [word list] - remove words containing a match to the given PATTERN (grep -w notation)"
         echo "  exclude <list1> <list2>           - print list2 items exclude list1 items"
         echo "  reg_exclude <list PATTERN> [word list] - print only words that do not match PATTERN"
-#        echo "  reg_wordexclude <list PATTERN> [word list] - print only words do not match PATTERN"
+        echo "  reg_wordexclude <list PATTERN> [word list] - print only words that do not match PATTERN (word boundary)"
+        echo "  reg_include <list PATTERN> [word list] - print only words that match PATTERN"
+        echo "  reg_wordinclude <list PATTERN> [word list] - print only words that match PATTERN (word boundary)"
         echo "  has <PATTERN> string              - check the string for a match to the regular expression given in PATTERN (grep notation)"
         echo "  match <PATTERN> string            - check the string for a match to the regular expression given in PATTERN (egrep notation)"
         echo "  isempty [string] (is_empty)       - true if string has no any symbols (only zero or more spaces)"
-        echo "  has_space [string]                - true if string has no spaces"
+        echo "  has_space [string]                - true if string has whitespace (space, tab, newline)"
         echo "  union [word list]                 - sort and remove duplicates"
         echo "  intersection <list1> <list2>      - print only intersected items (the same in both lists)"
         echo "  difference <list1> <list2>        - symmetric difference between lists items (not in both lists)"
@@ -309,12 +341,20 @@ help()
         echo "  firstupper <word list>            - print the words with first letter of each in upper case"
         echo "  tolower <word list>               - print the words in lower case"
         echo
+        echo "Legacy:"
+        echo "  strip_spaces                      - alias for strip"
+        echo
         echo "Examples:"
+        example strip "  hello   world  "
+        echo "echo '  hello   world  ' | \$0 strip -"
 #        example reg_remove "1." "11 12 21 22"
 #        example reg_wordremove "1." "11 12 21 22"
         example exclude "1 3" "1 2 3 4"
         example reg_exclude "22 1." "11 12 21 22"
         example reg_wordexclude "wo.* er" "work were more else"
+        example reg_include "1." "11 12 21 22"
+        example reg_wordinclude "lib" "lib libfoo foolib"
+        example reg_wordinclude "lib.*" "lib-foo libbar other"
         example union "1 2 2 3 3"
         example_res contains "wo" "wo wor"
         example_res contains "word" "wo wor"
@@ -341,7 +381,7 @@ if [ "$COMMAND" = "-h" ] || [ "$COMMAND" = "--help" ] ; then
         COMMAND="help"
 fi
 
-#
+# command aliases
 case "$COMMAND" in
     reg_remove|reg_wordremove)
         fatal "obsoleted command $COMMAND"

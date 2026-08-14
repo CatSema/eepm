@@ -10,7 +10,7 @@ end
 
 function __eepm_list_installed_packages
     set -l cur (commandline -ct)
-    epm qp --quiet --short "^$cur"
+    epm qp --quiet --short "^$cur" | string replace -r ' - ' \t
 end
 
 function __eepm_list_available_packages
@@ -21,11 +21,11 @@ function __eepm_list_available_packages
         # repo/package syntax (sisyphus/pkg, p10/pkg): complete package part, keep repo prefix
         set -l prefix (string replace -r '/[^/]*$' '' -- $cur)
         set -l pkg (string replace -r '^.*/' '' -- $cur)
-        epm list --available --quiet --short --direct | grep "^$pkg" | sed "s|^|$prefix/|"
+        epm list --available --quiet --short --direct | grep "^$pkg" | sed "s|^|$prefix/|" | string replace -r ' - ' \t
     else
         # plain packages + repo prefixes (sisyphus/, p10/, ...)
         epm tool epm-completion repos 2>/dev/null
-        epm list --available --quiet --short --direct | grep "^$cur"
+        epm list --available --quiet --short --direct | grep "^$cur" | string replace -r ' - ' \t
     end
 end
 

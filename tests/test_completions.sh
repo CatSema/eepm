@@ -118,6 +118,21 @@ test_fish_source() {
     fi
 }
 
+# Test: package descriptions are display-only Fish completion metadata
+test_fish_package_descriptions() {
+    if command -v fish >/dev/null 2>&1 ; then
+        local result
+        result=$(fish -c "source '$COMPLETIONS/fish/eepm.fish'; function commandline; printf mangohud; end; function epm; printf '%s\\n' 'mangohud-0.8.4-alt1 - A Vulkan overlay'; end; __eepm_list_installed_packages | string escape" 2>/dev/null)
+        if [ "$result" = 'mangohud-0.8.4-alt1\tA\ Vulkan\ overlay' ] ; then
+            pass "fish package descriptions use completion metadata"
+        else
+            fail "fish package descriptions are inserted as arguments"
+        fi
+    else
+        echo "SKIP: fish not available"
+    fi
+}
+
 # Run all tests
 echo "=== Testing shell completion scripts ==="
 echo
@@ -128,6 +143,7 @@ test_fish_syntax
 test_fish_symlinks
 test_bash_source
 test_fish_source
+test_fish_package_descriptions
 
 echo
 echo "=== Results: $PASSED passed, $FAILED failed ==="

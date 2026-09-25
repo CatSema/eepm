@@ -15,6 +15,9 @@ PRODUCTDIR=/opt/onlyoffice
 # ALT only
 add_requires fonts-ttf-liberation fonts-ttf-dejavu
 
+# The virtual keyboard plugin needs Qt5 QML and Quick from the system.
+add_unirequires libQt5Qml.so.5 libQt5Quick.so.5
+
 # pack icons
 iconname=onlyoffice-desktopeditors
 icon_paths=""
@@ -46,4 +49,3 @@ escaped_paths=$(echo "$template_paths" | sed ':a;N;$!ba;s/\n/\\n/g')
 subst "s|%files|%files\n$escaped_paths|" "$SPEC"
 
 fix_desktop_file /usr/bin/onlyoffice-desktopeditors
-

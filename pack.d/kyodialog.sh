@@ -6,18 +6,17 @@ RETURNTARNAME="$2"
 . $(dirname $0)/common.sh
 
 if echo "$TAR" | grep -q Linux_Universal_Driver.zip ; then
-    erc $TAR || fatal
+    erc --here $TAR || fatal
     TAR=$(echo KyoceraLinuxPackages-*.tar.gz)
 fi
 
 if echo "$TAR" | grep -q KyoceraLinuxPackages ; then
-    erc $TAR || fatal
+    erc --here $TAR || fatal
 else
     fatal "Have no idea how to handle $(basename $TAR)"
 fi
 
 rm $TAR
-cd KyoceraLinuxPackages-* || fatal
 case "$(epm print info -p)" in
     rpm)
         cd Fedora/Global/kyodialog_x86_64 || fatal

@@ -65,10 +65,14 @@ if [ -r "$DESKTOPFILE" ] ; then
     cat $DESKTOPFILE | sed -e "s|AppRun|$PRODUCT|" -e 's|X-AppImage-Integrate.*||' > $BUILDROOT/usr/share/applications/$DESKTOPFILE
     pack_file /usr/share/applications/$DESKTOPFILE
 
-    ICONNAME="$(cat $DESKTOPFILE | grep "^Icon=" | head -n1 | sed -e 's|Icon=||')"
+    ICONNAME="$(cat $DESKTOPFILE | grep "^Icon=" | head -n1 | sed -e 's|Icon=||' -e 's|\.png$||' -e 's|\.svg$||')"
     FROMICONFILE="$ICONNAME.png"
 
+    # generic "icon" name conflicts between packages, use product name instead
+    [ "$ICONNAME" = "icon" ] && ICONNAME="$PRODUCT"
+
     EXEC="$(cat $BUILDROOT/usr/share/applications/$DESKTOPFILE | grep "^Exec=" | head -n1 | sed -e 's|Exec=||' -e 's| .*||')"
+    EXEC="$(basename "$EXEC")"
 
     if [ -n "$EXEC" ] && [ "$PRODUCT" != "$EXEC" ] ; then
         PRODUCTCUR="$EXEC"
@@ -87,6 +91,11 @@ if [ -n "$ICONNAME" ] ; then
         grep -q "^<svg" $FROMICONFILE && ICONFILE="$PRODUCT.svg"
     fi
     install_file $PRODUCTDIR/$FROMICONFILE /usr/share/pixmaps/$ICONFILE
+
+    # update Icon= in desktop file to match renamed icon
+    if [ -f "$BUILDROOT/usr/share/applications/$DESKTOPFILE" ] ; then
+        subst "s|^Icon=.*|Icon=$ICONNAME|" $BUILDROOT/usr/share/applications/$DESKTOPFILE
+    fi
 fi
 
 # copy icons if possible

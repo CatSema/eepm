@@ -40,7 +40,7 @@ SHAREDIR="$PROGDIR"
 # will replaced with /etc/eepm during install
 CONFIGDIR="$PROGDIR/../etc"
 
-export EPMVERSION="3.64.51"
+export EPMVERSION="3.64.70"
 
 # package, single (file), pipe, git
 EPMMODE="package"
@@ -370,6 +370,11 @@ sed_escape()
     echo "$*" | sed -e 's|[][()$*.^|/]|\\&|g'
 }
 
+sed_escape_relaxed()
+{
+    echo "$*" | sed -e 's|[][()$*.^|]|\\&|g' -e 's|[/ ]\+|[/ ][/ ]*|g'
+}
+
 
 subst_option()
 {
@@ -448,7 +453,9 @@ __promo_message()
     local PROMOMESSAGE="$EPMPROMOMESSAGE"
     if [ -z "$PROMOMESSAGE" ] ; then
         local tg_link=$(make_osc8_link "https://t.me/useepm")
-        PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: $tg_link)"
+        local max_link=$(make_osc8_link "https://max.eepm.ru")
+        local matrix_link=$(make_osc8_link "https://matrix.eepm.ru")
+        PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: $tg_link, MAX: $max_link, Matrix: $matrix_link)"
     fi
     echo "$PROMOMESSAGE"
 }
@@ -473,7 +480,7 @@ fixme()
 
 debug()
 {
-    [ -n "$debug" ] || return
+    [ -z "$debug" ] && return
 
     set_color $YELLOW >&2
     echog -n "WARNING: " >&2
@@ -604,10 +611,10 @@ withtimeout()
         $TO "$@"
         return
     fi
-    fatal "Possible indefinite wait due timeout command is missed"
-    # fallback: drop time arg and run without timeout
-    #shift
-    #"$@"
+    # fallback: no timeout cmd (e.g. busybox built without applet) — drop time arg and run without timeout
+    warning "timeout command is missed, running without timeout"
+    shift
+    "$@"
 }
 
 set_eatmydata()
@@ -637,8 +644,13 @@ __get_package_for_command()
     esac
 }
 
+has_tty()
+{
+    ( : </dev/tty ) 2>/dev/null
+}
+
 read_tty() {
-    if [ -c /dev/tty ] ; then
+    if has_tty ; then
         read -r "$@" </dev/tty
     else
         read -r "$@"
@@ -689,9 +701,10 @@ confirm_yes() {
 confirm_info()
 {
     info "$*" >&2
-    if [ -z "$non_interactive" ] ; then
-        confirm "Are you sure? [y/N]" || fatal "Exiting"
-    fi
+    [ -n "$non_interactive" ] && return
+    confirm "Are you sure? [y/N]" && return
+    has_tty || [ -t 0 ] || fatal 'There is no terminal to ask for confirmation. Use --auto to confirm automatically.'
+    fatal "Exiting"
 
 }
 
@@ -1008,7 +1021,8 @@ __epm_assure_7zip()
     if is_command 7z || is_command 7za || is_command 7zr || is_command 7zz ; then
         :
     else
-        epm install 7-zip || epm install p7zip
+        # most distros provide 7zip package, including alt p11 and newer, but p10 and older not.
+        epm install 7zip || epm install 7-zip || epm install p7zip
     fi
 }
 
@@ -1087,7 +1101,8 @@ is_package_file()
 get_package_type()
 {
     local i
-    case $1 in
+    local _bn="$(basename "$1")"
+    case $_bn in
         *.deb)
             echo "deb"
             return
@@ -1116,13 +1131,17 @@ get_package_type()
             echo "AppImage"
             return
             ;;
+        *.pkg.tar.*)
+            echo "pkg.tar.$(echo "$_bn" | sed -e 's|.*\.pkg\.tar\.||')"
+            return
+            ;;
         *)
             if [ -r "$1" ] && file -L "$1" | grep -q " ELF " ; then
                 echo "ELF"
                 return
             fi
             # print extension by default
-            basename "$1" | sed -e 's|.*\.||'
+            echo "$_bn" | sed -e 's|.*\.||'
             return 1
             ;;
     esac
@@ -1218,12 +1237,25 @@ set_pm_type()
 
 if [ -n "$EPM_BACKEND" ] ; then
     PMTYPE="$EPM_BACKEND"
-    return
 fi
 if [ -n "$FORCEPM" ] ; then
     PMTYPE="$FORCEPM"
-    return
 fi
+
+case "$PMTYPE" in
+    dnf5)
+        PMTYPE="dnf5-rpm"
+        ;;
+esac
+
+case "$PMTYPE" in
+    dnf5-rpm)
+        DNFCMD="dnf5"
+        ;;
+    dnf-rpm)
+        DNFCMD="dnf"
+        ;;
+esac
 
 }
 
@@ -1333,8 +1365,8 @@ filter_glob_list()
 is_url()
 {
     echo "$1" | grep -qE "^(file|ftp|http|https|ipfs|rsync):/" && return 0
-    # SSH/rsync URL: host:/path or user@host:/path (but not scheme://)
-    echo "$1" | grep -qE '^[^:]+:/' && ! echo "$1" | grep -q "://"
+    # SSH/rsync URL: host:/path or user@host:/path (but not scheme://, not 'rpm file:/path ...')
+    echo "$1" | grep -qE '^[^:[:space:]]+:/' && ! echo "$1" | grep -q "://"
 }
 
 is_bash()
@@ -1395,7 +1427,7 @@ __epm_suggest_similar_packages()
     is_command fzf || return 1
 
     local similar
-    similar="$(fzf -f "$pkg" < "$cache" 2>/dev/null | head -$count)"
+    similar="$(fzf -f "$pkg" < "$cache" 2>/dev/null | grep -v "^${pkg}$" | head -$count)"
     [ -z "$similar" ] && return 1
 
     # Interactive selection if enabled (via config or --interactive flag)
@@ -1452,6 +1484,21 @@ else
 	}
 fi
 
+yaml_load_vars()
+{
+    local file="$1"
+    shift
+    local data field value
+    data="$(epm tool yaml "$file" 2>/dev/null)"
+    for field in "$@" ; do
+        value="$(printf '%s\n' "$data" | grep "^${field}=" | head -n1 | sed "s/^[^=]*=\"\(.*\)\"$/\1/")"
+        # skip if key is not present in yaml (preserve existing value)
+        [ -n "$value" ] || continue
+        # Use single quotes to prevent command execution in values
+        eval "$field='$(printf '%s' "$value" | sed "s/'/'\\\\''/g")'"
+    done
+}
+
 # File bin/epm-addrepo:
 
 
@@ -1478,13 +1525,13 @@ __epm_addrepo_rhel()
         powertools)
             # https://serverfault.com/questions/997896/how-to-enable-powertools-repository-in-centos-8
             assure_exists dnf-plugins-core
-            sudocmd dnf config-manager --set-enabled powertools
+            sudocmd $DNFCMD config-manager --set-enabled powertools
             return 1
             ;;
         crb)
             # https://wiki.rockylinux.org/rocky/repo/
             assure_exists dnf-plugins-core
-            sudocmd dnf config-manager --set-enabled crb
+            sudocmd $DNFCMD config-manager --set-enabled crb
             return 1
             ;;
     esac
@@ -1565,17 +1612,19 @@ __epm_addrepo_altlinux_short()
     [ "$1" = "rpm" ] || fatal "only for rpm repo"
     local url="$2"
     local repo="$3"
+    local sign="$4"
     local arch
 
     arch="$(basename "$url")"
     url="$(dirname "$url")"
-    docmd epm repo add "rpm $url $arch $repo"
+    docmd epm repo add "rpm ${sign:+$sign }$url $arch $repo"
 }
 
 
 __epm_addrepo_altlinux_url()
 {
     local url="$1"
+    local sign="$2"
     local arch
     local base
     local repo
@@ -1588,7 +1637,7 @@ __epm_addrepo_altlinux_url()
     if echo "$base" | grep -q "^RPMS\." ; then
         repo="$(echo $base | sed -e 's|.*\.||')"
         url="$(dirname $url)"
-        __epm_addrepo_altlinux_short rpm "$url" "$repo"
+        __epm_addrepo_altlinux_short rpm "$url" "$repo" "$sign"
         return
     fi
 
@@ -1598,7 +1647,7 @@ __epm_addrepo_altlinux_url()
     base="$(basename "$baseurl")"
     if echo "$base" | grep -q "^RPMS\." ; then
         REPO_NAME="$(echo "$base" | sed -e 's|.*\.||')"
-        __epm_addrepo_altlinux_short rpm "$url" "$REPO_NAME"
+        __epm_addrepo_altlinux_short rpm "$url" "$REPO_NAME" "$sign"
         return
     fi
 
@@ -1608,7 +1657,7 @@ __epm_addrepo_altlinux_url()
     arch=$DISTRARCH
     REPO_NAME="classic"
     if eget --check-url $url/$arch/base/pkglist.$REPO_NAME ; then
-        docmd epm repo add "rpm $url $arch $REPO_NAME"
+        docmd epm repo add "rpm ${sign:+$sign }$url $arch $REPO_NAME"
         return
     fi
 
@@ -1620,7 +1669,7 @@ __epm_addrepo_altlinux_url()
         [ -n "$rd" ] || continue
         local REPO_NAME="$(echo "$rd" | sed -e 's|/*$||' -e 's|.*\.||')"
         [ "$REPO_NAME" = "*" ] && continue
-        docmd epm repo add "rpm $url $arch $REPO_NAME"
+        docmd epm repo add "rpm ${sign:+$sign }$url $arch $REPO_NAME"
         res='1'
     done
     [ -n "$res" ] || warning "There is no arch repos in $url"
@@ -1650,8 +1699,9 @@ epm repo add - add branch repo. Use follow params:
 
 Examples:
     # epm repo add yandex
-    # epm repo add "rpm http://somesite/pub/product x86_64 addon
+    # epm repo add "rpm http://somesite/pub/product x86_64 addon"
     # epm repo add /var/ftp/pub/altlinux/p10
+    # epm repo add --name myrepo "rpm https://example.com x86_64 main"
 
 '
     return
@@ -1663,9 +1713,13 @@ __add_line_to_file()
     local line="$2"
     local sc="sudocmd"
     [ -n "$verbose" ] || sc="sudorun"
-    set_sudo
+    if [ -w "$file" ] || [ ! -e "$file" ] && [ -w "$(dirname "$file")" ] ; then
+        sc="command"
+    else
+        set_sudo
+    fi
     # ensure file ends with newline (check last byte)
-    [ -n "$(tail -c1 "$file")" ] && echo "" | $sc tee -a "$file" >/dev/null
+    [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ] && echo "" | $sc tee -a "$file" >/dev/null
     echo "$line" | $sc tee -a "$file" >/dev/null
 }
 
@@ -1676,10 +1730,8 @@ __epm_addrepo_to_file()
     shift
     local repo="$*"
 
-    if [ -z "$force" ] ; then
-        # skip if repo is already in the list
-        epm --quiet repo list "$repo" >/dev/null && return
-    fi
+    # always skip if repo is already in the list (even with --force)
+    epm --quiet repo list "$repo" >/dev/null && return
 
     if [ -n "$dryrun" ] ; then
         echo "$repo"
@@ -1693,6 +1745,353 @@ __epm_addrepo_to_file()
 
     __add_line_to_file "$file" "$repo"
 
+}
+
+__epm_addrepo_alt_dnf_mirror_key()
+{
+    [ -s "$ALT_DNF_MIRROR_KEYFILE" ] && return
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    eget -q -O- "$ALT_DNF_MIRROR_KEYURL" >$tmpfile && [ -s $tmpfile ] || fatal 'Can'\''t download $ALT_DNF_MIRROR_KEYURL'
+    assure_exists gpg gnupg2
+    a='' gpg --with-colons --with-fingerprint $tmpfile 2>/dev/null | grep -q "^fpr:.*:$ALT_DNF_MIRROR_KEYFPR:" || fatal 'Wrong key in $ALT_DNF_MIRROR_KEYURL (expected fingerprint $ALT_DNF_MIRROR_KEYFPR)'
+    chmod 644 $tmpfile
+    sudocmd mkdir -p "$(dirname "$ALT_DNF_MIRROR_KEYFILE")"
+    sudocmd cp $tmpfile "$ALT_DNF_MIRROR_KEYFILE"
+}
+
+__epm_addrepo_dnf_install_file()
+{
+    local tmpfile="$1"
+    local target="$2"
+
+    if [ -n "$dryrun" ] ; then
+        echo "# $target"
+        cat $tmpfile
+        return 1
+    fi
+
+    # warn about the same repo ids in other files
+    local id f
+    for id in $(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' $tmpfile) ; do
+        for f in /etc/yum.repos.d/*.repo ; do
+            [ "$f" = "$target" ] && continue
+            grep -q "^\[$id\]" "$f" 2>/dev/null && warning 'Repo id $id is already used in $f'
+        done
+    done
+
+    chmod 644 $tmpfile
+    sudocmd mkdir -p /etc/yum.repos.d
+    sudocmd cp $tmpfile $target
+}
+
+__epm_addrepo_dnf_baseurl()
+{
+    local name="$1"
+    local url="$2"
+    local gpgcheck="$3"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    cat >$tmpfile <<EOF
+[$name]
+name=$name
+baseurl=$url
+enabled=1
+gpgcheck=$gpgcheck
+EOF
+    local target=/etc/yum.repos.d/$name.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    if ! sudocmd $DNFCMD makecache --repo=$name ; then
+        sudocmd rm -f $target
+        fatal 'There is no rpm-md metadata for dnf in $url'
+    fi
+}
+
+__epm_addrepo_dnf_aptrpm_file()
+{
+    local name="$1"
+    local title="$2"
+    local vendor="$3"
+    local entries="$4"
+    local keyfile="$5"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    local suffix baseurl comp
+    while read -r suffix baseurl comp ; do
+        [ -n "$comp" ] || continue
+        cat >>$tmpfile <<EOF
+[$name-$suffix]
+name=$title $suffix
+type=apt-rpm
+baseurl=$baseurl
+apt_component=$comp
+${vendor:+apt_vendor=$vendor
+}${keyfile:+gpgkey=file://$keyfile
+}enabled=1
+
+EOF
+    done <<EOF
+$entries
+EOF
+    [ -s $tmpfile ] || fatal 'There are no APT-RPM repos for $name'
+    local repoids
+    repoids="$(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' $tmpfile | tr '\n' ',' | sed -e 's|,$||')"
+
+    local target=/etc/yum.repos.d/$name.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    [ -n "$keyfile" ] && __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+
+    # check APT-RPM indexes (base/release is checked by the vendor keys)
+    if ! sudocmd $DNFCMD makecache -y --repo=$repoids ; then
+        sudocmd rm -f $target
+        fatal 'Can'\''t get APT-RPM indexes for $name'
+    fi
+
+    # dnf5 on ALT does not import gpgkey from repo file itself
+    [ -n "$keyfile" ] && { sudocmd rpm --import "$keyfile" || fatal ; }
+    return 0
+}
+
+__epm_addrepo_dnf_aptrpm_url_entries()
+{
+    local url="$1"
+    local arch comp
+    __alt_dnf_aptrpm_probe_url "$url" | while read -r arch comp ; do
+        echo "$arch $url/$arch $comp"
+    done
+}
+
+__epm_addrepo_dnf_aptrpm_line()
+{
+    # shellcheck disable=SC2048,SC2086
+    set -- $*
+    [ "$1" = "rpm" ] || fatal 'Only rpm lines are supported for $PMTYPE on ALT: $*'
+    shift
+    local vendor=''
+    case "$1" in
+        \[*\])
+            vendor="$(echo "$1" | tr -d '[]')"
+            shift
+            ;;
+    esac
+    local url="$1"
+    local dist="$2"
+    [ -n "$url" ] && [ -n "$dist" ] && [ -n "$3" ] || fatal 'Wrong repo line, use: rpm [vendor] URL DIST component'
+    shift 2
+    local name comp entries=''
+    name="$(echo "$url/$dist" | sed -e 's|^[a-z]*:/*||' -e 's|/*$||' -e 's|[^A-Za-z0-9._-]|_|g')"
+    for comp in "$@" ; do
+        entries="$entries$comp $url/$dist $comp
+"
+    done
+    __epm_addrepo_dnf_aptrpm_file "$name" "$url $dist" "$vendor" "$entries"
+}
+
+__epm_addrepo_dnf_aptrpm_task()
+{
+    local tn="$1"
+    local url archcomps
+    url="$(eget --get-real-url "https://git.altlinux.org/tasks/$tn/build/repo")" || fatal 'Can'\''t access task $tn repo'
+    url="${url%/}"
+    archcomps="$(__epm_addrepo_dnf_aptrpm_url_entries "$url")"
+    [ -n "$archcomps" ] || fatal 'There are no arch repos in $url'
+    __epm_addrepo_dnf_aptrpm_file "task-$tn" "ALT task $tn" "$(get_task_sign "$tn" | tr -d '[]')" "$archcomps"
+}
+
+__epm_addrepo_altlinux_dnf_help()
+{
+    message '
+epm repo add - add repo for $PMTYPE on ALT (to /etc/yum.repos.d).
+The type of the added repos is apt-rpm if there are APT-RPM repos (type=apt-rpm) in /etc/yum.repos.d, rpm-md otherwise.
+Supported:
+    sisyphus, p11, ...       - ALT branch (rpm-md metadata from download.etersoft.ru, APT-RPM from any mirror)
+    alt, basealt, etersoft   - current ALT branch
+    deferred                 - Etersoft Sisyphus Deferred repo
+    deferred.org             - Etersoft Sisyphus Deferred repo (at mirror.eterfund.org)
+    deferred-devel           - Etersoft Sisyphus Deferred DEVEL repo
+    deferred-beta            - Etersoft Sisyphus Deferred BETA repo
+    URL/file.repo            - repo file
+    URL or /path/to/repo     - rpm-md repo (f.i. created with epm repo index), or APT-RPM repo URL
+    <task number>            - ALT task repo (APT-RPM only)
+    rpm [vendor] URL DIST component... - sources.list line (APT-RPM only)
+'
+}
+
+__epm_addrepo_altlinux_dnf()
+{
+    if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--list" ] || [ "$1" = "--help" ] ; then
+        __epm_addrepo_altlinux_dnf_help
+        return
+    fi
+
+    local repo="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    case "$repo" in
+        sisyphus|p[0-9]*|c[0-9]*|deferred|deferred.org|deferred-devel|deferred-beta)
+            __epm_addrepo_alt_dnf "$repo"
+            return
+            ;;
+        alt|basealt|etersoft)
+            __epm_addrepo_alt_dnf "$(echo "$DISTRVERSION" | tr "[:upper:]" "[:lower:]")"
+            return
+            ;;
+    esac
+
+    # sources.list line: rpm [vendor] URL DIST component
+    if [ "$1" = "rpm" ] || startwith "$1" "rpm " ; then
+        __alt_dnf_uses_aptrpm_repos || fatal 'Repo line $* is supported for $PMTYPE on ALT only with APT-RPM repos (type=apt-rpm in /etc/yum.repos.d)'
+        __epm_addrepo_dnf_aptrpm_line "$@"
+        return
+    fi
+
+    if is_taskarg "$@" ; then
+        __alt_dnf_uses_aptrpm_repos || fatal 'Task repos are supported for $PMTYPE on ALT only with APT-RPM repos (type=apt-rpm in /etc/yum.repos.d)'
+        local arg
+        for arg in "$@" ; do
+            is_taskarg "$arg" || continue
+            __epm_addrepo_dnf_aptrpm_task "$(get_tasknumber_from_arg "$arg")"
+        done
+        return
+    fi
+
+    local name
+    case "$1" in
+        *.repo)
+            local tmpfile
+            tmpfile=$(mktemp) || fatal
+            remove_on_exit $tmpfile
+            if is_url "$1" ; then
+                local url="$1"
+                eget -q -O $tmpfile "$url" || fatal 'Can'\''t download $url'
+            else
+                cp "$1" $tmpfile || fatal
+            fi
+            __epm_addrepo_dnf_install_file $tmpfile /etc/yum.repos.d/$(basename "$1") || return 0
+            return
+            ;;
+    esac
+
+    if [ -d "$1" ] ; then
+        local dir="$(realpath "$1")"
+        name="local-$(basename "$dir")"
+        __epm_addrepo_dnf_baseurl "$name" "file://$dir" 0
+        return
+    fi
+
+    if is_url "$1" ; then
+        name="$(echo "$1" | sed -e 's|^[a-z]*://||' -e 's|/*$||' -e 's|[^A-Za-z0-9._-]|_|g')"
+        # URL with APT-RPM repos ({noarch,x86_64,...}/RPMS.component)
+        if __alt_dnf_uses_aptrpm_repos ; then
+            local archcomps
+            archcomps="$(__epm_addrepo_dnf_aptrpm_url_entries "$1")"
+            if [ -n "$archcomps" ] ; then
+                __epm_addrepo_dnf_aptrpm_file "$name" "$name" "" "$archcomps"
+                return
+            fi
+        fi
+        __epm_addrepo_dnf_baseurl "$name" "$1" 1
+        return
+    fi
+
+    name="$1"
+    fatal 'Repo $name is not supported for $PMTYPE on ALT. Use # epm repo add --help'
+}
+
+__epm_addrepo_alt_dnf_repo()
+{
+    local repo="$1"
+    local name="$2"
+    local baseurl="$3"
+    local keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-${4:-$repo}"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    # repomd.xml is signed only on Etersoft mirror
+    local repo_gpgcheck=0 mirror_key=''
+    case "$baseurl" in
+        $ALT_DNF_MIRROR/*)
+            repo_gpgcheck=1
+            mirror_key=" file://$ALT_DNF_MIRROR_KEYFILE"
+            ;;
+    esac
+    local i repoids=''
+    for i in $(__alt_dnf_archlist) ; do
+        repoids="$repoids${repoids:+,}$repo-$i"
+        cat >>$tmpfile <<EOF
+[$repo-$i]
+name=$name $i
+baseurl=$baseurl/$i
+enabled=1
+gpgcheck=1
+repo_gpgcheck=$repo_gpgcheck
+gpgkey=file://$keyfile$mirror_key
+
+EOF
+    done
+    local target=/etc/yum.repos.d/alt-$repo.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+    [ "$repo_gpgcheck" = "1" ] && __epm_addrepo_alt_dnf_mirror_key
+
+    # check rpm-md metadata via dnf itself (it is generated only on download.etersoft.ru mirror)
+    # -y: import the keys (the mirror key fingerprint is checked above)
+    if ! sudocmd $DNFCMD makecache -y --repo=$repoids ; then
+        sudocmd rm -f $target
+        fatal 'There is no rpm-md metadata for dnf in $baseurl'
+    fi
+
+    # dnf5 on ALT does not import gpgkey from repo file itself
+    sudocmd rpm --import "$keyfile" || fatal
+}
+
+__epm_addrepo_alt_dnf()
+{
+    local repo="$1"
+    local baseurl aptrpm=''
+    __alt_dnf_uses_aptrpm_repos && aptrpm=1
+    if [ -n "$aptrpm" ] ; then
+        baseurl="$(__alt_dnf_aptrpm_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    else
+        baseurl="$(__alt_dnf_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    fi
+
+    local name
+    local keyname="sisyphus"
+    case "$repo" in
+        sisyphus)
+            name="ALT Sisyphus"
+            ;;
+        deferred*)
+            [ "$DISTRVERSION" = "Sisyphus" ] || fatal "Etersoft Sisyphus Deferred supported only for ALT Sisyphus based systems."
+            [ "$repo" = "deferred.org" ] && repo="deferred"
+            name="Etersoft Sisyphus $(echo "$repo" | sed -e 's|^deferred|Deferred|' -e 's|-devel$| DEVEL|' -e 's|-beta$| BETA|')"
+            ;;
+        *)
+            name="ALT $repo"
+            keyname="$repo"
+            ;;
+    esac
+
+    if [ -n "$aptrpm" ] ; then
+        local arch archcomps=''
+        for arch in $(__alt_dnf_archlist) ; do
+            archcomps="$archcomps$arch $baseurl/$arch classic
+"
+        done
+        # the vendor key of a branch does not sign old packages: check them by all ALT keys
+        __epm_addrepo_dnf_aptrpm_file "alt-$repo" "$name" "$(__alt_dnf_aptrpm_vendor "$repo")" "$archcomps" "/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-$keyname"
+        return
+    fi
+
+    __epm_addrepo_alt_dnf_repo "$repo" "$name" "$baseurl" "$keyname"
 }
 
 __epm_addrepo_altlinux()
@@ -1779,8 +2178,7 @@ __epm_addrepo_altlinux()
             return 0
             ;;
         deferred)
-            [ "$DISTRVERSION" = "Sisyphus" ] || fatal "Etersoft Sisyphus Deferred supported only for ALT Sisyphus based systems."
-            __epm_addrepo_add_alt_repo "$branch" "https://download.etersoft.ru/pub Etersoft/Sisyphus/Deferred" "classic"
+            __epm_addrepo_add_alt_repo "sisyphus" "https://download.etersoft.ru/pub Etersoft/Sisyphus/Deferred" "classic"
             return 0
             ;;
         deferred.org)
@@ -1815,12 +2213,12 @@ __epm_addrepo_altlinux()
             ;;
     esac
 
-    if is_taskarg $repo ; then
+    if is_taskarg "$@" ; then
         local arg tn
-        for arg in $repo ; do
+        for arg in "$@" ; do
             is_taskarg "$arg" || continue
             tn=$(get_tasknumber_from_arg "$arg")
-            epm repo add "https://git.altlinux.org/tasks/$tn/build/repo"
+            __epm_addrepo_altlinux_url "https://git.altlinux.org/tasks/$tn/build/repo" "$(get_task_sign "$tn")"
         done
         return
     fi
@@ -1871,6 +2269,16 @@ __epm_addrepo_astra()
     fi
 
     local reponame="$(epm print info --repo-name)"
+
+    # allow version shortcuts: epm repo set 1.7 / epm repo set 1.8
+    case "$distrname" in
+        1.7|1.8)
+            reponame="${distrname}_x86-64"
+            distrname="astra"
+            ;;
+        astra)
+            ;;
+    esac
 
     # keywords
     # https://wiki.astralinux.ru/pages/viewpage.action?pageId=3276859
@@ -1977,9 +2385,121 @@ __epm_addrepo_deb()
 
 }
 
+epm_addrepo_help()
+{
+    message 'epm addrepo - add package repository
+Usage: epm addrepo [options] <repo>
+
+Options:'
+    get_help HELPOPT $SHAREDIR/epm-addrepo
+    message '
+Examples:
+  epm repo add yandex
+  epm repo add "rpm http://somesite/pub/product x86_64 addon"
+  epm repo add --name akvis "rpm https://akvis-alt.sfo2.cdn.digitaloceanspaces.com x86_64 akvis"
+  epm repo add --disabled --name angie "rpm [angie] https://download.angie.software/angie/altlinux/11/ x86_64 main"
+
+With --name, the repo is stored in sources.list.d/<name>.list.
+With --disabled, the repo line is commented out.
+Use repo/package install syntax to install from named repos:
+  epm install akvis/alivecolors
+  epm install angie/angie
+'
+}
+
+__get_repo_filename()
+{
+    local repo="$*"
+
+    # Try to extract [name] from repo string: "rpm [name] URL arch comp"
+    local bracket_name="$(echo "$repo" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')"
+    if [ -n "$bracket_name" ] ; then
+        echo "$bracket_name"
+        return
+    fi
+
+    # Use last component: "rpm URL arch component" -> "component"
+    local last="$(echo "$repo" | sed -e 's/[[:space:]]*$//' | awk '{print $NF}')"
+    # For deb repos: "deb URL suite component" -> last word
+    if [ -n "$last" ] && [ "$last" != "rpm" ] && [ "$last" != "deb" ] ; then
+        echo "$last"
+        return
+    fi
+
+    # Fallback: extract domain from URL
+    echo "$repo" | grep -o 'https\?://[^/[:space:]]*' | head -1 | sed -e 's|.*://||' -e 's|\..*||'
+}
+
 epm_addrepo()
 {
+local disabled=
+local repo_name=
+
+while true ; do
+    case "$1" in
+        -h|--help)           # HELPOPT: print this help
+            epm_addrepo_help
+            return
+            ;;
+        --disabled)          # HELPOPT: add repo as disabled (commented out) in sources.list.d
+            disabled=1
+            shift
+            ;;
+        --name)              # HELPOPT: save repo to sources.list.d/<name>.list (enables repo/package install syntax)
+            shift
+            repo_name="$1"
+            shift
+            ;;
+        --name=*)            # HELPOPT: save repo to sources.list.d/<name>.list (--name=reponame)
+            repo_name="$(echo "$1" | sed -e 's|--name=||')"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 local repo="$*"
+
+if [ -n "$repo_name" ] ; then
+    if [ -z "$repo" ] ; then
+        fatal '--name requires a repo string'
+    fi
+
+    case $PMTYPE in
+        apt-rpm|apt-dpkg)
+            ;;
+        *)
+            fatal '--name is only supported for apt-based systems'
+            ;;
+    esac
+
+    local file="$APT_SOURCES_LIST_D/$repo_name.list"
+    local line="$repo"
+    [ -n "$disabled" ] && line="# $repo"
+
+    # check for duplicate (both enabled and disabled forms)
+    if [ -s "$file" ] && grep -q -F "$repo" "$file" ; then
+        info "Repo '$repo_name' already contains this source"
+        return
+    fi
+
+    # also check if repo already exists in other sources (including disabled)
+    if epm --quiet repo list --all "$repo" >/dev/null 2>&1 ; then
+        info "Repo is already in the sources list"
+        return
+    fi
+
+    if [ -n "$dryrun" ] ; then
+        echo "$line -> $file"
+        return
+    fi
+
+    __add_line_to_file "$file" "$line"
+    [ -n "$disabled" ] && info "Added disabled repo to $file" || info "Added repo to $file"
+    return
+fi
 
 case "$1" in
     copr/*)
@@ -1987,10 +2507,10 @@ case "$1" in
         case $PMTYPE in
             dnf-rpm)
                 assure_exists dnf-plugins-core
-                sudocmd dnf copr enable -y "$owner_project"
+                sudocmd $DNFCMD copr enable -y "$owner_project"
                 ;;
             dnf5-rpm)
-                sudocmd dnf copr enable -y "$owner_project"
+                sudocmd $DNFCMD copr enable -y "$owner_project"
                 ;;
             yum-rpm)
                 assure_exists yum-plugin-copr
@@ -2013,8 +2533,14 @@ esac
 
 case $BASEDISTRNAME in
     "alt")
-        __epm_addrepo_altlinux "$@"
-        return
+        if [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_uses_apt_sources ; then
+            __epm_addrepo_altlinux "$@"
+            return
+        fi
+        if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] ; then
+            __epm_addrepo_altlinux_dnf "$@"
+            return
+        fi
         ;;
     "astra")
         __epm_addrepo_astra "$@"
@@ -2039,11 +2565,11 @@ case $PMTYPE in
         ;;
     dnf-rpm)
         __epm_addrepo_rhel "$repo" || return
-        sudocmd dnf config-manager --add-repo "$repo"
+        sudocmd $DNFCMD config-manager --add-repo "$repo"
         ;;
     dnf5-rpm)
         __epm_addrepo_rhel "$repo" || return
-        sudocmd dnf config-manager addrepo --from-repofile "$repo"
+        sudocmd $DNFCMD config-manager addrepo --from-repofile "$repo"
         ;;
     urpm-rpm)
         sudocmd urpmi.addmedia "$@"
@@ -2159,6 +2685,16 @@ epm_assure()
 
     __epm_need_update $PACKAGE $PACKAGEVERSION || return 0
 
+    # dnf on ALT has no repos by default (they are in apt sources.list)
+    case $PMTYPE in
+        dnf-rpm|dnf5-rpm)
+            if [ "$BASEDISTRNAME" = "alt" ] && ! ls /etc/yum.repos.d/*.repo >/dev/null 2>&1 ; then
+                warning 'There are no repos for $PMTYPE to install $PACKAGE. Run # epm repo set sisyphus first.'
+                return 1
+            fi
+            ;;
+    esac
+
     info 'Installing appropriate package for $CMD command...'
     # can't be used in epm ei case
     #docmd epm --auto install $PACKAGE || return
@@ -2213,6 +2749,10 @@ esac
 
 __epm_orphan_altrpm()
 {
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        docmd $DNFCMD -q repoquery --qf '%{name}\n' --extras
+        return
+    fi
     docmd apt-cache list-extras
 }
 
@@ -2224,7 +2764,7 @@ epm_autoorphans()
 case $BASEDISTRNAME in
     alt)
         # ALT Linux only
-        assure_exists /usr/share/apt/scripts/list-extras.lua apt-scripts
+        [ "$PMTYPE" = "apt-rpm" ] && assure_exists /usr/share/apt/scripts/list-extras.lua apt-scripts
         if [ -z "$dryrun" ] ; then
             message "We will try remove all installed packages which are missed in repositories"
             warning "Use with caution!"
@@ -2573,6 +3113,14 @@ epm_autoremove()
 
 case $BASEDISTRNAME in
     "alt")
+        if [ "$PMTYPE" != "apt-rpm" ] ; then
+            [ -n "$direct" ] && fatal "--direct is supported only with apt-rpm"
+            [ -n "$1" ] && fatal "Please, run autoremove without args. Check epm autoremove --help to available commands."
+            # dnf returns error on --assumeno
+            sudocmd $DNFCMD $(subst_option non_interactive -y) $(subst_option dryrun --assumeno) autoremove || [ -n "$dryrun" ] || return
+            docmd epm remove-old-kernels $dryrun
+            return
+        fi
 
         if [ -z "$direct" ] ; then
             [ -n "$1" ] && fatal "Please, run autoremove without args or with --direct. Check epm autoremove --help to available commands."
@@ -2638,10 +3186,7 @@ case $PMTYPE in
         done
         ;;
     dnf-rpm|dnf5-rpm)
-        if [ -n "$dryrun" ] ; then
-            fatal "--dry-run is not supported yet"
-        fi
-        sudocmd dnf autoremove
+        sudocmd $DNFCMD $(subst_option non_interactive -y) $(subst_option dryrun --assumeno) autoremove
         ;;
     # see autoorhans
     #urpm-rpm)
@@ -2790,8 +3335,11 @@ __epm_changelog_unlocal_names()
             docmd yum changelog "$1"
             ;;
         dnf-rpm|dnf5-rpm)
-            #assure_exist yum-changelog
-            docmd dnf changelog "$1"
+            # changelog command is from dnf5-plugins (dnf-plugins-core)
+            if ! a='' $DNFCMD changelog --help >/dev/null 2>&1 ; then
+                [ "$PMTYPE" = "dnf5-rpm" ] && epm install --skip-installed dnf5-plugins || epm install --skip-installed dnf-plugins-core
+            fi
+            docmd $DNFCMD changelog "$1"
             ;;
         urpm-rpm)
             docmd urpmq --changelog "$1"
@@ -2852,7 +3400,8 @@ is_root || fatal "Run me under root user."
 
 update_repo_if_needed
 local APTOPTIONS="$(subst_option non_interactive -y)"
-local DNFOPTIONS="$(subst_option non_interactive -y) $(subst_option verbose --verbose) "
+local DNFOPTIONS="$(subst_option non_interactive -y) "
+[ "$PMTYPE" = "dnf5-rpm" ] || DNFOPTIONS="$DNFOPTIONS $(subst_option verbose --verbose) "
 
 case $BASEDISTRNAME in
     "alt")
@@ -2893,7 +3442,7 @@ case $PMTYPE in
     dnf-rpm|dnf5-rpm)
         __epm_rpm_rebuilddb
 
-        sudocmd dnf check $DNFOPTIONS
+        sudocmd $DNFCMD check $DNFOPTIONS
         ;;
     emerge)
         sudocmd revdep-rebuild
@@ -3176,7 +3725,8 @@ __epm_check_apt_db_days()
     # set ts to newest file ctime
     # shellcheck disable=SC2044
     for i in $(find $LISTS -name "*_$pkg*" 2>/dev/null); do
-        t=$(stat -c%Z "$i")
+        # skip entries that cannot be stat'ed (e.g. a stale eepm-fake_pkglist.)
+        t=$(stat -c%Z "$i" 2>/dev/null) || continue
         [ "$t" -gt "$ts" ] && ts=$t
     done
 
@@ -3191,6 +3741,33 @@ __epm_check_apt_db_days()
         # no any pkglist
         message "stalled"
     fi
+    return 1
+}
+
+__epm_check_dnf_db_days()
+{
+    local cachedir=/var/cache/dnf
+    [ "$PMTYPE" = "dnf5-rpm" ] && cachedir=/var/cache/libdnf5
+
+    local i t
+    local ts=0
+    # set ts to newest repomd.xml ctime
+    # shellcheck disable=SC2044
+    for i in $(find $cachedir -path "*/repodata/repomd.xml" 2>/dev/null); do
+        t=$(stat -c%Z "$i" 2>/dev/null) || continue
+        [ "$t" -gt "$ts" ] && ts=$t
+    done
+
+    if [ "$ts" = "0" ] ; then
+        message "never downloaded"
+        return 1
+    fi
+
+    local now=$(date +%s)
+    local days="$(( (now - ts) / (60 * 60 * 24) ))"
+    [ "$days" = "0" ] && return 0
+    [ "$days" = "1" ] && message "1 day old" && return 1
+    message '$days days old'
     return 1
 }
 
@@ -3242,6 +3819,9 @@ __is_repo_info_uptodate()
 update_repo_if_needed()
 {
     local days
+
+    # skip if already updated via temporary apt config
+    [ -n "$__EPM_APT_TMPDIR" ] && return
 
     # for apt only
     case $PMTYPE in
@@ -3305,11 +3885,15 @@ __remove_alt_apt_cache_file()
     sudocmd rm -vf /var/lib/apt/lists/*pkglist*
     sudocmd rm -vf /var/lib/apt/lists/*release*
 
+    # persistent cache of temporary APT indices (branch/task/named-repo installs)
+    sudocmd rm -rf "$(__epm_apt_cache_dir)"
+
     clean_alt_contents_index
 
     sudocmd rm -vf $epm_vardir/available-packages
 
     sudocmd rm -vf $eget_ipfs_db
+    sudocmd rm -vf $epm_vardir/eget-ipfs-db-remote.txt
     return 0
 }
 
@@ -3350,7 +3934,11 @@ case $PMTYPE in
         #sudocmd yum makecache
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf clean all
+        if [ -n "$dryrun" ] ; then
+            showcmd $DNFCMD clean all
+            return 0
+        fi
+        sudocmd $DNFCMD clean all
         ;;
     urpm-rpm)
         sudocmd urpmi --clean
@@ -3455,6 +4043,13 @@ case $PMTYPE in
         # FIXME: use hi level commands
         CMD="rpm -q --conflicts"
         ;;
+    dnf-rpm|dnf5-rpm)
+        if is_installed $pkg_names ; then
+            CMD="rpm -q --conflicts"
+        else
+            CMD="$DNFCMD repoquery --conflicts"
+        fi
+        ;;
     #yum-rpm)
     #    CMD="yum deplist"
     #    ;;
@@ -3503,53 +4098,11 @@ epm_conflicts()
 
 
 
-__create_spec() {
-
-echo "%{!?fake_name: %global fake_name $NAME}" >> "$1"
-echo "%{!?fake_version: %global fake_version $VERSION}" >> "$1"
-echo "%{!?fake_release: %global fake_release $RELEASE}" >> "$1"
-if [ -n "$REQUIRES" ]; then
-  echo "%{!?fake_requires: %global fake_requires $REQUIRES}" >> "$1"
-fi
-if [ -n "$PROVIDES" ]; then
-  echo "%{!?fake_provides: %global fake_provides $PROVIDES}" >> "$1"
-fi
-
-  cat <<EOF >> "$1"
-%define _rpmdir $PWD
-
-Name: fake-%{fake_name}
-
-Version: %{fake_version}
-Release: %{fake_release}
-License: CC0
-Group: Other
-
-Summary: Faked provides package
-
-%if "%{?fake_provides}" != ""
-Provides: %{fake_provides}
-%endif
-Provides: %{fake_name}
-%if "%{?fake_requires}" != ""
-Requires: %{fake_requires}
-%endif
-BuildArch: noarch
-
-%description
-This package is empty. It has been created to put fake entry in rpmdb.
-
-%files
-
-%changelog
-EOF
-}
-
-
 __epm_create_fake_help()
 {
     message 'epm create-fake - create package with fake provides and requires
-Usage: epm create-fake [options] <package-name>'
+Usage: epm create-fake [options] <package-name>
+       epm create-fake [options] <file.yaml>'
     echo ''
     echog 'Options:'
     get_help HELPOPT $SHAREDIR/epm-create_fake
@@ -3558,81 +4111,132 @@ Examples:
     # epm create-fake --install python-somepackage
     # epm create-fake --install --provides="python3dist(somepackage)" python-somepackage
     # epm create-fake --install --requires=python3 --requires=python3-module python-somepackage
+    # epm create-fake --name=libfoo --provides="libfoo.so.1()(64bit)" libfoo
+    # epm create-fake --install mypackage.yaml
 '
 }
 
 epm_create_fake()
 {
+    local VERSION=0
+    local RELEASE=0
+    local REQUIRES=""
+    local PROVIDES=""
+    local FAKENAME=""
+    local NAME=""
 
-  VERSION=0
-  RELEASE=0
-  REQUIRES=""
+    for i in "$@"; do
+        case $i in
+            -h|--help)          # HELPOPT: show this help
+                __epm_create_fake_help
+                return
+                ;;
+            --install)          # HELPOPT: auto install fake package
+                ;;
+            --name=*)           # HELPOPT: set exact package name (without fake- prefix)
+                FAKENAME="${i#*=}"
+                ;;
+            --version=*)        # HELPOPT: set package version (default: 0)
+                VERSION="${i#*=}"
+                ;;
+            --release=*)        # HELPOPT: set package release (default: 0)
+                RELEASE="${i#*=}"
+                ;;
+            --requires=*)       # HELPOPT: set package requires (repeat for multiple)
+                REQUIRES="$REQUIRES ${i#*=}"
+                ;;
+            --provides=*)       # HELPOPT: set package provides (repeat for multiple)
+                PROVIDES="$PROVIDES ${i#*=}"
+                ;;
+            *)
+                [ -z "$NAME" ] && NAME="$i"
+                ;;
+        esac
+    done
 
-  for i in "$@"; do
-    case $i in
-      -h|--help)          # HELPOPT: show this help
-      __epm_create_fake_help
-      return
-      ;;
-      --install)          # HELPOPT: auto install fake package
-      ;;
-      --version=*)        # HELPOPT: set package version (default: 0)
-      VERSION="${i#*=}"
-      shift
-      ;;
-      --release=*)        # HELPOPT: set package release (default: 0)
-      RELEASE="${i#*=}"
-      shift
-      ;;
-      --requires=*)       # HELPOPT: set package requires
-      REQUIRES+=" ${i#*=}"
-      shift
-      ;;
-      --provides=*)       # HELPOPT: set package provides
-      PROVIDES+=" ${i#*=}"
-      shift
-      ;;
-      *)
-      ;;
-    esac
-  done
-
-  NAME=$1
-
-  if [ -z "$NAME" ]; then
-    fatal "Error: You have to specify PACKAGE_NAME"
-  fi
+    if [ -z "$NAME" ] ; then
+        fatal 'Error: You have to specify PACKAGE_NAME or a yaml file'
+    fi
 
     # will set RPMBUILD
-  __assure_exists_rpmbuild
+    __assure_exists_rpmbuild
 
-  HOME="$(mktemp -d --tmpdir=$BIGTMPDIR)" || fatal
-  unset BASH_ENV
-  remove_on_exit $HOME
-  export HOME
-  __create_rpmmacros
+    HOME="$(mktemp -d --tmpdir=$BIGTMPDIR)" || fatal
+    unset BASH_ENV
+    remove_on_exit $HOME
+    export HOME
+    __create_rpmmacros
 
-  tmpbuilddir=$HOME/$(basename $NAME).tmpdir
-  mkdir $tmpbuilddir
+    local tmpbuilddir=$HOME/create-fake.tmpdir
+    mkdir $tmpbuilddir
 
-  cd $tmpbuilddir/ || fatal
+    local yamlfile=""
+    local pkgname=""
 
-  SPECFILE=${PWD}/${NAME}.spec
-  __create_spec "$SPECFILE"
+    # handle yaml file input
+    if echo "$NAME" | grep -q '\.yaml$' ; then
+        yamlfile="$(realpath "$NAME")"
+        [ -r "$yamlfile" ] || fatal 'Can'\''t read yaml file: $NAME'
+        # read name and version from yaml
+        local name="" version=""
+        yaml_load_vars "$yamlfile" name version
+        pkgname="$name"
+        VERSION="$version"
+    else
+        # generate yaml from CLI args
+        if [ -n "$FAKENAME" ] ; then
+            pkgname="$FAKENAME"
+        else
+            pkgname="fake-$NAME"
+            # auto-add original name to provides (like the old Provides: %{fake_name})
+            PROVIDES="$NAME $PROVIDES"
+        fi
 
-  showcmd $RPMBUILD -bb $SPECFILE
-  if [ -n "$verbose" ] ; then
-      a='' $RPMBUILD  -bb $SPECFILE || fatal
-  else
-      a='' $RPMBUILD -bb $SPECFILE >/dev/null || fatal
-  fi
+        yamlfile="$tmpbuilddir/eepm.yaml"
+        cat > "$yamlfile" <<EOF
+name: $pkgname
+version: $VERSION
+release: $RELEASE
+summary: Faked provides package
+license: CC0
+group: Other
+buildarch: noarch
+description: This package is empty. It has been created to put fake entry in rpmdb.
+EOF
+        # echo without quotes trims and normalizes whitespace
+        [ -n "$(echo $REQUIRES)" ] && echo "requires: $(echo $REQUIRES)" >> "$yamlfile"
+        [ -n "$(echo $PROVIDES)" ] && echo "provides: $(echo $PROVIDES)" >> "$yamlfile"
+    fi
 
-   repacked_rpm="$(realpath "$tmpbuilddir/noarch/*.rpm")"
-   remove_on_exit "$repacked_rpm"
+    info 'Generated YAML for fake package:'
+    cat "$yamlfile"
 
-  if [ -n "$install" ] ; then
-    epm install "$repacked_rpm"
-  fi
+    cd $tmpbuilddir/ || fatal
+
+    __generate_spec_by_yaml "$yamlfile" "$tmpbuilddir"
+
+    local buildroot="$tmpbuilddir/$pkgname-$VERSION"
+    local spec="$tmpbuilddir/$pkgname.spec"
+    mkdir -p "$buildroot"
+
+    showcmd $RPMBUILD --buildroot $buildroot -bb $spec
+    if [ -n "$verbose" ] ; then
+        a='' $RPMBUILD --buildroot $buildroot -bb $spec || fatal
+    else
+        a='' $RPMBUILD --buildroot $buildroot -bb $spec >/dev/null || fatal
+    fi
+
+    local repacked_rpm="$(realpath $tmpbuilddir/../*.rpm)"
+    remove_on_exit "$repacked_rpm"
+
+    if [ -n "$install" ] ; then
+        epm install "$repacked_rpm"
+    else
+        cp $verbose "$repacked_rpm" "$EPMCURDIR/" || fatal
+        local rpmname
+        rpmname="$(basename "$repacked_rpm")"
+        info 'Fake package saved: $rpmname'
+    fi
 }
 
 # File bin/epm-db:
@@ -3747,6 +4351,13 @@ try_fix_apt_rpm_dupls()
 
 epm_dedup()
 {
+case $PMTYPE in
+    dnf-rpm|dnf5-rpm)
+        sudocmd $DNFCMD $(subst_option non_interactive -y) $(subst_option dryrun --assumeno) remove --duplicates
+        return
+        ;;
+esac
+
 case "$BASEDISTRNAME" in
     "alt")
         assure_exists /usr/share/apt/scripts/dedup.lua apt-scripts
@@ -3929,6 +4540,12 @@ install_de()
     run_script "$de_name-postin" $de_name
     message "$de_name successfully installed."
 
+    # install a preferred display manager if none is installed yet
+    local preferred_dm="$(get_values "$de_name" "preferred_dm")"
+    if [ -n "$preferred_dm" ] ; then
+        ensure_dm $preferred_dm
+    fi
+
 }
 
 
@@ -4025,6 +4642,7 @@ epm_desktop_help()
 Examples:
   epm desktop install kde
   epm desktop install kde=small
+  epm desktop manager install lightdm
 '
 }
 
@@ -4074,11 +4692,293 @@ epm_desktop()
         list-installed)               # HELPCMD:             List installed desktop environments
             list_installed_des
             ;;
+        manager)                      # HELPCMD: <command>   Manage display managers (install, remove, list, ...)
+            epm_desktop_manager "$@"
+            ;;
         installed)
             is_de_installed "$1"
             ;;
         version)
             get_repo_version "$1"
+            ;;
+        *)
+            fatal 'Unknown option $cmd. Run with --help to get help'
+            ;;
+    esac
+}
+
+# File bin/epm-desktop-manager:
+
+
+
+KNOWN_DMS="lightdm sddm gdm greetd lxde-lxdm xdm ly slim"
+
+
+get_dm_json()
+{
+    local dm_name="$1"
+    realpath $CONFIGDIR/desktop-manager.d/$dm_name.json
+}
+
+get_dm_value()
+{
+    local dm_name="$1"
+    local key="$2"
+
+    get_json_value "$(get_dm_json $dm_name)" "$key"
+}
+
+
+get_dm_values()
+{
+    local dm_name="$1"
+    local key="$2"
+
+    get_json_values "$(get_dm_json $dm_name)" "$key" | xargs
+}
+
+
+check_dm_exists()
+{
+    local dm_name="$1"
+
+    [ -n "$dm_name" ] || fatal "Missed DM name."
+
+    local json="$(get_dm_json $dm_name)"
+
+    [ -s "$json" ] && return
+
+    fatal 'Manifest for $dm_name is not found.'
+}
+
+
+get_dm_main_package()
+{
+    local dm_name="$1"
+    local package="$(get_dm_values "$dm_name" "dependencies" | cut -d' ' -f1)"
+    [ -n "$package" ] || fatal 'Cannot get package name for $dm_name'
+    echo "$package"
+}
+
+
+get_dm_service()
+{
+    local dm_name="$1"
+    local service="$(get_dm_value "$dm_name" "service")"
+    [ -n "$service" ] || service="$dm_name"
+    echo "$service"
+}
+
+
+is_dm_installed()
+{
+    local dm_name="$1"
+
+    is_installed $(get_dm_main_package $dm_name)
+}
+
+
+any_dm_installed()
+{
+    local dm
+    for dm in $KNOWN_DMS ; do
+        is_installed "$dm" && return 0
+    done
+    return 1
+}
+
+
+install_dm()
+{
+    local dm_name="$1"
+    check_dm_exists "$dm_name"
+
+    if [ -z "$force" ] && is_dm_installed "$dm_name" ; then
+        message "$dm_name is already installed."
+        return 0
+    fi
+
+    local dependencies="$(get_dm_values "$dm_name" "dependencies")"
+    local service="$(get_dm_service "$dm_name")"
+
+    message "Installing $dm_name with dependencies: $dependencies"
+
+    if ! docmd epm install $dependencies ; then
+        fatal "Failed to install $dm_name."
+    fi
+
+    # Enable the DM so it becomes the active display-manager.service
+    # (each DM unit ships Alias=display-manager.service).
+    if serv "$service" exists 2>/dev/null ; then
+        docmd serv enable "$service"
+    else
+        warning "Service '$service' for $dm_name is not found, skip enabling."
+    fi
+
+    message "$dm_name successfully installed."
+}
+
+
+remove_dm()
+{
+    local dm_name="$1"
+    check_dm_exists "$dm_name"
+
+    if [ -z "$force" ] && ! is_dm_installed "$dm_name" ; then
+        message "$dm_name is not installed."
+        return 0
+    fi
+
+    local dependencies="$(get_dm_values "$dm_name" "dependencies")"
+
+    message "Removing $dm_name with dependencies: $dependencies"
+
+    if ! docmd epm remove $dependencies ; then
+        fatal "Failed to remove $dm_name."
+    fi
+
+    message "$dm_name successfully removed."
+}
+
+
+ensure_dm()
+{
+    [ $# -ge 1 ] || return 0
+
+    if any_dm_installed ; then
+        message "A display manager is already installed; skip preferred DM setup."
+        return 0
+    fi
+
+    local dm
+    for dm in "$@" ; do
+        if [ -s "$CONFIGDIR/desktop-manager.d/$dm.json" ] ; then
+            message "No display manager found; installing preferred '$dm'."
+            install_dm "$dm"
+            return $?
+        fi
+    done
+
+    warning "No supported display manager manifest found among candidates: $*"
+    return 0
+}
+
+
+get_dm_info()
+{
+    local dm_name="$1"
+    local json_flag="$2"
+
+    local installed="$(is_dm_installed "$dm_name" && echo 'true' || echo 'false')"
+
+    if [ -n "$json_flag" ]; then
+        local json="$(get_dm_json $dm_name)"
+        # "installed" is never the last key in the manifest, keep the trailing comma
+        cat "$json" | sed 's/"installed":.*/"installed": '$installed',/g'
+        return
+    fi
+
+    message "Information for $dm_name:
+    Name: $(get_dm_value $dm_name name)
+    Version: $(get_dm_value $dm_name version)
+    Installed: $installed
+    Service: $(get_dm_service $dm_name)
+    Description: $(get_dm_value $dm_name description)"
+}
+
+
+list_dms()
+{
+    local json_flag="$1"
+    if [ -z "$json_flag" ]; then
+        for dm in $CONFIGDIR/desktop-manager.d/*.json ; do
+            basename "$dm" .json || fatal
+        done
+        return
+    fi
+
+    echo '['
+    local first=1
+    for dm in $CONFIGDIR/desktop-manager.d/*.json ; do
+        if [ $first = 1 ] ; then
+            first=0
+        else
+            echo ','
+        fi
+
+        dm_name="$(basename $dm .json)" || fatal
+        get_dm_info "$dm_name" "$json_flag"
+
+    done
+    echo ']'
+}
+
+
+list_installed_dms()
+{
+    local dm dm_name
+    for dm in $CONFIGDIR/desktop-manager.d/*.json ; do
+        dm_name="$(basename "$dm" .json)" || fatal
+        is_dm_installed "$dm_name" && echo "$dm_name"
+    done
+}
+
+
+epm_desktop_manager_help()
+{
+    message 'Usage: epm desktop manager <command> [--json] [option]'
+            get_help HELPCMD $SHAREDIR/epm-desktop-manager
+    message '
+Examples:
+  epm desktop manager install lightdm
+  epm desktop manager info greetd
+'
+}
+
+
+epm_desktop_manager()
+{
+
+    local cmd="$1"
+    shift
+
+    local json_flag=''
+
+    case "$1" in
+        --json)
+            json_flag=1
+            shift
+            ;;
+    esac
+
+    case "$cmd" in
+        "-h"|"--help"|"help")        # HELPCMD: help
+            epm_desktop_manager_help
+            return
+            ;;
+        install)                     # HELPCMD: <dm_name>   Install a display manager
+            check_dm_exists "$1"
+            install_dm "$1"
+            ;;
+        remove)                      # HELPCMD: <dm_name>   Remove a display manager
+            check_dm_exists "$1"
+            remove_dm "$1"
+            ;;
+        info)                        # HELPCMD: <dm_name>   Get information about a display manager
+            check_dm_exists "$1"
+            get_dm_info "$1" $json_flag
+            ;;
+        list)                        # HELPCMD:             List all available display managers
+            list_dms $json_flag
+            ;;
+        list-installed)              # HELPCMD:             List installed display managers
+            list_installed_dms
+            ;;
+        installed)
+            is_dm_installed "$1"
+            ;;
+        any-installed)
+            any_dm_installed
             ;;
         *)
             fatal 'Unknown option $cmd. Run with --help to get help'
@@ -4163,6 +5063,16 @@ __epm_downgrade_to_alt_archive()
     return
 }
 
+__epm_downgrade_dnf()
+{
+    local OPTIONS="$(subst_option non_interactive -y) $(subst_option download_only --downloadonly)"
+    if [ -n "$pkg_filenames" ] ; then
+        sudocmd $DNFCMD $OPTIONS downgrade $pkg_filenames
+    else
+        sudocmd $DNFCMD $OPTIONS distro-sync
+    fi
+}
+
 epm_downgrade()
 {
     if [ -n "$exclude" ] ; then
@@ -4197,6 +5107,16 @@ __epm_downgrade_do()
 
     case $BASEDISTRNAME in
     alt)
+        # apt preferences are not used by dnf
+        if [ "$PMTYPE" != "apt-rpm" ] && [ -z "$pkg_files" ] ; then
+            case "$arg" in
+                archive|archive/*)
+                    fatal 'Downgrade to ALT archive is not supported for $PMTYPE'
+                    ;;
+            esac
+            __epm_downgrade_dnf
+            return
+        fi
         case "$arg" in
             # archive/date/package (simular to install arg)
             archive/*/*)
@@ -4247,7 +5167,11 @@ __epm_downgrade_do()
     #apt-rpm)
     #    ;;
     apt-dpkg)
-        local APTOPTIONS="$(subst_option non_interactive -y) $force_yes"
+        # --force-yes is deprecated in Debian apt, use --allow-* instead
+        local apt_force_yes="$force_yes"
+        [ "$apt_force_yes" = "--force-yes" ] && apt_force_yes="--allow-unauthenticated --allow-downgrades --allow-change-held-packages"
+        local APTOPTIONS="$(subst_option non_interactive -y) $apt_force_yes"
+        [ -n "$download_only" ] && APTOPTIONS="$APTOPTIONS -d"
         __epm_add_deb_apt_downgrade_preferences || return
         if [ -n "$pkg_filenames" ] ; then
             sudocmd apt-get $APTOPTIONS install $pkg_filenames
@@ -4259,17 +5183,13 @@ __epm_downgrade_do()
     yum-rpm)
         # can do update repobase automagically
         if [ -n "$pkg_filenames" ] ; then
-            sudocmd yum downgrade $pkg_filenames
+            sudocmd yum downgrade $(subst_option download_only --downloadonly) $pkg_filenames
         else
-            sudocmd yum distro-sync
+            sudocmd yum distro-sync $(subst_option download_only --downloadonly)
         fi
         ;;
     dnf-rpm|dnf5-rpm)
-        if [ -n "$pkg_filenames" ] ; then
-            sudocmd dnf downgrade $pkg_filenames
-        else
-            sudocmd dnf distro-sync
-        fi
+        __epm_downgrade_dnf
         ;;
     urpm-rpm)
         assure_exists urpm-reposync urpm-tools
@@ -4373,7 +5293,9 @@ __download_pkg_urls()
         __check_if_wildcard_downloading "$url" && latest=''
 
         # download packages
-        if docmd eget $latest "$url" ; then
+        if docmd eget --tries 3 $latest "$url" ; then
+            # drop wget side-effect log files (wget creates wget-log, wget-log.1, ... on SIGHUP)
+            rm -fv wget-log wget-log.* 2>/dev/null
             local i
             for i in * ; do
                 [ "$i" = "*" ] && warning 'Incorrect true status from eget. No saved files from download $url, ignoring' && continue
@@ -4474,7 +5396,7 @@ __epm_print_url_alt_check()
 __epm_alt_get_package_url()
 {
     #sudocmd apt-get install -y --print-uris --reinstall "$pkg" | cut -f1 -d " " | grep ".rpm'$" | sed -e "s|^'||" -e "s|'$||"
-    sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y --force-yes --print-uris "$@" | grep -E -o -e "(https?|ftp)://[^']+"
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y --print-uris "$@" | grep -E -o -e "(https?|ftp)://[^']+"
 }
 
 
@@ -4492,6 +5414,31 @@ __epm_alt_download_to_cache()
     sudocmd_eget --output-dir /var/cache/apt/archives --continue $urls
 }
 
+__epm_download_alt_tasks()
+{
+    local task_numbers=""
+    local arg
+    for arg in "$@" ; do
+        local tn="$(get_tasknumber_from_arg "$arg")"
+        [ -n "$tn" ] && task_numbers="$task_numbers $tn"
+    done
+
+    local installlist="$(get_task_packages $*)"
+    installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
+    [ -n "$verbose" ] && info 'Packages from task(s): $installlist'
+
+    # task repos have no rpm-md, so download rpm files directly
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        __epm_download_alt_task_files "$installlist" "$@"
+        docmd cp $task_files .
+        return
+    fi
+
+    __use_tmp_apt_for_tasks $task_numbers || return 1
+    [ -n "$verbose" ] && cat "$__EPM_APT_TMPDIR/sources.list"
+    epm_download $installlist
+}
+
 __epm_download_alt()
 {
     local pkg
@@ -4504,26 +5451,6 @@ __epm_download_alt()
         fatal "Missed package name"
     fi
 
-
-    # TODO: enable if install --download-only will works
-    if is_taskarg "$@" ; then
-        local task_numbers=""
-        local arg
-        for arg in "$@" ; do
-            local tn="$(get_tasknumber_from_arg "$arg")"
-            [ -n "$tn" ] && task_numbers="$task_numbers $tn"
-        done
-
-        local installlist="$(get_task_packages $*)"
-        installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
-        [ -n "$verbose" ] && info 'Packages from task(s): $installlist'
-
-        __use_tmp_apt_for_tasks $task_numbers || return 1
-        [ -n "$verbose" ] && cat "$__EPM_APT_TMPDIR/sources.list"
-        epm_download $installlist
-
-        return
-    fi
 
     info "Cleaning apt cache for correct result ..."
     epm --quiet clean
@@ -4573,6 +5500,10 @@ epm_download()
 
     case "$BASEDISTRNAME" in
         "alt")
+            if is_taskarg "$@" ; then
+                __epm_download_alt_tasks "$@"
+                return
+            fi
             if [ "$PMTYPE" = "apt-rpm" ] ; then
                 __epm_download_alt $*
                 return
@@ -4589,7 +5520,7 @@ epm_download()
         docmd apt-get download $*
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf download $print_url $*
+        sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS download $print_url $*
         ;;
     aptcyg)
         sudocmd apt-cyg download $*
@@ -4601,9 +5532,6 @@ epm_download()
         # TODO: check yum install --downloadonly --downloaddir=/tmp <package-name>
         assure_exists yumdownloader yum-utils
         sudocmd yumdownloader $*
-        ;;
-    dnf-rpm|dnf5-rpm)
-        sudocmd dnf download $*
         ;;
     urpm-rpm)
         sudocmd urpmi --no-install $URPMOPTIONS $@
@@ -4668,9 +5596,13 @@ __epm_korinf_install() {
     local pkg_urls=''
     for pkgurl in $* ; do
         pkg="$(__epm_korinf_site_mask "$pkgurl")"
-        [ -n "$pkg" ] || fatal "Can't get package url by $pkgurl"
+        if [ -z "$pkg" ] ; then
+            warning "Can't get package url for $pkgurl, skipping"
+            continue
+        fi
         [ -n "$pkg_urls" ] && pkg_urls="$pkg_urls $pkg" || pkg_urls="$pkg"
     done
+    [ -n "$pkg_urls" ] || fatal "No packages found in $EPM_KORINF_REPO_URL"
     # due Error: Can't use epm call from the piped script
     #epm install $(__epm_korinf_site_mask "$PACKAGE")
     pkg_names='' pkg_files='' epm_install
@@ -4713,7 +5645,7 @@ __epm_korinf_install_eepm()
 
     pkg_list="eepm"
     # preserve already installed eepm-*
-    for i in repack play ; do
+    for i in repack play full command-not-found ; do
        is_installed eepm-$i && pkg_list="$pkg_list eepm-$i"
     done
 
@@ -4773,7 +5705,7 @@ __alt_local_content_filelist()
 {
 
     local pkg="$1"
-    check_alt_contents_index || init_alt_contents_index
+    assure_alt_contents_index
     update_repo_if_needed
     local CI="$(cat $ALT_CONTENTS_INDEX_LIST)"
 
@@ -4834,7 +5766,7 @@ __epm_filelist_remote()
             ;;
         dnf-rpm|dnf5-rpm)
             assure_exists dnf-plugins-core
-            docmd dnf repoquery -l "$@"
+            docmd $DNFCMD repoquery -l "$@"
             ;;
         *)
             fatal "Query filelist for non installed packages is not implemented yet."
@@ -5102,7 +6034,7 @@ confirm_action()
     fi
 
 
-    if is_command flatpak ; then
+    if is_command flatpak && [ -n "$(flatpak list 2>/dev/null)" ] ; then
         confirm_action "Upgrade installed flatpak packages? [Y/n]" || full_upgrade_no_flatpak=1
         if [ -z "$full_upgrade_no_flatpak" ] ; then
             [ -n "$quiet" ] || echo
@@ -5143,6 +6075,29 @@ confirm_action()
         [ -n "$quiet" ] || echo
         docmd epm $dryrun clean
     fi
+}
+
+# File bin/epm-hedgehog:
+
+
+epm_hedgehog()
+{
+	local figlet docmd
+	epm assure figlet && figlet="figlet"
+
+	[ -n "$verbose" ] && docmd="docmd"
+	[ -n "$figlet" ] && $docmd $figlet "EPM"
+
+	cat <<'EOF'
+       ..::::::::.
+      :::::::::::::
+     /. `:::::::::::
+    o__,_::::::::::'
+   ~                  ~
+EOF
+
+	echo
+	echo 'Ёжик вышел из тумана. Пакеты доставлены.'
 }
 
 # File bin/epm-history:
@@ -5271,6 +6226,19 @@ if [ $PMTYPE = "apt-rpm" ] || [ $PMTYPE = "apm-rpm" ] ; then
     esac
 fi
 
+case "$PMTYPE:$option" in
+    *:-h|*:--help|*:help)
+        epm_history_help
+        return
+        ;;
+    dnf-rpm:--list|dnf5-rpm:--list)
+        shift
+        ;;
+    dnf-rpm:-*|dnf5-rpm:-*)
+        fatal 'Option $option is not supported for $PMTYPE'
+        ;;
+esac
+
 [ -z "$*" ] || fatal "No arguments are allowed here"
 
 case $PMTYPE in
@@ -5281,10 +6249,10 @@ case $PMTYPE in
         docmd cat /var/log/dpkg.log
         ;;
     dnf-rpm)
-        sudocmd dnf history
+        sudocmd $DNFCMD history
         ;;
     dnf5-rpm)
-        sudocmd dnf history list
+        sudocmd $DNFCMD history list
         ;;
     eopkg)
         sudocmd eopkg history
@@ -5377,7 +6345,9 @@ case $PMTYPE in
         __epm_info_rpm_low && return
         case $PMTYPE in
             apt-rpm)
-                docmd apt-cache show $pkg_names | awk 'BEGIN{desk=1}{if(/^Changelog:$/){desk=0} else if (desk==1) {print}}'
+                local APTCACHEOUT
+            APTCACHEOUT="$(docmd apt-cache show $pkg_names)" || return
+            echo "$APTCACHEOUT" | awk 'BEGIN{desk=1}{if(/^Changelog:$/){desk=0} else if (desk==1) {print}}'
                 ;;
             packagekit)
                 docmd pkcon get-details $pkg_names
@@ -5389,7 +6359,7 @@ case $PMTYPE in
                 docmd urpmq -i $pkg_names
                 ;;
             dnf-rpm|dnf5-rpm)
-                docmd dnf info $pkg_names
+                docmd $DNFCMD info $pkg_names
                 ;;
             zypper-rpm)
                 docmd zypper info $pkg_names
@@ -5608,7 +6578,7 @@ epm_info_obsoletes_names()
             if is_installed $pkg_names ; then
                 docmd rpm -q --obsoletes $pkg_names
             else
-                docmd dnf repoquery --obsoletes $pkg_names
+                docmd $DNFCMD repoquery --obsoletes $pkg_names
             fi
             ;;
         yum-rpm)
@@ -5687,7 +6657,7 @@ epm_info_recommends_names()
             if is_installed $pkg_names ; then
                 docmd rpm -q --recommends $pkg_names
             else
-                docmd dnf repoquery --recommends $pkg_names
+                docmd $DNFCMD repoquery --recommends $pkg_names
             fi
             ;;
         yum-rpm)
@@ -5766,7 +6736,7 @@ epm_info_suggests_names()
             if is_installed $pkg_names ; then
                 docmd rpm -q --suggests $pkg_names
             else
-                docmd dnf repoquery --suggests $pkg_names
+                docmd $DNFCMD repoquery --suggests $pkg_names
             fi
             ;;
         yum-rpm)
@@ -5791,6 +6761,15 @@ epm_info_suggests()
 
 # File bin/epm-install:
 
+
+__epm_check_packages_not_found()
+{
+    local pkg
+    for pkg in "$@" ; do
+        epm status --valid "$pkg" </dev/null >/dev/null 2>&1 || return 0
+    done
+    return 1
+}
 
 __use_zypper_no_gpg_checks()
 {
@@ -5827,6 +6806,48 @@ __separate_sudocmd()
     return 0
 }
 
+__epm_apt_install()
+{
+    local APTOPTIONS="$APTOPTIONS"
+    local noremove="$noremove"
+    local VIRTAPTOPTIONS=''
+    local simulate=''
+
+    [ -n "$dryrun" ] && simulate="--simulate"
+    [ -n "$norecommends" ] && APTOPTIONS="$APTOPTIONS -o APT::Install-Recommends=false"
+    if [ "$PMTYPE" = "apt-dpkg" ] && [ -n "$force_overwrite" ] ; then
+        APTOPTIONS="$APTOPTIONS -o Dpkg::Options::=--force-overwrite"
+    fi
+
+    if [ "$PMTYPE" = "apt-rpm" ] ; then
+        # https://bugzilla.altlinux.org/44670
+        VIRTAPTOPTIONS="-o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true"
+        # not for kernel packages
+        echo "$*" | grep -q "^kernel-" && VIRTAPTOPTIONS=''
+    fi
+
+    if [ -n "$non_interactive" ] ; then
+        [ -z "$noremove" ] && [ -z "$force" ] && [ -z "$allow_remove" ] && noremove="--no-remove"
+        case $PMTYPE in
+            apt-rpm)
+                sudocmd apt-get $__EPM_APT_REPO_OPTIONS $simulate -y $noremove --force-yes $VIRTAPTOPTIONS $APTOPTIONS install "$@"
+                ;;
+            apt-dpkg)
+                sudocmd env ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive apt-get $__EPM_APT_REPO_OPTIONS $simulate -y $noremove --allow-unauthenticated --allow-downgrades --allow-change-held-packages -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install "$@"
+                ;;
+        esac
+        return $?
+    fi
+
+    APTOPTIONS="$APTOPTIONS -o APT::Sandbox::User=root $(subst_option debug "-o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
+    if [ -n "$parallel" ] && [ -z "$simulate" ] ; then
+        info "Downloading packages to the cache... "
+        __epm_alt_download_to_cache $VIRTAPTOPTIONS $APTOPTIONS $noremove install "$@"
+    fi
+
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS $simulate $VIRTAPTOPTIONS $APTOPTIONS $noremove install "$@"
+}
+
 epm_install_names()
 {
     [ -z "$1" ] && return
@@ -5851,7 +6872,7 @@ epm_install_names()
     warmup_hibase
 
     if [ -n "$dryrun" ] ; then
-        epm simulate "$@"
+        pkg_filenames="$*" epm_simulate
         return
     fi
 
@@ -5860,35 +6881,28 @@ epm_install_names()
         return
     fi
 
-    if [ -n "$force_overwrite" ] ; then
-        APTOPTIONS="$APTOPTIONS -o Dpkg::Options::=--force-overwrite"
+    if [ -n "$norecommends" ] ; then
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
     fi
 
     case $PMTYPE in
         apt-rpm|apt-dpkg)
-            APTOPTIONS="$APTOPTIONS -o APT::Sandbox::User=root $(subst_option debug "-o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
-
-            # https://bugzilla.altlinux.org/44670
-            VIRTAPTOPTIONS="-o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true"
-            # not for kernel packages
-            echo "$*" | grep -q "^kernel-"  && VIRTAPTOPTIONS=''
-
-            if [ -n "$parallel" ] ; then
-                info "Downloading packages to the cache... "
-                __epm_alt_download_to_cache $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
-            fi
-
-            sudocmd apt-get $__EPM_APT_REPO_OPTIONS $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
+            __epm_apt_install "$@"
             local res=$?
             if [ "$res" = 0 ] ; then
                 save_installed_packages $@
             elif [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_install_names $selected
-                    return $?
+                # only suggest alternatives if packages are not found (not broken deps)
+                if __epm_check_packages_not_found $@ ; then
+                    local selected
+                    selected="$(__epm_suggest_similar_packages_by_list $@)"
+                    if [ -n "$selected" ] ; then
+                        info "Installing selected: $selected"
+                        epm_install_names $selected
+                        return $?
+                    fi
                 fi
             fi
             return $res ;;
@@ -5937,7 +6951,7 @@ epm_install_names()
             sudocmd yum $YUMOPTIONS install $(echo "$*" | exp_with_arch_suffix)
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf install $(echo "$*" | exp_with_arch_suffix)
+            sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS install $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
             return ;;
         snappy)
             sudocmd snappy install $@
@@ -6016,33 +7030,19 @@ epm_ni_install_names()
 {
     [ -z "$1" ] && return
 
+    # forbid package removal by default in non-interactive mode
+    [ -z "$noremove" ] && [ -z "$force" ] && [ -z "$allow_remove" ] && noremove="--no-remove"
+
+    if [ -n "$norecommends" ] ; then
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
+    fi
+
     case $PMTYPE in
-        apt-rpm)
-            sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            local res=$?
-            if [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_ni_install_names $selected
-                    return $?
-                fi
-            fi
-            return $res ;;
-        apt-dpkg)
-            sudocmd env ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive apt-get -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            local res=$?
-            if [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_ni_install_names $selected
-                    return $?
-                fi
-            fi
-            return $res ;;
+        apt-rpm|apt-dpkg)
+            __epm_apt_install "$@"
+            return ;;
         apm-rpm)
             sudocmd apm system install $@
             return ;;
@@ -6053,14 +7053,14 @@ epm_ni_install_names()
             sudocmd yum -y $YUMOPTIONS install $(echo "$*" | exp_with_arch_suffix)
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf install -y --allowerasing $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
+            sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS install -y $(subst_option noremove '' --allowerasing) $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
             return ;;
         urpm-rpm)
             sudocmd urpmi --auto $URPMOPTIONS $@
             return ;;
         zypper-rpm)
             # FIXME: returns true ever no package found, need check for "no found", "Nothing to do."
-            yes | sudocmd zypper --non-interactive $ZYPPEROPTIONS install $@
+            yes | sudocmd zypper --non-interactive $ZYPPEROPTIONS install $(subst_option noremove --no-force-resolution) $@
             return ;;
         packagekit)
             docmd pkcon install --noninteractive $@
@@ -6176,7 +7176,8 @@ __epm_if_command_path()
 __epm_get_replacepkgs()
 {
     [ -n "$2" ] && echo '--replacepkgs' && return
-    # don't use --replacepkgs when install only one file
+    # always use --replacepkgs with --force to avoid duplicates (rpm bug with same NEVR)
+    [ -n "$force" ] && echo '--replacepkgs' && return
 }
 
 epm_install_files()
@@ -6290,9 +7291,8 @@ epm_install()
             epm_install_alt_tasks $pkg_names
             return
         fi
-        if echo "$pkg_urls" | grep -q -E "https://packages.altlinux.org/ru/tasks/[0-9]+/*$" || \
-           echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/[0-9]+/*$" || \
-           echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/archive/done/_[0-9]+/[0-9]+/*$" ; then
+        # only one url really
+        if is_taskurl "$pkg_urls" ; then
             local task="$(basename "$pkg_urls")"
             local taskurl="$(dirname "$pkg_urls")"
             pkg_urls=""
@@ -6331,6 +7331,11 @@ epm_install()
     fi
 
     if [ -n "$pkg_urls" ] ; then
+        if [ -n "$repack" ] ; then
+            # pass URLs directly to repack (it will download and keep pkg_urls_downloaded)
+            epm repack --install $pkg_urls $pkg_files
+            return
+        fi
         # it will put downloaded by pkg_urls packages to pkg_files and reconstruct pkg_filenames
         __handle_pkg_urls_to_install
     fi
@@ -6406,7 +7411,7 @@ epm_install_files_alt_via_repo()
 
     #docmd epm repo save
 
-    docmd epm repo add $repodir
+    docmd epm repo add --name "local-repo" $repodir
     docmd epm update
 
     # install with name=version
@@ -6438,8 +7443,8 @@ epm_install_files_alt()
         return
     fi
 
-    # install packages via local repo if enabled
-    if [ -n "$use_local_repo" ] ; then
+    # install packages via local repo if enabled (apt only: it uses name=version install)
+    if [ -n "$use_local_repo" ] && [ "$PMTYPE" = "apt-rpm" ] ; then
         [ -n "$nodeps" ] && warning "Option --nodeps is not supported with local repo, ignored"
         epm_install_files_alt_via_repo $files
         return
@@ -6479,15 +7484,18 @@ epm_install_files_alt()
         fatal "Only RPM 6 can install packages larger than 4 GB"
     fi
 
-    # try install via apt if we could't install package file via rpm (we guess we need install requirements firsly)
-
+    # try install via apt/dnf if we could't install package file via rpm (we guess we need install requirements firsly)
     if [ -z "$direct" ] && [ -z "$noscripts" ] ; then
-        epm_install_names $files
-        return
+        case "$PMTYPE" in
+            apt-rpm|dnf-rpm|dnf5-rpm)
+                epm_install_names $files
+                return
+                ;;
+        esac
     fi
 
     # TODO: use it always (apt can install version from repo instead of a file package)
-    info "Workaround for install packages via apt with --noscripts (see https://bugzilla.altlinux.org/44670)"
+    [ "$PMTYPE" = "apt-rpm" ] && info "Workaround for install packages via apt with --noscripts (see https://bugzilla.altlinux.org/44670)"
     info "Firstly install package requrements …"
     # names of packages to be installed
     local fl="$(epm print name for package $files)"
@@ -6511,122 +7519,36 @@ get_current_kernel_flavour()
     echo "$rflv"
 }
 
-get_flavour_from_kernel_package()
+__epm_alt_kernel_module_flavour()
 {
-    local pkg="$1"
-    # remove kernel-image- prefix if present
-    pkg="${pkg#kernel-image-}"
-
-    # if just flavour (no dots or single segment like "std-def" or "6.12")
-    case "$pkg" in
-        *-*-alt*)
-            # full version like 6.12.10-6.12-alt1 or 5.10.123-std-def-alt1
-            # extract flavour using same logic as get_current_kernel_flavour
-            local flv
-            flv="${pkg#*-}"   # 6.12-alt1 or std-def-alt1
-            flv="${flv%-*}"   # 6.12 or std-def
-            echo "$flv"
-            ;;
-        *)
-            # short form: 6.12 or std-def
-            echo "$pkg"
-            ;;
-    esac
-}
-
-make_kernel_release()
-{
-    echo "$2" | sed -e "s|-|-$1-|"
-}
-
-get_latest_kernel_rel()
-{
-    local kernel_flavour="$1"
-    # current
-    rrel=$(uname -r)
-
-    # latest
-    # copied and modified from update-kernel
-    # get the maximum available kernel package version
-    kmaxver=
-    while read version
-    do
-        comparever="$(a='' rpmevrcmp "$kmaxver" "$version")"
-        [ "$comparever" -lt 0 ] && kmaxver="$version" ||:
-    done <<<"$(epm print version-release for package kernel-image-$kernel_flavour)"
-    [ -z "$kmaxver" ] && echo "$rrel" && return
-
-    make_kernel_release "$kernel_flavour" "$kmaxver"
+    local n="${1#kernel-modules-}" f
+    for f in "$(echo "$n" | sed -n 's|.*-\([0-9]\+\.[0-9]\+\)$|\1|p')" "$(echo "$n" | sed -n 's|.*-\([a-z]\+-def\)$|\1|p')" "${n##*-}" ; do
+        [ -n "$f" ] && [ "$f" != "$n" ] || continue
+        if echo "$f" | grep -q -E '^([0-9]+\.[0-9]+|[a-z]+-def)$' || a='' rpm -q "kernel-image-$f" >/dev/null 2>&1 ; then
+            echo "${n%-"$f"} $f"
+            return
+        fi
+    done
+    echo "$n $(get_current_kernel_flavour)"
 }
 
 epm_install_alt_kernel_module()
 {
     [ -n "$1" ] || return 0
 
-    local kflist=''
-    local kmplist=''
-    local kmf module flavour tmp
-
-    # fill kernel flavour list
-    for kmf in "$@"; do
-        case "$kmf" in
-            # full package with explicit version: kernel-modules-<mod>-<ver>
-            kernel-modules-*-*[0-9]*)
-                tmp=${kmf#kernel-modules-}      # tmp="<mod>-<ver>"
-                flavour=${tmp##*-}              # take version part
-                ;;
-            # full package without version: kernel-modules-<mod>
-            kernel-modules-*)
-                flavour=$(get_current_kernel_flavour)
-                ;;
-            # short name with version: <mod>-<ver>
-            *-[0-9]*)
-                flavour=${kmf##*-}
-                ;;
-            # everything else — module name only
-            *)
-                flavour=$(get_current_kernel_flavour)
-                ;;
-        esac
-        kflist="$kflist $flavour"
+    local list='' kmf flavour module
+    for kmf in "$@" ; do
+        list="$list
+$(__epm_alt_kernel_module_flavour "$kmf")"
     done
 
-    # firstly, update all needed kernels (by flavour)
-    for flavour in $(estrlist uniq $kflist); do
-        info
-        docmd epm update-kernel -t "$flavour" || exit
+    for flavour in $(echo "$list" | cut -d' ' -f2 | grep . | sort -u) ; do
+        local addopts=''
+        for module in $(echo "$list" | grep " $flavour\$" | cut -d' ' -f1) ; do
+            addopts="$addopts -A $module"
+        done
+        epm_kernel_update -t "$flavour" $addopts || return
     done
-
-    # skip install modules if there are no installed kernels (may be, a container)
-    epm installed "kernel-image-$flavour" || return 0
-
-    # make list for install kernel modules
-    for kmf in "$@"; do
-        case "$kmf" in
-            kernel-modules-*-*[0-9]*)
-                tmp=${kmf#kernel-modules-}
-                module=${tmp%-*}
-                flavour=${tmp##*-}
-                ;;
-            kernel-modules-*)
-                module=${kmf#kernel-modules-}
-                flavour=$(get_current_kernel_flavour)
-                ;;
-            *-[0-9]*)
-                module=${kmf%-*}
-                flavour=${kmf##*-}
-                ;;
-            *)
-                module=$kmf
-                flavour=$(get_current_kernel_flavour)
-                ;;
-        esac
-        kvf=$(get_latest_kernel_rel "$flavour")
-        kmplist="$kmplist kernel-modules-$module-$kvf"
-    done
-
-    # secondly, install module(s)
-    epm_install_names $kmplist
 }
 
 
@@ -6647,22 +7569,15 @@ epm_install_alt_names()
     while [ -n "$1" ] ; do
         local pkgname
         pkgname="$1"
-        if echo "$pkgname" | grep -v "#" | grep -q "^kernel-modules*-" ; then
-            # virtualbox[-std-def]
-            local kmn="$(echo $pkgname | sed -e 's|kernel-modules*-||')"
-            local kf1="$(echo "$kmn" | cut -d- -f2)"
-            local kf2="$(echo "$kmn" | cut -d- -f4)"
-            # pass install with full pkgnames
-            if [ "$kf1" != "$kf2" ] && [ -n "$kf2" ] || echo "$kf1" | grep -q "^[0-9]" ; then
-                installnames="$installnames $pkgname"
-            else
-                kmlist="$kmlist $kmn"
-            fi
-        elif echo "$pkgname" | grep -v "#" | grep -q "^kernel-image-" ; then
-            # kernel-image-6.12 or kernel-image-std-def or full kernel-image-6.12.10-6.12-alt1
-            local flavour
-            flavour="$(get_flavour_from_kernel_package "$pkgname")"
-            kilist="$kilist $flavour"
+        if echo "$pkgname" | grep -q "^kernel-image-" && ! echo "$pkgname" | grep -q -- "-debuginfo" ; then
+            # kernel-image-6.12, kernel-image-std-def or kernel-image-6.12-6.12.10-alt1
+            kilist="$kilist $pkgname"
+        elif echo "$pkgname" | grep -q -E -- '[#=]|-[0-9][^-]*-alt[^-]*$' ; then
+            # pass install with full pkgnames (with version)
+            installnames="$installnames $pkgname"
+        elif echo "$pkgname" | grep -q "^kernel-modules-" ; then
+            # virtualbox[-6.12]
+            kmlist="$kmlist $pkgname"
         else
             installnames="$installnames $pkgname"
         fi
@@ -6672,11 +7587,15 @@ epm_install_alt_names()
     epm_install_names $installnames || return
     epm_install_alt_kernel_module $kmlist || return
 
-    # install kernel images via update-kernel (handles modules automatically)
+    # install kernel images via update-kernel logic (handles modules automatically)
     if [ -n "$kilist" ] ; then
-        local flavour
-        for flavour in $kilist ; do
-            epm_kernel_update -t "$flavour" || return
+        local kpkg
+        for kpkg in $kilist ; do
+            if echo "$kpkg" | grep -q -E -- '[#=]|-[0-9][^-]*-alt[^-]*$' ; then
+                epm_kernel_update -r "$kpkg" || return
+            else
+                epm_kernel_update -t "${kpkg#kernel-image-}" || return
+            fi
         done
     fi
 }
@@ -6701,10 +7620,12 @@ apt_repo_after()
 prepare_task_packages()
 {
     # Sets global vars:
-    #   installlist  — final list of packages to install
-    #   unique_tasks — unique task names from args
+    #   installlist             — final list of packages to install
+    #   requested_task_packages — packages explicitly requested from a task
+    #   unique_tasks            — unique task names from args
 
     installlist=""
+    requested_task_packages=""
     unique_tasks=""
     local seen_tasks=""
     local task_packages=""
@@ -6726,10 +7647,35 @@ prepare_task_packages()
         # Add specific package or all task packages to install list
         if [ -n "$pkg" ]; then
             installlist="$installlist $pkg"
+            requested_task_packages="$requested_task_packages $pkg"
         else
             installlist="$installlist $task_packages"
         fi
     done
+}
+
+__epm_download_alt_task_files()
+{
+    local names="$1"
+    shift
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal
+    remove_on_exit "$tmpdir"
+    __download_task_rpms "$tmpdir" "$@"
+    local f
+    task_files=''
+    for f in "$tmpdir"/*.rpm ; do
+        [ -e "$f" ] || continue
+        estrlist contains "$(epm print name for package "$f")" "$names" || continue
+        task_files="$task_files $f"
+    done
+    [ -n "$task_files" ] || fatal "No packages downloaded from task(s)"
+}
+
+__epm_install_alt_task_files()
+{
+    __epm_download_alt_task_files "$@"
+    epm_install_files $task_files
 }
 
 epm_install_alt_tasks()
@@ -6744,6 +7690,9 @@ epm_install_alt_tasks()
     else
         # hack: drop -devel packages to avoid package provided by multiple packages
         installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
+        # Keep packages explicitly requested as task/PACKAGE.  In particular,
+        # a task may be used to install a -devel subpackage.
+        installlist="$(estrlist union "$installlist $requested_task_packages")"
     fi
 
     # TODO: need we this option?
@@ -6755,8 +7704,22 @@ epm_install_alt_tasks()
     [ -n "$verbose" ] && info "Packages to install: $installlist"
 
     if [ -z "$installlist" ] ; then
-        warning 'There is no installed packages for upgrade from task' "$*"
+        warning 'No packages available for install from task(s)' "$*"
         return 22
+    fi
+
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        # dnf reads APT-RPM repos: install from the task repos with dependencies from the system repos
+        if __alt_dnf_supports_aptrpm ; then
+            local res
+            __use_tmp_dnf_for_tasks $unique_tasks || return 1
+            (pkg_names="$installlist" epm_install)
+            res=$?
+            __EPM_DNF_REPO_OPTIONS=''
+            return $res
+        fi
+        __epm_install_alt_task_files "$installlist" $unique_tasks
+        return
     fi
 
     local res
@@ -6933,8 +7896,30 @@ separate_installed()
     done
 }
 
+epm_installed_help()
+{
+    message 'epm installed - check presence of package(s)
+Usage: epm installed [options] <package>
+'
+    get_help HELPOPT $SHAREDIR/epm-installed
+}
+
 epm_installed()
 {
+    case "$pkg_options" in
+        -h|--help)          # HELPOPT: show this help
+            epm_installed_help
+            return
+            ;;
+        --virtual)          # HELPOPT: check if virtual package has an installed provider
+            is_installed_virtual "$pkg_names"
+            return
+            ;;
+        --real)             # HELPOPT: check if real (non-virtual) package is installed
+            is_installed_real "$pkg_names"
+            return
+            ;;
+    esac
     [ -n "$pkg_names" ] || fatal "is_installed: package name is missed"
     is_installed "$pkg_names"
 }
@@ -7091,13 +8076,21 @@ epm_print_install_names_command()
     # check for pkg_files to support print out command without pkg names in args
     #[ -z "$1" ] && [ -n "$pkg_files" ] && return
     [ -z "$1" ] && return
+
+    if [ -n "$norecommends" ] ; then
+        APTOPTIONS="$APTOPTIONS -o APT::Install-Recommends=false"
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
+    fi
+
     case $PMTYPE in
         apt-rpm)
             echo "apt-get -y --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true $APTOPTIONS install $*"
             return ;;
         apt-dpkg)
             # this command  not for complex use. ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive
-            echo "apt-get -y --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true $APTOPTIONS install $*"
+            echo "apt-get -y --allow-unauthenticated --allow-downgrades --allow-change-held-packages $APTOPTIONS install $*"
             return ;;
         apm-rpm)
             echo "apm system install $*"
@@ -7109,7 +8102,7 @@ epm_print_install_names_command()
             echo "yum -y $YUMOPTIONS install $*"
             return ;;
         dnf-rpm|dnf5-rpm)
-            echo "dnf install -y $YUMOPTIONS --allowerasing  $*"
+            echo "$DNFCMD install -y $YUMOPTIONS --allowerasing $*"
             return ;;
         urpm-rpm)
             echo "urpmi --auto $URPMOPTIONS $*"
@@ -7210,6 +8203,108 @@ epm_install_files_rpm()
 
 }
 
+# File bin/epm-ipfs:
+
+IPFS_DHASH_PEER_ID="12D3KooWLDKZGAgD5v4gvgtXbCwxPV9aeRnhQyigSMW9gfKdY4xC"
+IPFS_DHASH_ADDRS='["/ip4/91.232.225.49/tcp/4001", "/ip4/91.232.225.49/udp/4001/quic-v1", "/ip6/2a03:5a00:c:20::49/tcp/4001", "/ip6/2a03:5a00:c:20::49/udp/4001/quic-v1"]'
+
+IPFS_USER="ipfs"
+IPFS_HOME="/var/lib/ipfs"
+IPFS_SERVICE="ipfs"
+
+epm_ipfs_help()
+{
+    message "epm ipfs - manage IPFS node for epm
+Usage: epm ipfs [start|stop|status|help]
+"
+    get_help HELPCMD $SHAREDIR/epm-ipfs
+}
+
+__epm_ipfs_check_installed()
+{
+    if ! is_command ipfs ; then
+        info 'IPFS (kubo) is not installed. Installing...'
+        epm play kubo || fatal 'Failed to install kubo'
+    fi
+}
+
+__epm_ipfs_init_repo()
+{
+    if [ ! -d "$IPFS_HOME/.ipfs" ] ; then
+        info "Initializing IPFS repository in $IPFS_HOME ..."
+        sudocmd mkdir -p "$IPFS_HOME"
+        sudocmd chown "$IPFS_USER:$IPFS_USER" "$IPFS_HOME"
+        sudocmd su - "$IPFS_USER" -s /bin/sh -c "IPFS_PATH=$IPFS_HOME/.ipfs ipfs init" || fatal 'Failed to initialize IPFS repository'
+    fi
+}
+
+__epm_ipfs_configure_peering()
+{
+    local current_peers
+    current_peers="$(su - "$IPFS_USER" -s /bin/sh -c "IPFS_PATH=$IPFS_HOME/.ipfs ipfs config Peering.Peers" 2>/dev/null)" || return 1
+
+    if echo "$current_peers" | grep -q "$IPFS_DHASH_PEER_ID" ; then
+        info 'Peering with dhash.ru is already configured'
+        return 0
+    fi
+
+    info 'Configuring peering with dhash.ru ...'
+    sudocmd su - "$IPFS_USER" -s /bin/sh -c "IPFS_PATH=$IPFS_HOME/.ipfs ipfs config --json Peering.Peers '[{\"ID\": \"$IPFS_DHASH_PEER_ID\", \"Addrs\": $IPFS_DHASH_ADDRS}]'" || return 1
+}
+
+__epm_ipfs_start()
+{
+    __epm_ipfs_check_installed
+    __epm_ipfs_init_repo
+    __epm_ipfs_configure_peering
+    sudocmd serv "$IPFS_SERVICE" on
+}
+
+__epm_ipfs_stop()
+{
+    sudocmd serv "$IPFS_SERVICE" off
+}
+
+__epm_ipfs_status()
+{
+    if ! is_command ipfs ; then
+        info 'IPFS (kubo) is not installed'
+        return 1
+    fi
+
+    docmd serv "$IPFS_SERVICE" status
+    echo
+    if ipfs swarm peers 2>/dev/null | grep -q "$IPFS_DHASH_PEER_ID" ; then
+        info 'Peering with dhash.ru: connected'
+    else
+        info 'Peering with dhash.ru: not connected'
+    fi
+}
+
+epm_ipfs()
+{
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        start|on)                    # HELPCMD: install kubo if needed, configure peering and start IPFS service
+            __epm_ipfs_start
+            ;;
+        stop|off)                    # HELPCMD: stop IPFS service
+            __epm_ipfs_stop
+            ;;
+        status)                      # HELPCMD: show IPFS service status and peering info
+            __epm_ipfs_status
+            ;;
+        -h|--help|help|"")
+            epm_ipfs_help
+            ;;
+        *)
+            fatal "Unknown command '$cmd'. Run 'epm ipfs help' for usage."
+            ;;
+    esac
+}
+
 # File bin/epm-kernel_update:
 
 
@@ -7278,16 +8373,18 @@ esac
 
     case $BASEDISTRNAME in
     "alt")
-        if ! __epm_query_package kernel-image >/dev/null ; then
-            info "No installed kernel packages, skipping update"
-            return
-        fi
-        assure_exists update-kernel update-kernel 0.9.9
-        local update_kernel_cmd
-        update_kernel_cmd="update-kernel"
-        # pass temporary APT config to update-kernel (e.g. when installing from another branch)
-        [ -n "$__EPM_APT_TMPDIR" ] && update_kernel_cmd="env APT_CONFIG=$__EPM_APT_TMPDIR/apt.conf update-kernel"
-        sudocmd $update_kernel_cmd $dryrun $(subst_option non_interactive -y) $force $interactive $reinstall $verbose "$@" || return
+        # list kernels even without installed ones
+        case " $* " in
+            *" -l "*|*" --list "*|*" -h "*|*" --help "*)
+                ;;
+            *)
+                if ! a='' rpm -qa 'kernel-image-*' 2>/dev/null | grep -q . ; then
+                    info "No installed kernel packages, skipping update"
+                    return
+                fi
+                ;;
+        esac
+        epm_alt_update_kernel "$@"
         return ;;
     esac
 
@@ -7492,12 +8589,12 @@ case $PMTYPE in
         # TODO: --format json?
         CMD="apm system list --limit 100000"
         ;;
-    dnf-*)
+    dnf-*|dnf5-*)
         warmup_rpmbase
         if [ -n "$short" ] ; then
-            docmd dnf list --available | sed -e "s| .*||g"
+            docmd $DNFCMD list --available | sed -e "s| .*||g"
         else
-            docmd dnf list --available
+            docmd $DNFCMD list --available
         fi
         ;;
     yum-*)
@@ -7611,12 +8708,19 @@ epm_list_installed()
 case $PMTYPE in
     *-dpkg)
         warmup_dpkgbase
-        docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture} - \${Description}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | cut -d'
-' -f1 | __fo_pfn "$@"
+        if [ -n "$short" ] ; then
+            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
+        else
+            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture} - \${binary:Summary}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
+        fi
         return ;;
     *-rpm)
         warmup_rpmbase
-        docmd rpm -qa --queryformat "%{name}-%{version}-%{release} - %{summary}\n" "$@" | __fo_pfn "$@"
+        if [ -n "$short" ] ; then
+            docmd rpm -qa --queryformat "%{name}\n" "$@" | __fo_pfn "$@"
+        else
+            docmd rpm -qa --queryformat "%{name}-%{version}-%{release} - %{summary}\n" "$@" | __fo_pfn "$@"
+        fi
         return ;;
     packagekit)
         docmd pkcon get-packages --filter installed
@@ -7644,7 +8748,7 @@ case $PMTYPE in
         docmd pkg info 2>/dev/null | sed -e "s| | - |" | __fo_pfn "$@"
         return ;;
     pacman)
-        docmd pacman -Qi "$@" 2>/dev/null | awk '/^Name/{name=$3} /^Version/{ver=$3} /^Description/{$1=$2=""; desc=$0} /^$/{print name"-"ver" -"desc}' | __fo_pfn "$@"
+        LC_ALL=C docmd pacman -Qi "$@" 2>/dev/null | awk '/^Name/{name=$3} /^Version/{ver=$3} /^Description/{$1=$2=""; desc=$0} /^$/{print name"-"ver" -"desc}' | __fo_pfn "$@"
         return
         ;;
     npackd)
@@ -7772,12 +8876,12 @@ case $PMTYPE in
             docmd apt list --upgradable
         fi
         ;;
-    dnf-*|yum-*)
+    dnf-*|dnf5-*|yum-*)
         warmup_rpmbase
         if [ -n "$short" ] ; then
-            docmd dnf check-update | sed -e "s| .*||g"
+            docmd $DNFCMD check-update | sed -e "s| .*||g"
         else
-            docmd dnf check-update
+            docmd $DNFCMD check-update
         fi
         ;;
     pacman)
@@ -7880,19 +8984,30 @@ __alt_mark_showhold()
 
 __dnf_assure_versionlock()
 {
+    [ "$PMTYPE" = "dnf5-rpm" ] && return
     epm assure /etc/dnf/plugins/versionlock.conf 'dnf-command(versionlock)'
+}
+
+__dnf_versionlock_names()
+{
+    if [ "$PMTYPE" = "dnf5-rpm" ] ; then
+        sed -n 's|^Package name: ||p'
+        return
+    fi
+    sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short
 }
 
 __dnf_is_supported_versionlock()
 {
+    [ "$PMTYPE" = "dnf5-rpm" ] && return
     [ -f /etc/dnf/plugins/versionlock.conf ]
 }
 
 epm_mark_hold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         __alt_mark_hold "$@"
         exit
         ;;
@@ -7909,7 +9024,7 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         __dnf_assure_versionlock
-        sudocmd dnf versionlock add "$@"
+        sudocmd $DNFCMD versionlock add "$@"
         ;;
     zypper-rpm)
         sudocmd zypper al "$@"
@@ -7931,8 +9046,8 @@ esac
 epm_mark_unhold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         __alt_mark_unhold "$@"
         exit
         ;;
@@ -7949,7 +9064,7 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         __dnf_assure_versionlock
-        sudocmd dnf versionlock delete "$@"
+        sudocmd $DNFCMD versionlock delete "$@"
         ;;
     zypper-rpm)
         sudocmd zypper rl "$@"
@@ -7971,8 +9086,8 @@ esac
 epm_mark_showhold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         __alt_mark_showhold "$@"
         exit
         ;;
@@ -7987,9 +9102,9 @@ case $PMTYPE in
         __dnf_is_supported_versionlock || return 0
         __dnf_assure_versionlock
         if [ -n "$short" ] ; then
-            docmd dnf versionlock list "$@" | sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short
+            docmd $DNFCMD versionlock list "$@" | __dnf_versionlock_names
         else
-            docmd dnf versionlock list "$@"
+            docmd $DNFCMD versionlock list "$@"
         fi
         ;;
     zypper-rpm)
@@ -8015,7 +9130,7 @@ case $PMTYPE in
         # there is no hold entries without versionlock
         __dnf_is_supported_versionlock || return 1
         __dnf_assure_versionlock
-        docmd dnf versionlock list | grep "^$1" | sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short | grep -q "^$1$"
+        docmd $DNFCMD versionlock list | __dnf_versionlock_names | grep -q "^$1$"
         return
         ;;
 esac
@@ -8033,8 +9148,8 @@ resolved="$(__epm_mark_resolve "$@")" || return 1
 [ -n "$resolved" ] || return 1
 set -- $resolved
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark auto "$@"
         exit
         ;;
@@ -8045,10 +9160,10 @@ case $PMTYPE in
         sudocmd apt-mark auto "$@"
         ;;
     dnf-rpm)
-        sudocmd dnf mark remove "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark remove "$@"
         ;;
     dnf5-rpm)
-        sudocmd dnf mark dependency "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark dependency "$@"
         ;;
     pacman)
             sudocmd pacman -D --asdeps "$@"
@@ -8072,8 +9187,8 @@ resolved="$(__epm_mark_resolve "$@")" || return 1
 [ -n "$resolved" ] || return 1
 set -- $resolved
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark manual "$@"
         exit
         ;;
@@ -8084,10 +9199,10 @@ case $PMTYPE in
         sudocmd apt-mark manual "$@"
         ;;
     dnf-rpm)
-        sudocmd dnf mark install "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark install "$@"
         ;;
     dnf5-rpm)
-        sudocmd dnf mark user "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark user "$@"
         ;;
     pacman)
             sudocmd pacman -D --asexplicit "$@"
@@ -8103,11 +9218,56 @@ esac
 }
 
 
+epm_mark_weak()
+{
+
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
+
+case $PMTYPE in
+    dnf5-rpm)
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark weak "$@"
+        ;;
+    *)
+        # apt considers weak dependency as automatically installed
+        info 'There is no weak dependency mark for $PMTYPE, mark as automatically installed'
+        epm_mark_auto "$@"
+        ;;
+esac
+
+}
+
+__epm_dnf_installed_by_reason()
+{
+    a='' LC_ALL=C $DNFCMD -q repoquery --installed --qf '%{name}|%{reason}\n' 2>/dev/null | \
+        awk -F'|' -v reasons="$*" 'BEGIN { n = split(reasons, r, ",") } { for (i = 1; i <= n; i++) if ($2 == r[i]) print $1 }' | sort -u
+}
+
+epm_mark_showweak()
+{
+
+case $PMTYPE in
+    dnf-rpm|dnf5-rpm)
+        __epm_dnf_installed_by_reason "Weak Dependency"
+        ;;
+    apt-rpm|apm-rpm)
+        # dnf5 on ALT writes 2 to AUTOINSTALLED rpm tag for weak dependencies
+        a='' rpm -qa --qf '%{NAME} %{AUTOINSTALLED}\n' 2>/dev/null | awk '$2 == 2 { print $1 }' | sort -u
+        ;;
+    *)
+        fatal 'Have no suitable command for $PMTYPE in epm_mark_showweak()'
+        ;;
+esac
+
+}
+
 epm_mark_showauto()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark showauto "$@"
         exit
         ;;
@@ -8118,7 +9278,8 @@ case $PMTYPE in
         sudocmd apt-mark showauto "$@"
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf repoquery --unneeded
+        # apt considers weak dependency as automatically installed too
+        __epm_dnf_installed_by_reason "Dependency,Weak Dependency"
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_mark_showauto()'
@@ -8130,8 +9291,8 @@ esac
 epm_mark_showmanual()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark showmanual "$@"
         exit
         ;;
@@ -8142,7 +9303,7 @@ case $PMTYPE in
         sudocmd apt-mark showmanual "$@"
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf repoquery --userinstalled
+        docmd $DNFCMD -q repoquery --qf '%{name}\n' --userinstalled
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_mark_showmanual'
@@ -8228,6 +9389,12 @@ epm_mark()
         ;;
     manual|install)                   # HELPCMD: mark the given package(s) as manually installed
         epm_mark_manual "$@"
+        ;;
+    weak)                             # HELPCMD: mark the given package(s) as weak dependency (auto for apt)
+        epm_mark_weak "$@"
+        ;;
+    showweak)                         # HELPCMD: print the list of packages installed as weak dependency
+        epm_mark_showweak "$@"
         ;;
     showauto)                         # HELPCMD: print the list of automatically installed packages
         epm_mark_showauto "$@"
@@ -8328,6 +9495,12 @@ __epm_pack_run_handler()
 
     local packscript="$(get_pack_script "$packname")"
     has_pack_script "$packscript" || return
+
+    # copy source file to pack working directory so pack scripts can freely rename it
+    if [ -f "$tarname" ] && [ "$(dirname "$tarname")" != "$(pwd)" ] ; then
+        __epm_repack_copy "$tarname" "$(pwd)/$(basename "$tarname")"
+        tarname="$(pwd)/$(basename "$tarname")"
+    fi
 
     # a file to keep filename of generated tarball
     filefortarname="$(pwd)/filefortarname"
@@ -8608,7 +9781,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
         else
-            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
+            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture} - \${binary:Summary}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
         fi
         return ;;
     *-rpm)
@@ -8616,7 +9789,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd rpm -qa --queryformat "%{name}\n" "$@" | __fo_pfn "$@"
         else
-            docmd rpm -qa --queryformat "%{name}-%{version}-%{release}\n" "$@" | __fo_pfn "$@"
+            docmd rpm -qa --queryformat "%{name}-%{version}-%{release} - %{summary}\n" "$@" | __fo_pfn "$@"
         fi
         return ;;
     packagekit)
@@ -8629,7 +9802,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd snap list 2>/dev/null | tail -n +2 | awk '{print $1}' | __fo_pfn "$@"
         else
-            docmd snap list 2>/dev/null | tail -n +2 | awk '{print $1"-"$2}' | __fo_pfn "$@"
+            docmd snap list 2>/dev/null | tail -n +2 | awk '{print $1"-"$2" - "$4}' | __fo_pfn "$@"
         fi
         return
         ;;
@@ -8637,7 +9810,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd flatpak list --app --columns=application 2>/dev/null | __fo_pfn "$@"
         else
-            docmd flatpak list --app --columns=application,version 2>/dev/null | awk -F'\t' '{print $1"-"$2}' | __fo_pfn "$@"
+            docmd flatpak list --app --columns=application,version,name 2>/dev/null | awk -F'\t' '{print $1"-"$2" - "$3}' | __fo_pfn "$@"
         fi
         return
         ;;
@@ -8653,14 +9826,14 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd pkg info 2>/dev/null | sed -e "s| .*||g" -e "s|-[0-9].*||g" | __fo_pfn "$@"
         else
-            docmd pkg info 2>/dev/null | sed -e "s| .*||g" | __fo_pfn "$@"
+            docmd pkg info 2>/dev/null | sed -e "s| | - |" | __fo_pfn "$@"
         fi
         return ;;
     pacman)
         if [ -n "$short" ] ; then
             docmd pacman -Q "$@" 2>/dev/null | sed -e "s| .*||g" | __fo_pfn "$@"
         else
-            docmd pacman -Q "$@" 2>/dev/null | awk '{print $1"-"$2}' | __fo_pfn "$@"
+            LC_ALL=C docmd pacman -Qi "$@" 2>/dev/null | awk '/^Name/{name=$3} /^Version/{ver=$3} /^Description/{$1=$2=""; desc=$0} /^$/{print name"-"ver" -"desc}' | __fo_pfn "$@"
         fi
         return
         ;;
@@ -8726,7 +9899,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd nix-env -q 2>/dev/null | sed -e "s|-[0-9].*||g" | __fo_pfn "$@"
         else
-            docmd nix-env -q 2>/dev/null | __fo_pfn "$@"
+            docmd nix-env -q --description 2>/dev/null | sed -e "s|  *| - |" | __fo_pfn "$@"
         fi
         return
         ;;
@@ -8746,7 +9919,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd pkg list-installed 2>/dev/null | sed -e "s|/.*||g" | __fo_pfn "$@"
         else
-            docmd pkg list-installed 2>/dev/null | awk '{split($1,a,"/"); print a[1]"-"$2}' | __fo_pfn "$@"
+            docmd pkg list-installed 2>/dev/null | sed -e "s|/[^ ]* | - |" | __fo_pfn "$@"
         fi
         return
         ;;
@@ -8754,7 +9927,7 @@ case $PMTYPE in
         if [ -n "$short" ] ; then
             docmd xbps-query -l 2>/dev/null | sed -e "s|^ii ||g" -e "s| .*||g" -e "s|\(.*\)-.*|\1|g" | __fo_pfn "$@"
         else
-            docmd xbps-query -l 2>/dev/null | sed -e "s|^ii ||g" -e "s| .*||g" | __fo_pfn "$@"
+            docmd xbps-query -l 2>/dev/null | sed -e "s|^ii ||g" -e "s| \+| - |" | __fo_pfn "$@"
         fi
         return 0
         ;;
@@ -8810,10 +9983,23 @@ __remove_installed_app()
 }
 
 
+__is_repo_play_app_installed()
+{
+    local app="$1"
+    local list_file="$CONFIGDIR/repo-play-apps.list"
+    [ -s "$list_file" ] || return 1
+    grep -q "^$app$" "$list_file" || return 1
+    # App is in the repo list — check if its package is actually installed
+    local pkg
+    pkg="$(__run_script "$app" --package-name </dev/null 2>/dev/null)"
+    [ -n "$pkg" ] && epm status --installed "$pkg" </dev/null
+}
+
 __is_app_installed()
 {
-    __run_script "$1" --installed "$2"
-    return
+    __run_script "$1" --installed "$2" && return 0
+    # Fallback: check if app is repo-installed (listed in repo-play-apps.list)
+    __is_repo_play_app_installed "$1"
 }
 
 
@@ -8897,7 +10083,7 @@ __list_app_packages_table()
     [ "$arch" = "x86_64" ] && IGNOREi586='NoNo' || IGNOREi586='i586-'
 
     __get_fast_short_list_app $arch | LC_ALL=C sort -k1,1 >$tmplist
-    grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" $psdir/*.sh | xargs grep -oP "^PKGNAME=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1 |" | grep -v -E "(^$IGNOREi586|^common|#.*$)" | LC_ALL=C sort -k1,1 >$tmplist1
+    find $psdir -maxdepth 1 -name '*.sh' ! -type l | xargs grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" | xargs grep -oP "^PKGNAME=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1 |" | grep -v -E "(^$IGNOREi586|^common|#.*$)" | LC_ALL=C sort -k1,1 >$tmplist1
     # tmplist - app
     # tmplist1 - app package
     __print_targeted_packages $tmplist1 | LC_ALL=C join -j 1 -a 1 $tmplist - | while read -r app package ; do
@@ -8984,10 +10170,27 @@ __get_installed_table()
     rm -f $pkglist
 }
 
+__get_repo_installed_apps()
+{
+    local found_apps="$1"
+    local list_file="$CONFIGDIR/repo-play-apps.list"
+    [ -s "$list_file" ] || return
+    local app
+    while read -r app ; do
+        [ -n "$app" ] || continue
+        [ "${app#\#}" != "$app" ] && continue
+        echo "$found_apps" | grep -q "^$app$" && continue
+        __is_repo_play_app_installed "$app" </dev/null 2>/dev/null && echo "$app"
+    done <"$list_file"
+}
+
 __list_installed_app()
 {
     # get all installed packages and convert it to a apps list
-    __get_installed_table | cut -f2 -d" "
+    local apps
+    apps="$(__get_installed_table | cut -f2 -d" ")"
+    [ -n "$apps" ] && echo "$apps"
+    __get_repo_installed_apps "$apps"
 }
 
 __list_installed_packages()
@@ -9034,9 +10237,10 @@ Options:
     --list                - list all installed apps
     --list-all            - list all available apps
     --search <pattern>    - search available apps by name or description
+    --list-updates        - list installed apps that have available updates
     --list-scripts        - list all available scripts
     --short (with --list) - list names only
-    --installed <app>     - check if the app is installed
+    --installed [<app>]   - check if the app is installed (list all installed apps without <app>)
     --ipfs <app>          - use IPFS for downloading
     --product-alternatives- list alternatives (use like epm play app=beta)
 
@@ -9067,7 +10271,7 @@ __epm_play_update()
     RES=0
     for i in $* ; do
         echo
-        echo "$i"
+        info 'Updating $i ...'
             if ! __is_app_installed "$i" ; then
                 continue
             fi
@@ -9115,55 +10319,138 @@ __epm_play_install_one()
         __epm_play_run "$prescription" --run "$@" || fatal "There was some error during run $prescription script."
     fi
 }
-__get_latest_package_version()
+
+__download_versions_list()
 {
-    local pkg="$1"
-    local ver
+    local target="$1"
+    local epmver="$(epm --short --version)"
+    # use baseversion (strip last .N)
+    epmver=$(echo "$epmver" | sed -e 's|\.[0-9]*$||')
 
-    [ -n "$pkg" ] || return 1
+    local URL
+    for URL in "https://eepm.ru/releases/$epmver/app-versions" "https://eepm.ru/app-versions" ; do
+        eget -q --force -O "$target" "$URL/epm-play-list-full.txt" && return
+    done
+    return 1
+}
 
-    ver="$(fetch_url "https://eepm.ru/app-versions/$pkg")"
+__get_installed_table_with_versions()
+{
+    local tapt
+    tapt="$(mktemp)" || fatal
+    remove_on_exit $tapt
 
-    if [ -n "$ver" ] ; then
-        echo "$ver"
-        return 0
+    local pkglist
+    pkglist="$(mktemp)" || fatal
+    remove_on_exit $pkglist
+
+    if [ "$PKGFORMAT" = "rpm" ] ; then
+        # pkglist: pkg version EPM <support@...>
+        __get_all_rpm_repacked_packages | LC_ALL=C sort -u >$pkglist
+        __list_app_packages_table $pkglist | LC_ALL=C sort -u >$tapt
+        # join gives: pkg app version EPM <support@...>
+        LC_ALL=C join -11 -21 $tapt $pkglist | uniq | awk '{print $1, $2, $3}'
+    else
+        local verlist
+        verlist="$(mktemp)" || fatal
+        remove_on_exit $verlist
+
+        local instpkgs
+        instpkgs="$(mktemp)" || fatal
+        remove_on_exit $instpkgs
+
+        epm --short packages | LC_ALL=C sort -u >$pkglist
+        __list_app_packages_table $pkglist | LC_ALL=C sort -u >$tapt
+        __filter_by_installed_packages $tapt $pkglist | LC_ALL=C sort -k1,1 >$instpkgs
+
+        # get versions for all installed packages
+        dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | LC_ALL=C sort -k1,1 >$verlist
+
+        # join to add versions: pkg app version
+        LC_ALL=C join -11 -21 $instpkgs $verlist | awk '{print $1, $2, $3}'
     fi
 
-    return 1
+    rm -f $tapt $pkglist
+}
+
+__compare_versions()
+{
+    local latest="$1"
+    local installed="$2"
+
+    case "$PKGFORMAT" in
+        rpm)
+            if is_command rpmevrcmp ; then
+                a= rpmevrcmp "$latest" "$installed"
+            else
+                a= rpm --eval "%{lua:print(rpm.vercmp('$latest', '$installed'))}"
+            fi
+            ;;
+        deb)
+            a= dpkg --compare-versions "$latest" gt "$installed" && echo "1" && return
+            echo "0"
+            ;;
+        *)
+            epm print compare version "$latest" "$installed" 2>/dev/null
+            ;;
+    esac
 }
 
 __list_available_updates()
 {
+    local installed_file latest_file joined_file
+    installed_file="$(mktemp)" || fatal
+    remove_on_exit $installed_file
+    latest_file="$(mktemp -u)" || fatal
+    remove_on_exit $latest_file
+    joined_file="$(mktemp)" || fatal
+    remove_on_exit $joined_file
 
-    local installed_table pkg app installed latest cmp header_printed updates_found line
+    # Step 1: get installed packages with versions: pkg app installed_version
+    __get_installed_table_with_versions | LC_ALL=C sort -k1,1 >$installed_file
 
-    installed_table="$(__get_installed_table)"
+    [ -s "$installed_file" ] || return 0
 
-    [ -n "$installed_table" ] || return 0
+    # Step 2: download bulk versions list: pkg latest_version [release]
+    __download_versions_list "$latest_file" || { warning "Can't download versions list" ; return 1 ; }
+    [ -s "$latest_file" ] || { warning "Empty versions list" ; return 1 ; }
 
-    updates_found=0
+    # for deb, lowercase the package name field for case-insensitive join
+    if [ "$PKGFORMAT" = "deb" ] ; then
+        awk '{$1=tolower($1); print}' "$latest_file" | LC_ALL=C sort -k1,1 -o "$latest_file"
+    else
+        LC_ALL=C sort -k1,1 "$latest_file" -o "$latest_file"
+    fi
 
-    while IFS= read -r line ; do
+    # Step 3: join on package name
+    # installed_file: pkg app installed_version
+    # latest_file: pkg latest_version [release]
+    # result: pkg app installed_version latest_version [release]
+    # Keep apps absent from the catalog: their target may come from an
+    # installed driver (hplip-plugin, virtualbox-extpack).
+    LC_ALL=C join -a1 -11 -21 "$installed_file" "$latest_file" >"$joined_file"
 
-        [ -n "$line" ] || continue
-        set -- $line
-        pkg="$1"
-        app="$2"
+    # Step 4: compare versions and output updates
+    local updates_found=0
+    local header_printed
+    local pkg app installed latest
 
+    while read -r pkg app installed latest _ ; do
         [ -n "$pkg" ] || continue
-        [ -n "$app" ] || continue
-
-        installed="$(epm print version for package "$pkg" 2>/dev/null | head -n1)"
-
         [ -n "$installed" ] || continue
-
-        latest="$(__get_latest_package_version "$pkg")"
-
-        [ -n "$latest" ] || continue
-
-        cmp="$(epm print compare package version "$latest" "$installed" 2>/dev/null)"
-
-        [ "$cmp" = "1" ] || continue
+        if grep -q '^get_target_version()' "$psdir/$app.sh" 2>/dev/null ; then
+            latest="$(__run_script "$app" --available-version 2>/dev/null)" || continue
+            [ -n "$latest" ] || continue
+            # Ignore packaging epoch/release; the plugin must match its driver
+            # after both upgrades and downgrades.
+            local installed_target
+            installed_target="$(epm print version for package "$pkg" 2>/dev/null | head -n1)"
+            [ -n "$installed_target" ] || continue
+            [ "$installed_target" != "$latest" ] || continue
+        else
+            [ -n "$latest" ] || continue
+            [ "$(__compare_versions "$latest" "$installed")" = "1" ] || continue
+        fi
 
         updates_found=1
 
@@ -9183,13 +10470,13 @@ __list_available_updates()
             printf "  %-25s %s -> %s\n" "$app" "$installed" "$latest"
         fi
 
-    done <<EOF
-    $installed_table
-EOF
+    done < "$joined_file"
 
-    if [ "$updates_found" -eq 0 ] && [ -z "$short" ] && [ -z "$quiet" ] ; then
+    if [ "$updates_found" = "0" ] && [ -z "$short" ] && [ -z "$quiet" ] ; then
         echo "All installed applications are up to date."
     fi
+
+    rm -f "$installed_file" "$latest_file" "$joined_file"
 }
 
 
@@ -9258,10 +10545,9 @@ __epm_play_install()
    return $RES
 }
 
-__epm_play_download_epm_file()
+__epm_play_download_ipfs_db()
 {
     local target="$1"
-    local file="$2"
     # use short version (3.4.5)
     local epmver="$(epm --short --version)"
     # use baseversion
@@ -9269,37 +10555,57 @@ __epm_play_download_epm_file()
 
     local URL
     for URL in "https://eepm.ru/releases/$epmver/app-versions" "https://eepm.ru/app-versions" ; do
-        info "Updating local IPFS DB in $eget_ipfs_db file from $URL/eget-ipfs-db.txt"
-        docmd eget -q -O "$target" "$URL/$file" && return
+        info "Updating cached IPFS DB in $target from $URL/eget-ipfs-db.txt"
+        docmd eget --timestamping -q -O "$target" "$URL/eget-ipfs-db.txt" && return
     done
 }
 
 
 __epm_play_initialize_ipfs()
 {
-    if [ ! -d "$(dirname "$eget_ipfs_db")" ] ; then
-        warning "ipfs db dir $eget_ipfs_db does not exist, skipping IPFS mode"
+    if [ ! -d "$epm_vardir" ] ; then
+        warning "ipfs db dir $epm_vardir does not exist, skipping IPFS mode"
         return 1
     fi
 
-    if [ ! -r "$eget_ipfs_db" ] ; then
-        sudorun touch "$eget_ipfs_db" >&2
-        sudorun chmod -v a+rw "$eget_ipfs_db" >&2
+    local eget_ipfs_db_local=$eget_ipfs_db
+
+    # ensure local writable db exists
+    if [ ! -r "$eget_ipfs_db_local" ] ; then
+        sudorun touch "$eget_ipfs_db_local" >&2
+        sudorun chmod -v a+rw "$eget_ipfs_db_local" >&2
     fi
 
-    # download and merge with local db
-    local t
-    t=$(mktemp -u) || fatal
-    remove_on_exit $t
-    __epm_play_download_epm_file "$t" "eget-ipfs-db.txt" || warning "Can't update IPFS DB"
-    if [ -s "$t" ] && [ -z "$EPM_IPFS_DB_UPDATE_SKIPPING" ] ; then
-        echo >>$t
-        cat $eget_ipfs_db >>$t
-        sort -u < $t | grep -v "^$" > $eget_ipfs_db
+    if [ -n "$EPM_IPFS_DB_UPDATE_SKIPPING" ] ; then
+        # skip remote db download (for the source server that generates the db)
+        export EGET_IPFS_DB="$eget_ipfs_db_local"
+        return
     fi
 
-    # the only one thing is needed to enable IPFS in eget
-    export EGET_IPFS_DB="$eget_ipfs_db"
+    local eget_ipfs_db_remote=$epm_vardir/eget-ipfs-db-remote.txt
+
+    # ensure remote cached db is writable
+    if [ ! -w "$eget_ipfs_db_remote" ] ; then
+        sudorun touch "$eget_ipfs_db_remote" >&2
+        sudorun chmod -v a+rw "$eget_ipfs_db_remote" >&2
+    fi
+
+    # download remote db with timestamping (skip if not changed)
+    __epm_play_download_ipfs_db "$eget_ipfs_db_remote" || warning "Can't update IPFS DB"
+
+    # one-time migration: remove entries already in remote from the local db
+    if [ -s "$eget_ipfs_db_remote" ] && [ -s "$eget_ipfs_db_local" ] ; then
+        local cleaned
+        cleaned=$(grep -vxFf "$eget_ipfs_db_remote" "$eget_ipfs_db_local")
+        if [ -n "$cleaned" ] ; then
+            echo "$cleaned" > "$eget_ipfs_db_local"
+        else
+            : > "$eget_ipfs_db_local"
+        fi
+    fi
+
+    # eget reads from all files, writes new entries to the last one
+    export EGET_IPFS_DB="$eget_ipfs_db_remote $eget_ipfs_db_local"
 }
 
 epm_play()
@@ -9350,6 +10656,14 @@ case "$1" in
 
     --update|--upgrade)
         shift
+        # handle --latest/--force after --update
+        while true ; do
+            case "$1" in
+                --latest) shift ; export latest="true" ;;
+                --force)  shift ; force=1 ;;
+                *) break ;;
+            esac
+        done
         local CMDUPDATE="--update"
         # check --force on common.sh side
         #[ -n "$force" ] && CMDUPDATE="--run"
@@ -9361,8 +10675,13 @@ case "$1" in
         local list
         if [ "$1" = "all" ] ; then
             shift
-            info "Retrieving list of installed apps ..."
-            list="$(__list_installed_app)"
+            info "Checking for available updates ..."
+            list="$(short=1 __list_available_updates)"
+            if [ -z "$list" ] ; then
+                info "All installed applications are up to date."
+                exit
+            fi
+            info "Apps to update: $(echo $list | wc -w)"
         else
             list="$*"
         fi
@@ -9373,6 +10692,10 @@ case "$1" in
 
     --installed)
         shift
+        if [ -z "$1" ] ; then
+            __epm_play_list_installed | __epm_colorize_search_output
+            exit
+        fi
         __is_app_installed "$1" "$2"
         #[ -n "$quiet" ] && exit
         exit
@@ -9425,7 +10748,7 @@ case "$1" in
         exit
         ;;
 
-    --list-updates)
+    --list-updates|--list-upgradable)
         __list_available_updates
         exit
         ;;
@@ -9542,7 +10865,8 @@ __get_fast_short_list_app()
     [ -n "$arch" ] || fatal
     local IGNOREi586
     [ "$arch" = "x86_64" ] && IGNOREi586='NoNo' || IGNOREi586='i586-'
-    grep -L -E "^DESCRIPTION=(''|\"\")" $psdir/*.sh | xargs grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" | xargs basename -s .sh | grep -v -E "(^$IGNOREi586|^common)"
+    # filter out symlinks (used as aliases) to avoid duplicates in listings
+    find $psdir -maxdepth 1 -name '*.sh' ! -type l | xargs grep -L -E "^DESCRIPTION=(''|\"\")" | xargs grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" | xargs basename -s .sh | grep -v -E "(^$IGNOREi586|^common)" | LC_ALL=C sort
 }
 
 __get_fast_int_list_app()
@@ -9552,7 +10876,7 @@ __get_fast_int_list_app()
     local IGNOREi586
     local RIFS=$'\x1E'
     [ "$arch" = "x86_64" ] && IGNOREi586='NoNo' || IGNOREi586='i586-'
-    grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" $psdir/*.sh | xargs grep -oP "^DESCRIPTION=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1$RIFS|" | grep -v -E "(^$IGNOREi586|^common|#.*$)"
+    find $psdir -maxdepth 1 -name '*.sh' ! -type l | xargs grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" | xargs grep -oP "^DESCRIPTION=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1$RIFS|" | grep -v -E "(^$IGNOREi586|^common|#.*$)" | LC_ALL=C sort
 }
 
 __epm_play_suggest_similar_apps()
@@ -9674,7 +10998,7 @@ esac
 
 case $PMTYPE in
     dnf-*|dnf5-*)
-        docmd dnf info $pkg_names
+        docmd $DNFCMD info $pkg_names
         ;;
     yum-*)
         fatal "policy command is not implemented for yum"
@@ -9684,6 +11008,9 @@ case $PMTYPE in
         ;;
     apk)
         docmd apk policy $pkg_names
+        ;;
+    opkg)
+        docmd opkg info $pkg_names
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_policy()'
@@ -9998,8 +11325,8 @@ print_srcpkgname()
             return
             ;;
         dnf-rpm|dnf5-rpm)
-            showcmd dnf repoquery --qf '%{SOURCERPM}' "$@"
-            a= dnf repoquery --qf '%{SOURCERPM}' "$@"
+            showcmd $DNFCMD repoquery --qf '%{SOURCERPM}\n' "$@"
+            a= $DNFCMD repoquery --qf '%{SOURCERPM}\n' "$@"
             return
             ;;
     esac
@@ -10383,7 +11710,7 @@ case $PMTYPE in
         if is_installed $pkg_names ; then
             CMD="rpm -q --provides"
         else
-            CMD="dnf repoquery --provides"
+            CMD="$DNFCMD repoquery --provides"
         fi
         ;;
     emerge)
@@ -10616,7 +11943,7 @@ __epm_query_dpkg_check()
 {
     local i
     for i in $@ ; do
-        a='' dpkg -s $i >/dev/null 2>/dev/null || return
+        a='' dpkg-query -W -f='${Status}\n' -- $i 2>/dev/null | grep -qE " (installed|half-configured|unpacked|triggers-awaited|triggers-pending)$" || return
     done
     return 0
 }
@@ -10756,9 +12083,40 @@ __epm_query_shortname()
 
 
 
-is_installed()
+is_installed_real()
 {
     (quiet=1 __epm_query_name "$@") >/dev/null 2>/dev/null
+}
+
+is_installed()
+{
+    is_installed_real "$@"
+}
+
+is_installed_virtual()
+{
+    is_installed_real "$@" && return 1
+    (quiet=1 __epm_whatprovides_installed "$@") >/dev/null 2>/dev/null
+}
+
+
+resolve_virtual_packages()
+{
+    local i
+    for i in "$@" ; do
+        if ! is_installed_virtual "$i" ; then
+            echo "$i"
+            continue
+        fi
+        local providers
+        providers="$(short=1 __epm_whatprovides_installed "$i" 2>/dev/null)"
+        if [ "$(echo "$providers" | wc -l)" = "1" ] ; then
+            info 'Resolved virtual package $i to $providers'
+            echo "$providers"
+        else
+            echo "$i"
+        fi
+    done
 }
 
 filter_pkgnames_to_short()
@@ -10816,8 +12174,8 @@ __do_query_real_file()
     local TOFILE
     local file="$1"
 
-    # get canonical path
-    if [ -e "$file" ] ; then
+    # get canonical path (-L for broken symlinks where -e fails)
+    if [ -e "$file" ] || [ -L "$file" ] ; then
         TOFILE="$(__abs_filename "$file")"
     else
         TOFILE="$(print_command_path "$file" || echo "$file")"
@@ -10851,8 +12209,11 @@ __do_query_real_file()
         LINKTO=$(readlink -- "$TOFILE")
         info " > $TOFILE is link to $LINKTO"
         LINKTO=$(readlink -f -- "$TOFILE")
-        __do_query_real_file "$LINKTO"
-        return
+        if [ -e "$LINKTO" ] ; then
+            __do_query_real_file "$LINKTO"
+            return
+        fi
+        return $RES
     else
         return $RES
     fi
@@ -11004,10 +12365,22 @@ epm_reinstall_names()
 {
     [ -n "$1" ] || return
 
+    # check backend:package syntax (snap:pkg, nix:pkg)
+    if __has_backend_syntax "$@" ; then
+        __process_backend_arguments epm_reinstall_names "$@"
+        return
+    fi
+
+    # check repo/package syntax (p10/pkg, sisyphus/pkg)
+    if __has_repo_syntax "$@" ; then
+        __process_repo_arguments epm_reinstall_names "$@"
+        return
+    fi
+
     case $PMTYPE in
         apt-rpm|apt-dpkg)
             local APTOPTIONS="$(subst_option non_interactive -y)"
-            sudocmd apt-get --reinstall $APTOPTIONS install $@
+            sudocmd apt-get $__EPM_APT_REPO_OPTIONS --reinstall $APTOPTIONS install $@
             return ;;
         aptitude-dpkg)
             sudocmd aptitude reinstall $@
@@ -11017,10 +12390,12 @@ epm_reinstall_names()
             docmd pkcon install --allow-reinstall $@
             return ;;
         yum-rpm)
-            sudocmd yum reinstall $@
+            local YUMOPTIONS="$(subst_option non_interactive -y)"
+            sudocmd yum reinstall $YUMOPTIONS $@
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf reinstall $@
+            local YUMOPTIONS="$(subst_option non_interactive -y)"
+            sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS reinstall $YUMOPTIONS $@
             return ;;
         homebrew)
             sudocmd brew reinstall $@
@@ -11082,7 +12457,7 @@ epm_reinstall()
 
     warmup_hibase
 
-    epm_reinstall_names $pkg_names
+    epm_reinstall_names $pkg_names || return
     epm_reinstall_files $pkg_files
 }
 
@@ -11136,10 +12511,11 @@ epm_release_downgrade()
 
     case $BASEDISTRNAME in
     "alt")
+        [ "$PMTYPE" = "apt-rpm" ] || fatal 'Release switching on ALT is supported only with apt-rpm (not $PMTYPE) yet'
         __epm_ru_update || fatal
 
         # try to detect current release by repo
-        if [ "$DISTRVERSION" = "Sisyphus" ] || [ -z "$DISTRVERSION" ] ; then
+        if [ "$DISTRVERSION" = "Sisyphus" ] || [ "$DISTRVERSION" = "Deferred" ] || [ -z "$DISTRVERSION" ] ; then
             local dv
             dv="$(__detect_alt_release_by_repo)"
             if [ -n "$dv" ] && [ "$dv" != "$DISTRVERSION" ] ; then
@@ -11193,19 +12569,19 @@ epm_release_downgrade()
         info "Check https://fedoraproject.org/wiki/DNF_system_upgrade for an additional info"
         docmd epm install dnf
         #docmd epm install epel-release yum-utils
-        sudocmd dnf --refresh upgrade
-        #sudocmd dnf clean all
+        sudocmd $DNFCMD --refresh upgrade
+        #sudocmd $DNFCMD clean all
         assure_exists dnf-plugin-system-upgrade
-        sudocmd dnf upgrade --refresh
+        sudocmd $DNFCMD upgrade --refresh
         local RELEASEVER="$1"
         [ -n "$RELEASEVER" ] || RELEASEVER=$(($DISTRVERSION + 1))
         #[ -n "$RELEASEVER" ] || fatal "Run me with new version"
         confirm_info 'Upgrade to $DISTRNAME/$RELEASEVER'
-        sudocmd dnf system-upgrade download --refresh --releasever=$RELEASEVER
+        sudocmd $DNFCMD system-upgrade download --refresh --releasever=$RELEASEVER
         # TODO: from docs:
         # dnf system-upgrade reboot
         # FIXME: download all packages again
-        sudocmd dnf distro-sync --releasever=$RELEASEVER
+        sudocmd $DNFCMD distro-sync --releasever=$RELEASEVER
         info "Run epm autoorphans to remove orphaned packages"
         ;;
     urpm-rpm)
@@ -11304,9 +12680,13 @@ __wcount()
 
 __p11_upgrade_fix()
 {
-    if ! docmd epm installed apt-conf-branch ; then 
-        info "Need to install default apt-conf-branch package to avoid missing $TO repo"
-        docmd epm install apt-conf-branch || fatal
+    # Only stable branches need apt-conf-branch. Deferred and Sisyphus use
+    # apt-conf-sisyphus, which must not be replaced with the conflicting package.
+    if [ "$TO" != "Deferred" ] && [ "$TO" != "Sisyphus" ] ; then
+        if ! docmd epm installed apt-conf-branch ; then
+            info "Need to install default apt-conf-branch package to avoid missing $TO repo"
+            docmd epm install apt-conf-branch || fatal
+        fi
     fi
     # файл /etc/openssl/openssl.cnf из устанавливаемого пакета openssl-config-3.2.0-alt1.noarch конфликтует с файлом из пакета libcrypto10-1.0.2u-alt1.p9.2.x86_64
     docmd epm remove libcrypto10 libssl10
@@ -11325,21 +12705,13 @@ __sisyphus_downgrade_fix()
 
 __detect_alt_release_by_repo()
 {
-    local BRD=$(cat /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
-        | grep -v "^#" \
-        | grep -E "[tpc][1-3]?[5-9][f.]?[0-9]?/branch/" \
-        | sed -e "s|.*\([tpc][1-3]\?[5-9][f.]\?[0-9]\?\)/branch.*|\1|g" \
-        | sort -u )
-    if [ "$(__wcount $BRD)" = "1" ] ; then
-        echo "$BRD"
-        return
-    fi
-
-    local BRD=$(cat /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
-        | grep -v "^#" \
-        | grep "Sisyphus/" \
-        | sed -e "s|.*\(Sisyphus\).*|\1|g" \
-        | sort -u )
+    local BRD
+    BRD="$(epm --quiet repo list | sed -n -E '
+        /^[[:space:]]*#/d
+        /Etersoft\/Sisyphus\/Deferred\// { s/.*//; s/^/Deferred/; p; d; }
+        /[/ ]Sisyphus\// { s/.*//; s/^/Sisyphus/; p; d; }
+        s!.*[/ ]([tpc][0-9]+([f.][0-9]+)?)/branch/.*!\1!p
+    ' | sort -u)"
     if [ "$(__wcount $BRD)" = "1" ] ; then
         echo "$BRD"
         return
@@ -11367,11 +12739,12 @@ get_fix_release_pkg()
 
     local TO="$1"
 
-    if [ "$TO" = "Sisyphus" ] ; then
-        TO="sisyphus"
-        echo "apt-conf-$TO"
-        # apt-conf-sisyphus and apt-conf-branch conflicts
+    if [ "$TO" = "Sisyphus" ] || [ "$TO" = "Deferred" ] ; then
+        # Deferred uses the Sisyphus configuration and release packages.
+        echo "apt-conf-sisyphus"
+        # apt-conf-sisyphus conflicts with apt-conf-branch and apt-conf-deferred
         epm installed apt-conf-branch && echo "apt-conf-branch-"
+        epm installed apt-conf-deferred && echo "apt-conf-deferred-"
         #for i in apt apt-rsync libapt libpackagekit-glib librpm7 packagekit rpm synaptic realmd libldap2 ; do
         #    epm installed $i && echo "$i"
         #done
@@ -11380,13 +12753,16 @@ get_fix_release_pkg()
         epm installed apt-conf-branch && echo "apt-conf-branch" && epm installed apt-conf-sisyphus && echo "apt-conf-sisyphus-"
     fi
 
+    # package names are lowercase (altlinux-release-sisyphus, not altlinux-release-Sisyphus)
+    local to_lower="$(echo "$TO" | tr '[:upper:]' '[:lower:]')"
+
     if [ "$FORCE" = "--force" ] ; then
         # assure we have set needed release
-        TOINSTALL="altlinux-release-$TO"
+        TOINSTALL="altlinux-release-$to_lower"
     else
         # just assure we have /etc/altlinux-release and switched from sisyphus
         if [ ! -s /etc/altlinux-release ] || epm qf /etc/altlinux-release | grep -q sisyphus ; then
-            TOINSTALL="altlinux-release-$TO"
+            TOINSTALL="altlinux-release-$to_lower"
         fi
     fi
 
@@ -11395,9 +12771,12 @@ get_fix_release_pkg()
     #    echo "$AR-"
     #fi
 
-    # TODO: add bug?
     # workaround against obsoleted altlinux-release-sisyphus package from 2008 year
-    [ "$TOINSTALL" = "altlinux-release-sisyphus" ] && TOINSTALL="branding-alt-sisyphus-release"
+    # branding-alt-sisyphus-release requires alt-os-release
+    if [ "$TOINSTALL" = "altlinux-release-sisyphus" ] || [ "$TOINSTALL" = "altlinux-release-deferred" ] ; then
+        TOINSTALL="branding-alt-sisyphus-release"
+        echo "alt-os-release"
+    fi
 
     if epm installed etersoft-gpgkeys ; then
         # TODO: we don't support LINUX@Etersoft for now
@@ -11435,7 +12814,7 @@ __check_system()
         docmd epm --skip-installed install systemd || fatal
     fi
 
-    if [ "$TO" != "Sisyphus" ] ; then
+    if [ "$TO" != "Sisyphus" ] && [ "$TO" != "Deferred" ] ; then
         # skip if /etc/altlinux-release is owned by a branding package
         local release_pkg="$(__get_conflict_release_pkg)"
         if [ -n "$release_pkg" ] && rhas "$release_pkg" "^branding-" ; then
@@ -11470,9 +12849,11 @@ __check_system()
 __epm_ru_update()
 {
     docmd epm update && return
-    # TODO: there can be errors due obsoleted alt-gpgkeys
-    epm update 2>&1 | grep "E: Unknown vendor ID" || return
-    info "Drop vendor signs"
+    # update failed after the branch switch: the target branch may be signed with a
+    # different vendor key than the source branch sign pins (e.g. [p11] sign vs the
+    # Sisyphus key), or alt-gpgkeys is obsolete. Drop the vendor signs and retry
+    # (covers both "Unknown vendor ID" and signature-mismatch errors).
+    info "Drop vendor signs and retry update"
     __alt_replace_sign_name ""
     docmd epm update
 }
@@ -11531,14 +12912,22 @@ __switch_alt_to_distro()
     local FROM="$1"
     info
 
+    local repo_already_switched=""
+    if [ "$(__detect_alt_release_by_repo)" = "$TO" ] ; then
+        repo_already_switched=1
+        info 'Repositories already point to $TO; skipping preparation from $FROM.'
+    fi
+
     try_change_alt_repo
 
     case "$*" in
         "p6"|"p6 p7"|"t6 p7"|"c6 c7")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            fi
             __switch_repo_to $TO
-            docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             end_change_alt_repo
             __do_upgrade
             docmd epm update-kernel
@@ -11546,9 +12935,11 @@ __switch_alt_to_distro()
             ;;
         "p7"|"p7 p8"|"t7 p8"|"c7 c8")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            fi
             __switch_repo_to $TO
-            docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             end_change_alt_repo
             __do_upgrade
             __check_system "$TO"
@@ -11557,9 +12948,11 @@ __switch_alt_to_distro()
             ;;
         "c8"|"c8.1"|"c8.2"|"c8 c8.1"|"c8.1 c8.2"|"c8 c8.2")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            fi
             __switch_repo_to $TO
-            docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             end_change_alt_repo
             __do_upgrade
             __check_system "$TO"
@@ -11567,9 +12960,11 @@ __switch_alt_to_distro()
             ;;
         "p8 c8"|"p8 c8.1"|"p8 c8.2")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+            fi
             __switch_repo_to $TO
-            docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             if epm installed libcrypt ; then
                 # glibc-core coflicts libcrypt
                 docmd epm downgrade apt pam pam0_passwdqc glibc-core libcrypt- || fatal
@@ -11582,66 +12977,76 @@ __switch_alt_to_distro()
             ;;
         "p8"|"p8 p9"|"t8 p9"|"c8 c9"|"c8 p9"|"c8.1 p9"|"c8.2 p9"|"p9 p9"|"p9 c9f2")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
-            info "Workaround for https://bugzilla.altlinux.org/show_bug.cgi?id=35492 ..."
-            if epm installed gdb >/dev/null ; then
-                docmd epm remove gdb || fatal
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                info "Workaround for https://bugzilla.altlinux.org/show_bug.cgi?id=35492 ..."
+                if epm installed gdb >/dev/null ; then
+                    docmd epm remove gdb || fatal
+                fi
             fi
             __switch_repo_to $TO
             end_change_alt_repo
             __do_upgrade
-            docmd epm install rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             __check_system "$TO"
             docmd epm update-kernel || fatal
             info "Run epm release-upgrade again for update to p10"
             ;;
         "p9"|"p9 p10"|"p10 p10")
-            info "Upgrade all packages to current $FROM repository"
-            __do_upgrade
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
-            if [ $TO = "p11" ]; then __p11_upgrade_fix; fi
+            if [ -z "$repo_already_switched" ] ; then
+                info "Upgrade all packages to current $FROM repository"
+                __do_upgrade
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                if [ $TO = "p11" ]; then __p11_upgrade_fix; fi
+            fi
             __switch_repo_to $TO
             end_change_alt_repo
             __do_upgrade
-            docmd epm install rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             __check_system "$TO"
             docmd epm update-kernel -t std-def || fatal
             ;;
         "p10 p11")
-            info "Upgrade all packages to current $FROM repository"
-            __do_upgrade
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
-            __p11_upgrade_fix
+            if [ -z "$repo_already_switched" ] ; then
+                info "Upgrade all packages to current $FROM repository"
+                __do_upgrade
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                __p11_upgrade_fix
+            fi
             __switch_repo_to $TO
             end_change_alt_repo
             __do_upgrade
-            docmd epm install rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             __check_system "$TO"
             # will update to kernel 6.6
             docmd epm update-kernel -t 6.12 || fatal
             ;;
         "c10f1 c10f2"|"c10f2 c10f3")
-            info "Upgrade all packages to current $FROM repository"
-            __do_upgrade
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
-            #__p11_upgrade_fix
+            if [ -z "$repo_already_switched" ] ; then
+                info "Upgrade all packages to current $FROM repository"
+                __do_upgrade
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                #__p11_upgrade_fix
+            fi
             __switch_repo_to $TO
             end_change_alt_repo
             __do_upgrade
-            docmd epm install altlinux-release-$TO altlinux-release-$FROM-
-            docmd epm install rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove altlinux-release-$TO altlinux-release-$FROM-
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             __check_system "$TO"
             # will update to kernel 6.6
             docmd epm update-kernel || fatal
             ;;
         "p9 p8"|"c8.1 c8"|"c8.1 p8"|"p8 p8")
             confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install $(get_fix_release_pkg "$FROM")
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove $(get_fix_release_pkg "$FROM")
+            fi
             __switch_repo_to $TO
-            docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm downgrade --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             if epm installed libcrypt >/dev/null ; then
                 # glibc-core coflicts libcrypt
                 docmd epm downgrade apt rpm pam pam0_passwdqc glibc-core libcrypt- || fatal
@@ -11653,9 +13058,11 @@ __switch_alt_to_distro()
             ;;
         "p9 c8"|"p9 c8.1"|"p9 c8.2")
             confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install $(get_fix_release_pkg "$FROM")
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove $(get_fix_release_pkg "$FROM")
+            fi
             __switch_repo_to $TO
-            docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm downgrade --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             #if epm installed libcrypt >/dev/null ; then
             #    # glibc-core coflicts libcrypt
             #    docmd epm downgrade apt rpm pam pam0_passwdqc glibc-core libcrypt- || fatal
@@ -11667,42 +13074,72 @@ __switch_alt_to_distro()
             ;;
         "p10 p9"|"p11 p9")
             confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install $(get_fix_release_pkg "$FROM")
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove $(get_fix_release_pkg "$FROM")
+            fi
             __switch_repo_to $TO
-            docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm downgrade --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             docmd epm $force_yes $non_interactive downgrade || fatal "Check the error and run '# epm downgrade'"
             end_change_alt_repo
             __check_system "$TO"
             docmd epm upgrade || fatal
             ;;
-        "Sisyphus p8"|"Sisyphus p9"|"Sisyphus p10"|"Sisyphus p11"|"Sisyphus c8"|"Sisyphus c8.1"|"Sisyphus c9f2"|"Sisyphus c10f1"|"Sisyphus c10f2"|"Sisyphus c10f3")
+        "Sisyphus p8"|"Sisyphus p9"|"Sisyphus p10"|"Sisyphus p11"|"Sisyphus c8"|"Sisyphus c8.1"|"Sisyphus c9f2"|"Sisyphus c10f1"|"Sisyphus c10f2"|"Sisyphus c10f3"|\
+        "Deferred p8"|"Deferred p9"|"Deferred p10"|"Deferred p11"|"Deferred c8"|"Deferred c8.1"|"Deferred c9f2"|"Deferred c10f1"|"Deferred c10f2"|"Deferred c10f3")
             confirm_info 'Downgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install $(get_fix_release_pkg "$FROM")
-            if [ $TO = "p11" ]; then __sisyphus_downgrade_fix; fi
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove $(get_fix_release_pkg "$FROM")
+                if [ $TO = "p11" ]; then __sisyphus_downgrade_fix; fi
+            fi
             __switch_repo_to $TO
-            docmd epm downgrade rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm downgrade --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
             docmd epm $force_yes $non_interactive downgrade || fatal "Check the error and run '# epm downgrade'"
             end_change_alt_repo
             __check_system "$TO"
             docmd epm upgrade || fatal
             ;;
-        "p8 Sisyphus"|"p9 Sisyphus"|"p10 Sisyphus"|"p11 Sisyphus"|"Sisyphus Sisyphus")
+        "p11 Deferred")
             confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
-            docmd epm install rpm apt $(get_fix_release_pkg "$FROM") || fatal
-            docmd epm upgrade || fatal
-            # TODO: epm_reposwitch??
-            __replace_alt_version_in_repo "$FROM/branch/" "$TO/"
+            if [ -z "$repo_already_switched" ] ; then
+                info 'Upgrade all packages to current $FROM repository'
+                __do_upgrade
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                __p11_upgrade_fix
+            fi
+            __switch_repo_to $TO
+            [ -s /etc/rpm/macros.d/p10 ] && rm -fv /etc/rpm/macros.d/p10
+            [ -s /etc/rpm/macros.d/p11 ] && rm -fv /etc/rpm/macros.d/p11
+            end_change_alt_repo
+            __do_upgrade
+            # apt-conf-sisyphus may overwrite sources.list during upgrade, restore Deferred URLs
+            __switch_repo_to $TO
+            docmd epm install --allow-remove rpm apt $(get_fix_release_pkg --force "$TO") || fatal
+            __switch_repo_to "$TO"
+            __check_system "$TO"
+            docmd epm update-kernel || fatal
+            ;;
+        "p8 Sisyphus"|"p9 Sisyphus"|"p10 Sisyphus"|"p11 Sisyphus"|"Sisyphus Sisyphus"|\
+        "p8 Deferred"|"p9 Deferred"|"p10 Deferred"|"Deferred Deferred"|"Sisyphus Deferred"|"Deferred Sisyphus")
+            confirm_info 'Upgrade $DISTRNAME from $FROM to $TO ...'
+            if [ -z "$repo_already_switched" ] ; then
+                docmd epm install --allow-remove rpm apt $(get_fix_release_pkg "$FROM") || fatal
+                docmd epm upgrade || fatal
+                # TODO: epm_reposwitch??
+                __replace_alt_version_in_repo "$FROM/branch/" "Sisyphus/"
+            fi
             __switch_repo_to $TO
             [ -s /etc/rpm/macros.d/p10 ] && rm -fv /etc/rpm/macros.d/p10
             [ -s /etc/rpm/macros.d/p11 ] && rm -fv /etc/rpm/macros.d/p11
             __epm_ru_update || fatal
             docmd epm fix || fatal
-            docmd epm install $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            docmd epm install --allow-remove $(get_fix_release_pkg --force "$TO") || fatal "Check the errors and run '# epm release-upgrade' again"
+            [ "$TO" != "Deferred" ] || __switch_repo_to "$TO"
             #local ADDPKG
             #ADDPKG=$(epm -q --short make-initrd sssd-ad 2>/dev/null)
             #docmd epm install librpm7 librpm rpm apt $ADDPKG $(get_fix_release_pkg --force "$TO") ConsoleKit2- || fatal "Check an error and run again"
             end_change_alt_repo
             docmd epm $force_yes $non_interactive upgrade || fatal "Check the error and run '# epm release-upgrade' again or just '# epm upgrade'"
+            [ "$TO" != "Deferred" ] || __switch_repo_to "$TO"
             docmd epm $force_yes $non_interactive downgrade || fatal "Check the error and run '# epm downgrade'"
             __check_system "$TO"
             docmd epm update-kernel || fatal
@@ -11714,7 +13151,7 @@ __switch_alt_to_distro()
                 warning 'Unknown distro version. Have no idea how to switch from $DISTRNAME $FROM to $DISTRNAME $TO.'
             fi
             end_change_alt_repo
-            info "Try run f.i. '# epm release-upgrade p10' or '# epm release-downgrade p9' or '# epm release-upgrade Sisyphus'"
+            info "Try run f.i. '# epm release-upgrade p10' or '# epm release-downgrade p9' or '# epm release-upgrade Deferred' or '# epm release-upgrade Sisyphus'"
             info "Also possible you need install altlinux-release-p? package for correct distro version detecting"
             return 1
     esac
@@ -11735,12 +13172,13 @@ epm_release_upgrade()
 
     case $BASEDISTRNAME in
     "alt")
+        [ "$PMTYPE" = "apt-rpm" ] || fatal 'Release switching on ALT is supported only with apt-rpm (not $PMTYPE) yet'
         [ "$FULLDISTRNAME" = "ALT Atomic" ] && fatal "Use epm upgrade for update to the new image."
         __epm_ru_update || fatal
 
         # TODO: remove this hack (or move it to distro_info)
         # try to detect current release by repo
-        if [ "$DISTRVERSION" = "Sisyphus" ] || [ -z "$DISTRVERSION" ] ; then
+        if [ "$DISTRVERSION" = "Sisyphus" ] || [ "$DISTRVERSION" = "Deferred" ] || [ -z "$DISTRVERSION" ] ; then
             local dv
             dv="$(__detect_alt_release_by_repo)"
             if [ -n "$dv" ] && [ "$dv" != "$DISTRVERSION" ] ; then
@@ -11759,7 +13197,13 @@ epm_release_upgrade()
             TARGET="$1"
         fi
 
+        case "$TARGET" in
+            deferred) TARGET="Deferred" ;;
+            sisyphus) TARGET="Sisyphus" ;;
+        esac
+
         [ "$TARGET" = "Sisyphus" ] && info "Check also https://www.altlinux.org/Update/Sisyphus"
+        [ "$TARGET" = "Deferred" ] && info "Check also https://www.altlinux.org/Update/Sisyphus"
 
         [ -n "$TARGET" ] || TARGET="$(get_next_release $DISTRVERSION)"
 
@@ -11774,6 +13218,13 @@ epm_release_upgrade()
     esac
 
     case $DISTRNAME in
+    "AstraLinuxSE")
+        info "Upgrading Astra Linux SE $DISTRVERSION ..."
+        info "See also https://wiki.astralinux.ru/pages/viewpage.action?pageId=333809857"
+        assure_exists astra-console-upgrade
+        sudocmd astra-console-upgrade force
+        return
+        ;;
     "Mageia")
         epm repo remove all
         sudocmd urpmi.addmedia --distrib --mirrorlist 'http://mirrors.mageia.org/api/mageia.8.$DISTRARCH.list'
@@ -11781,19 +13232,19 @@ epm_release_upgrade()
         return
         ;;
      "OpenMandrivaLx")
-        #sudocmd dnf clean all
-        sudocmd dnf distro-sync --allowerasing
+        #sudocmd $DNFCMD clean all
+        sudocmd $DNFCMD distro-sync --allowerasing
         return
         ;;
     "ROSA")
-        sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
-        #sudocmd dnf clean all
+        sudocmd $DNFCMD $(subst_option non_interactive -y) --refresh upgrade || fatal
+        #sudocmd $DNFCMD clean all
         DV=$(echo "$DISTRVERSION" | sed -e "s|\..*||")
         [ "$DV" = "2021" ] && DV=12
         local RELEASEVER="$1"
         [ -n "$RELEASEVER" ] || RELEASEVER=$(($DV + 1))
         confirm_info 'Upgrade to $DISTRNAME/$RELEASEVER'
-        sudocmd dnf distro-sync -y --releasever=$RELEASEVER --allowerasing
+        sudocmd $DNFCMD distro-sync -y --releasever=$RELEASEVER --allowerasing
         sudocmd rpm --rebuilddb
         epm upgrade
         return
@@ -11854,15 +13305,15 @@ epm_release_upgrade()
                     -e 's!^#?baseurl=http://(mirror|vault).centos.org/\$contentdir/\$releasever/!baseurl=https://dl.rockylinux.org/vault/centos/8.5.2111/!i' \
                         /etc/yum.repos.d/CentOS-*.repo
             docmd epm install centos-release-stream
-            sudocmd dnf swap centos-{linux,stream}-repos
-            sudocmd dnf distro-sync
+            sudocmd $DNFCMD swap centos-{linux,stream}-repos
+            sudocmd $DNFCMD distro-sync
             info "You can run '# epm autoorphans' to remove orphaned packages"
             exit
         fi
 
         if [ "$DISTRNAME" = "RockyLinux" ] ; then
-            sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
-            #sudocmd dnf clean all
+            sudocmd $DNFCMD $(subst_option non_interactive -y) --refresh upgrade || fatal
+            #sudocmd $DNFCMD clean all
 
             DV=$(echo "$DISTRVERSION" | sed -e "s|\..*||")
             local RELEASEVER="$1"
@@ -11875,29 +13326,29 @@ epm_release_upgrade()
             sudocmd rpm --import "/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-$RELEASEVER"
 
             epm install --nodeps "$ROCKY_URL/rocky-repos*.rpm" "$ROCKY_URL/rocky-release*.rpm" || fatal
-            sudocmd dnf distro-sync -y --releasever=$RELEASEVER --allowerasing --setopt=deltarpm=false
+            sudocmd $DNFCMD distro-sync -y --releasever=$RELEASEVER --allowerasing --setopt=deltarpm=false
             sudocmd rpm --rebuilddb
             epm upgrade
             info "You can run '# epm autoorphans' to remove orphaned packages"
-            info "Use # dnf module reset <module> to resolve 'nothing provides module' error"
+            info "Use # $DNFCMD module reset <module> to resolve 'nothing provides module' error"
             exit
         fi
 
         info "Check https://fedoraproject.org/wiki/DNF_system_upgrade for an additional info"
         #docmd epm install epel-release yum-utils
-        sudocmd dnf $(subst_option non_interactive -y) --refresh upgrade || fatal
-        #sudocmd dnf clean all
+        sudocmd $DNFCMD $(subst_option non_interactive -y) --refresh upgrade || fatal
+        #sudocmd $DNFCMD clean all
         assure_exists dnf-plugin-system-upgrade
-        sudocmd dnf $(subst_option non_interactive -y) upgrade --refresh
+        sudocmd $DNFCMD $(subst_option non_interactive -y) upgrade --refresh
         local RELEASEVER="$1"
         [ -n "$RELEASEVER" ] || RELEASEVER=$(($DISTRVERSION + 1))
         #[ -n "$RELEASEVER" ] || fatal "Run me with new version"
         confirm_info 'Upgrade to $DISTRNAME/$RELEASEVER'
-        sudocmd dnf system-upgrade download --refresh --releasever=$RELEASEVER
+        sudocmd $DNFCMD system-upgrade download --refresh --releasever=$RELEASEVER
         # TODO: from docs:
         # dnf system-upgrade reboot
         # FIXME: download all packages again
-        sudocmd dnf distro-sync --releasever=$RELEASEVER
+        sudocmd $DNFCMD distro-sync --releasever=$RELEASEVER
         info "You can run '# epm autoorphans' to remove orphaned packages"
         ;;
     zypper-rpm)
@@ -11953,9 +13404,6 @@ epm_remove_low()
             cd /tmp || fatal
             __epm_check_vendor $@
             set_sudo
-            sudocmd rpm -ev $noscripts $nodeps $@
-            return
-            # we don't need RPMISNOTINSTALLED as for now
             store_output sudocmd rpm -ev $noscripts $nodeps $@
             # rpm returns number of packages if failed on removing
             __check_rpm_e_result $RC_STDOUT $?
@@ -12048,7 +13496,7 @@ epm_remove_names()
             sudocmd yum remove $@
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf remove $@
+            sudocmd $DNFCMD $(subst_option dryrun --assumeno) remove $@
             return ;;
         snappy)
             sudocmd snappy uninstall $@
@@ -12123,13 +13571,13 @@ epm_remove_nonint()
 
     case $PMTYPE in
         apt-dpkg)
-            sudocmd apt-get -y --force-yes remove --purge $@
+            sudocmd apt-get -y remove --purge $@
             return ;;
         aptitude-dpkg)
             sudocmd aptitude -y purge $@
             return ;;
         apt-rpm)
-            sudocmd apt-get -y --force-yes remove $@
+            sudocmd apt-get -y remove $@
             return ;;
         packagekit)
             docmd pkcon remove --noninteractive $@
@@ -12144,7 +13592,7 @@ epm_remove_nonint()
             sudocmd yum -y remove $@
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf remove --assumeyes $@
+            sudocmd $DNFCMD remove --assumeyes $@
             return ;;
         zypper-rpm)
             sudocmd zypper --non-interactive remove --clean-deps $@
@@ -12274,7 +13722,10 @@ epm_remove()
                 nodeps="--test"
                 APTOPTIONS="--simulate"
                 ;;
-            apt-deb)
+            dnf-rpm|dnf5-rpm)
+                nodeps="--test"
+                ;;
+            apt-dpkg)
                 nodeps="--simulate"
                 APTOPTIONS="--simulate"
                 ;;
@@ -12289,11 +13740,21 @@ epm_remove()
         pkg_names="$(get_only_installed_packages $pkg_names)"
     fi
 
+    # resolve virtual package names to real installed package names
+    pkg_names="$(resolve_virtual_packages $pkg_names)"
+
     epm_remove_low $pkg_names && return
     local STATUS=$?
 
-    # || [ "$STATUS" = "$RPMISNOTINSTALLED" ]
+    # if rpm says packages are not installed, check if they are virtual
+    # don't escalate to hi level package manager for truly missing packages
     # see https://github.com/Etersoft/eepm/issues/236
+    if [ "$STATUS" = "$RPMISNOTINSTALLED" ] ; then
+        if [ -z "$(get_only_installed_packages $pkg_names)" ] ; then
+            return $STATUS
+        fi
+    fi
+
     if [ -n "$direct" ] || [ -n "$nodeps" ] ; then
         [ -n "$force" ] || return $STATUS
     fi
@@ -12328,12 +13789,11 @@ epm_remove_old_kernels()
 
     case $BASEDISTRNAME in
     "alt")
-        if ! __epm_query_package kernel-image >/dev/null ; then
+        if ! a='' rpm -qa 'kernel-image-*' 2>/dev/null | grep -q . && [ "$1" != "-h" ] && [ "$1" != "--help" ] ; then
             info "No installed kernel packages, skipping cleaning"
             return
         fi
-        assure_exists update-kernel update-kernel 0.9.9
-        sudocmd remove-old-kernels $dryrun $(subst_option non_interactive -y) "$@"
+        epm_alt_remove_old_kernels "$@" || return
 
         [ -n "$dryrun" ] && return
 
@@ -12392,8 +13852,8 @@ __apt_delete_repo_line()
 {
     local repo="$1"
 
-    local sc="sudocmd"
-    [ -z "$quiet" ] || sc="sudorun"
+    local sc="sudorun"
+    [ -n "$verbose" ] && sc="sudocmd"
 
     # touch file only when it is needed
     grep -q -F "$repo" "$APT_SOURCES_LIST" || return
@@ -12415,7 +13875,9 @@ __epm_removerepo_apt()
     __apt_delete_repo_line "$repo"
 
     # sources.list.d: comment lines instead of deleting
-    epm repo disable "^$repo" 2>/dev/null
+    docmd epm repo disable "^$repo" 2>/dev/null
+
+    return 0
 }
 
 
@@ -12425,9 +13887,9 @@ __epm_grep_repo_list()
         epm --quiet repo list
         return
     fi
-    # use --regex for raw regex patterns
+    # use --regexp for raw regex patterns
     while [ -n "$1" ] ; do
-        epm --quiet repo list --regex "$1"
+        epm --quiet --regexp repo list "$1"
         shift
     done
 }
@@ -12458,6 +13920,7 @@ __epm_removerepo_alt()
         for arg in $repo ; do
             is_taskarg "$arg" || continue
             tn=$(get_tasknumber_from_arg "$arg")
+            showcmd epm repo remove $tn
             __epm_removerepo_alt_grepremove " repo/$tn/" "/tasks/$tn " "/$tn[ /]build/repo"
         done
         return
@@ -12512,6 +13975,79 @@ __epm_removerepo_alt()
 
 }
 
+__epm_removerepo_dnf_section()
+{
+    local file="$1"
+    local id="$2"
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    awk -v id="$id" '/^\[.*\]/ { skip = ($0 == "[" id "]") } !skip' "$file" >$tmpfile
+    if grep -q "^\[" $tmpfile ; then
+        chmod 644 $tmpfile
+        sudocmd cp $tmpfile "$file"
+    else
+        sudocmd rm -f "$file"
+    fi
+}
+
+__epm_removerepo_dnf()
+{
+    local repo f found
+    for repo in "$@" ; do
+        if [ "$repo" = "all" ] ; then
+            info "removing all repos"
+            for f in /etc/yum.repos.d/*.repo ; do
+                [ -e "$f" ] || continue
+                sudocmd rm -f "$f"
+            done
+            continue
+        fi
+
+        if [ "$BASEDISTRNAME" = "alt" ] ; then
+            # task repos (APT-RPM) added with epm repo add <task number>
+            case "$repo" in
+                tasks|task)
+                    for f in /etc/yum.repos.d/task-[0-9]*.repo ; do
+                        [ -e "$f" ] || continue
+                        sudocmd rm -f "$f"
+                    done
+                    continue
+                    ;;
+                [0-9]*)
+                    if [ -e "/etc/yum.repos.d/task-$repo.repo" ] ; then
+                        sudocmd rm -f "/etc/yum.repos.d/task-$repo.repo"
+                        continue
+                    fi
+                    ;;
+            esac
+            case "$repo" in
+                archive|cdroms|autoimports|korinf|[0-9]*)
+                    info 'Skipping $repo: it is not supported for $PMTYPE'
+                    continue
+                    ;;
+            esac
+        fi
+
+        found=''
+        for f in /etc/yum.repos.d/$repo.repo /etc/yum.repos.d/alt-$repo.repo ; do
+            [ -e "$f" ] || continue
+            sudocmd rm -f "$f"
+            found=1
+        done
+        [ -n "$found" ] && continue
+
+        for f in /etc/yum.repos.d/*.repo ; do
+            grep -q -F "[$repo]" "$f" 2>/dev/null || continue
+            __epm_removerepo_dnf_section "$f" "$repo"
+            found=1
+        done
+        # not an error - repo may be already removed (idempotency)
+        [ -n "$found" ] || info 'Repo $repo is not found in /etc/yum.repos.d'
+    done
+    return 0
+}
+
 epm_removerepo()
 {
 
@@ -12520,7 +14056,7 @@ case "$1" in
         local owner_project="$(echo "$1" | sed 's|^copr/||')"
         case $PMTYPE in
             dnf-rpm|dnf5-rpm)
-                sudocmd dnf copr disable "$owner_project"
+                sudocmd $DNFCMD copr disable "$owner_project"
                 ;;
             yum-rpm)
                 sudocmd yum copr disable "$owner_project"
@@ -12535,13 +14071,32 @@ esac
 
 case $BASEDISTRNAME in
     "alt")
-        __epm_removerepo_alt "$@"
+        if [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_uses_apt_sources ; then
+            __epm_removerepo_alt "$@"
+            return
+        fi
+        ;;
+esac
+
+case "$PMTYPE:$1" in
+    yum-rpm:all)
+        __epm_removerepo_dnf "$@"
         return
         ;;
+esac
+
+case $BASEDISTRNAME in
     "astra")
-        echo "Use workaround for AstraLinux"
-        # aptsources.distro.NoDistroTemplateException: Error: could not find a distribution template for AstraLinuxCE/orel
-        __epm_removerepo_apt "$@"
+        # handle "all" and pattern-based removal
+        case "$1" in
+            all)
+                info "removing all repos"
+                __epm_removerepo_alt_grepremove "all"
+                ;;
+            *)
+                __epm_removerepo_apt "$@"
+                ;;
+        esac
         return
         ;;
 esac;
@@ -12569,13 +14124,8 @@ case $PMTYPE in
         assure_exists yum-utils
         sudocmd yum-config-manager --disable "$@"
         ;;
-    dnf-rpm)
-        repo_file_name=$(env LC_ALL=C dnf repoinfo "$@" 2>/dev/null | sed -n 's/^Repo-filename\s*:\s*//p')
-        sudocmd rm "$repo_file_name"
-        ;;
-    dnf5-rpm)
-        repo_file_name=$(env LC_ALL=C dnf repoinfo "$@" 2>/dev/null | sed -n 's/^Config file\s*:\s*//p')
-        sudocmd rm "$repo_file_name"
+    dnf-rpm|dnf5-rpm)
+        __epm_removerepo_dnf "$@"
         ;;
     urpm-rpm)
         if [ "$1" = "all" ] ; then
@@ -12622,6 +14172,60 @@ esac
 
 
 [ -n "$EPM_REPACK_SCRIPTS_DIR" ] || EPM_REPACK_SCRIPTS_DIR="$CONFIGDIR/repack.d"
+
+__run_alien()
+{
+    # Note: install epm-repack for static (package based) dependencies
+    assure_exists cpio
+    assure_exists alien
+    assure_exists fakeroot
+    assure_exists rpm
+
+    local use_fakeroot=''
+    if [ "$1" = "--fakeroot" ] ; then
+        ! is_root && is_command fakeroot && use_fakeroot='fakeroot'
+        shift
+    fi
+
+    local alpkg="$1"
+    shift
+
+    # cpio < 2.15: --make-directories doesn't create parent dirs for symlinks
+    # workaround: inject a cpio wrapper that pre-creates dirs from RPM file list
+    local cpio_ver
+    cpio_ver="$(cpio --version 2>&1 | head -n1 | sed 's/.* //')"
+    if [ -n "$cpio_ver" ] && [ "$(epm print compare version "$cpio_ver" "2.15")" = "-1" ] ; then
+        local wrapdir
+        wrapdir="$(mktemp -d)"
+        remove_on_exit "$wrapdir"
+        local real_cpio
+        real_cpio="$(print_command_path cpio)"
+        local abs_alpkg
+        abs_alpkg="$(realpath "$alpkg")"
+        cat > "$wrapdir/cpio" <<CPIOWRAPPER
+case "\$*" in
+    *--extract*)
+        rpm -qpl "$abs_alpkg" 2>/dev/null | while IFS= read -r f; do
+            mkdir -p ".\$(dirname "\$f")" 2>/dev/null
+        done
+        ;;
+esac
+exec $real_cpio "\$@"
+CPIOWRAPPER
+        chmod +x "$wrapdir/cpio"
+        PATH="$wrapdir:$PATH"
+    fi
+
+    local alien_verbose="$verbose"
+    [ -n "$debug" ] && alien_verbose="--veryverbose"
+
+    if [ -n "$verbose" ] || [ -n "$debug" ] ; then
+        docmd $use_fakeroot alien $alien_verbose "$@" "$alpkg"
+    else
+        showcmd $use_fakeroot alien "$@" "$alpkg"
+        $use_fakeroot alien "$@" "$alpkg" >/dev/null
+    fi
+}
 
 __epm_have_repack_rule()
 {
@@ -12755,7 +14359,14 @@ __prepare_source_package()
         return
     fi
 
-    # convert tarballs to tar (for alien)
+    # skip packing if tar already prepared by pack.d (has yaml metadata)
+    if rhas "$alpkg" "\.(tar|tar\.gz|tar\.bz2|tar\.xz|tgz)$" && [ -r "$pkg.eepm.yaml" ] ; then
+        returntarname="$pkg"
+        SUBGENERIC='tar'
+        return
+    fi
+
+    # convert tarballs/AppImage/snap/flatpak to tar
 
     # they will fill $returntarname
 
@@ -12768,6 +14379,9 @@ __prepare_source_package()
     elif rhas "$alpkg" "\.snap$" ; then
         __epm_pack_run_handler generic-snap "$pkg" "$pkgversion"
         SUBGENERIC='snap'
+    elif rhas "$alpkg" "\.flatpak$" ; then
+        __epm_pack_run_handler generic-flatpak "$pkg" "$pkgversion" "$pkg_urls_downloaded"
+        SUBGENERIC='flatpak'
     else
         __epm_pack_run_handler generic-tar "$pkg" "$pkgversion"
         SUBGENERIC='tar'
@@ -12778,7 +14392,7 @@ __prepare_source_package()
 
     alpkg=$(basename $returntarname)
     # FIXME: looks like a hack with current dir
-    if [ "$(pwd)" != "$(dirname "$returntarname")" ] ; then
+    if ! [ "$returntarname" -ef "$alpkg" ] ; then
         cp $verbose $returntarname $alpkg
         [ -r "$returntarname.eepm.yaml" ] && cp $verbose $returntarname.eepm.yaml $alpkg.eepm.yaml
     fi
@@ -12807,9 +14421,18 @@ __epm_repack_single()
             # repack via rpm if source is not deb or we have rpm rule for the package
             if __epm_have_repack_rule "$pkg" || ! rhas "$pkg" "\.deb$" ; then
                 # we have repack rules only for rpm, so use rpm step in any case
+                # save original depends before deb→rpm conversion
+                local orig_deb_depends=""
+                local orig_pkg_type="$(get_package_type "$pkg")"
+                if [ "$orig_pkg_type" = "deb" ] ; then
+                    orig_deb_depends="$(epm requires "$pkg" 2>/dev/null)"
+                elif [ "$orig_pkg_type" = "rpm" ] ; then
+                    # extract non-library package-name Requires from RPM
+                    orig_deb_depends="$(epm requires --debian "$pkg" 2>/dev/null)"
+                fi
                 __epm_repack_to_rpm "$pkg" "$packversion" "$packrelease" || return
                 [ -n "$repacked_pkg" ] || return
-                __epm_repack_to_deb $repacked_pkg || return
+                __epm_repack_to_deb $repacked_pkg "$orig_deb_depends" "$orig_pkg_type"
             else
                 __epm_repack_to_deb "$pkg" || return
             fi
@@ -12831,6 +14454,7 @@ __epm_repack()
     repacked_pkgs=''
     local packversion="${EPM_REPACK_VERSION:-}"
     local packrelease="${EPM_REPACK_RELEASE:-}"
+    [ -n "$pkg_urls_downloaded" ] || pkg_urls_downloaded="${EPM_REPACK_URL:-}"
 
     print_sha256sum $pkg_files
 
@@ -12961,13 +14585,16 @@ __epm_repack_to_arch()
 # File bin/epm-repack-deb:
 
 
+__need_skip_dh_strip_nondeterminism()
+{
+    [ -f "$(dirname "$1")/.eepm_skip_deb_dh_strip_nondeterminism" ]
+}
+
 __epm_repack_to_deb()
 {
     local pkg="$1"
-
-    assure_exists alien
-    assure_exists fakeroot
-    assure_exists rpm
+    local orig_deb_depends="$2"
+    local orig_pkg_type="$3"
 
     repacked_pkg=''
 
@@ -12976,6 +14603,11 @@ __epm_repack_to_deb()
     remove_on_exit $TDIR
 
     umask 022
+
+    # alien uses $EMAIL for Maintainer email (not DEBEMAIL)
+    # and always takes the name from system GECOS (can't override without patching alien)
+    # TODO: fix Maintainer name in the generated deb (replace GECOS with "EPM")
+    export EMAIL="support@eepm.ru"
 
     if echo "$pkg" | grep -q "\.deb" ; then
         warning "Repack deb to deb is not supported yet."
@@ -12991,22 +14623,59 @@ __epm_repack_to_deb()
         cd $TDIR || fatal
         __prepare_source_package "$(pwd)/$alpkg"
 
-        showcmd_store_output fakeroot alien -d -k $verbose $scripts "$alpkg"
-        local DEBCONVERTED=$(grep "deb generated" $RC_STDOUT | sed -e "s| generated||g")
+        # generate debian/ dir without building
+        __run_alien "$alpkg" --single -k $scripts
+
+        # find the generated source directory (must contain debian/)
+        local debsrcdir
+        debsrcdir="$(ls -1d */debian 2>/dev/null | sed 's|/debian$||' | head -n1)"
+        [ -n "$debsrcdir" ] && debsrcdir="$debsrcdir/"
+        if [ -z "$debsrcdir" ] ; then
+            warning 'Can'\''t find alien generated directory for $pkg'
+            cd - >/dev/null
+            return 1
+        fi
+
+        # Some repack scripts need to keep bundled archives byte-identical.
+        # The opt-in marker is written by skip_deb_dh_strip_nondeterminism().
+        if __need_skip_dh_strip_nondeterminism "$abspkg" ; then
+            cat >>"$debsrcdir"debian/rules <<'EOF'
+
+override_dh_strip_nondeterminism:
+	@echo "Skipping dh_strip_nondeterminism for this repack"
+EOF
+        fi
+
+        # inject original depends into debian/control
+        if [ -n "$orig_deb_depends" ] ; then
+            info "Injecting Depends: $orig_deb_depends"
+            if [ "$orig_pkg_type" = "rpm" ] ; then
+                # RPM source: add non-lib requires alongside shlibs
+                sed -i -e "s|\${shlibs:Depends}|\${shlibs:Depends}, $orig_deb_depends|" "$debsrcdir"debian/control
+            else
+                # DEB source: replace shlibs placeholder with original depends
+                sed -i -e "s|\${shlibs:Depends}|$orig_deb_depends|" "$debsrcdir"debian/control
+            fi
+        fi
+
+        # build the deb
+        ( cd "$debsrcdir" && a= fakeroot debian/rules binary )
+
+        local DEBCONVERTED
+        DEBCONVERTED="$(ls -1 *.deb 2>/dev/null | head -n1)"
         if [ -n "$DEBCONVERTED" ] ; then
             repacked_pkg="$repacked_pkg $(realpath $DEBCONVERTED)"
             remove_on_exit "$(realpath $DEBCONVERTED)"
         else
             warning 'Can'\''t find converted deb for source binary package $pkg'
         fi
-        clean_store_output
         cd - >/dev/null
 
     return 0
 }
 
-
 # File bin/epm-repack-rpm:
+
 
 
 get_repack_script()
@@ -13099,7 +14768,9 @@ __epm_check_repacked_package_req()
     local tmpalf=$(__convert_pkgallowscripts_to_regexp "$alf")
     remove_on_exit $tmpalf
     [ -n "$verbose" ] && echo "reqstop rules: $(cat $tmpalf)"
-    ! echo "$name" | grep $grep_flag -f $tmpalf
+    # feed requires one per line: patterns are anchored (^...$), so a forbidden
+    # require must be matched as a whole token, not as part of a space-joined line
+    ! echo "$name" | tr ' ' '\n' | grep $grep_flag -f $tmpalf
     local res=$?
     rm $tmpalf
     return $res
@@ -13125,16 +14796,13 @@ epm_check_repacked_rpm()
 }
 
 
+
+
 __epm_repack_to_rpm()
 {
     local pkg="$1"
     local packversion="$2"
     local packrelease="$3"
-
-    # Note: install epm-repack for static (package based) dependencies
-    assure_exists cpio
-    assure_exists alien
-    assure_exists fakeroot
 
     # will set RPMBUILD
     __assure_exists_rpmbuild
@@ -13179,37 +14847,38 @@ __epm_repack_to_rpm()
         abspkg="$(realpath $alpkg)"
         cd $tmpbuilddir/ || fatal
 
-        local fakeroot
-        fakeroot=''
-        ! is_root && is_command fakeroot && fakeroot='fakeroot'
+        local buildroot spec pkgname
 
-        if [ -n "$verbose" ] || [ -n "$debug" ] ; then
-            verbose1="$verbose"
-            [ -n "$debug" ] && verbose1="--veryverbose"
-            docmd $fakeroot alien --generate --to-rpm --keep-version $verbose1 $scripts "../$alpkg" || fatal
+        if [ -n "$SUBGENERIC" ] && [ -z "$EPM_USE_ALIEN" ] ; then
+            # for tar/appimage/snap: generate spec directly without alien
+            __fill_yaml_from_tarball "../$alpkg.eepm.yaml" "../$alpkg"
+            __generate_spec_by_yaml "../$alpkg.eepm.yaml" "$tmpbuilddir"
+            __unpack_files_from_tarball "../$alpkg.eepm.yaml" "../$alpkg" "$tmpbuilddir"
+            local name version
+            __set_name_version_by_yaml "../$alpkg.eepm.yaml"
+            pkgname="$name"
+            spec="$tmpbuilddir/$name.spec"
+            buildroot="$tmpbuilddir/$name-$version"
         else
-            showcmd $fakeroot alien --generate --to-rpm --keep-version $scripts "../$alpkg"
-            a='' $fakeroot alien --generate --to-rpm --keep-version $scripts "../$alpkg" >/dev/null || fatal
+            # for deb/rpm: use alien
+            __run_alien --fakeroot "../$alpkg" --generate --to-rpm --keep-version $scripts || fatal
+
+            # remove all empty dirs (hack against broken dpkg with LF in the end of line) (hack for linux_pantum.deb)
+            rmdir * 2>/dev/null
+
+            local subdir="$(echo *)"
+            [ -d "$subdir" ] || fatal "can't find subdir in" $(pwd)
+
+            buildroot="$tmpbuilddir/$subdir"
+
+            # detect spec and move to tmpbuilddir
+            spec="$(echo $buildroot/*.spec)"
+            [ -s "$spec" ] || fatal "Can't find spec $spec"
+            mv $spec $tmpbuilddir || fatal
+            spec="$tmpbuilddir/$(basename "$spec")"
+
+            pkgname="$(grep "^Name: " $spec | sed -e "s|Name: ||g" | head -n1)"
         fi
-
-        # remove all empty dirs (hack against broken dpkg with LF in the end of line) (hack for linux_pantum.deb)
-        rmdir * 2>/dev/null
-
-        local subdir="$(echo *)"
-        [ -d "$subdir" ] || fatal "can't find subdir in" $(pwd)
-
-        local buildroot="$tmpbuilddir/$subdir"
-
-        # for tarballs fix permissions (ideally fix in pack.d/generic-tar.sh, but there is tar repacking only)
-        [ "$SUBGENERIC" = "tar" ] && chmod $verbose -R a+rX $buildroot/*
-
-        # detect spec and move to prev dir
-        local spec="$(echo $buildroot/*.spec)"
-        [ -s "$spec" ] || fatal "Can't find spec $spec"
-        mv $spec $tmpbuilddir || fatal
-        spec="$tmpbuilddir/$(basename "$spec")"
-
-        local pkgname="$(grep "^Name: " $spec | sed -e "s|Name: ||g" | head -n1)"
 
         # run generic scripts and repack script for the pkg
         cd $buildroot || fatal
@@ -13243,6 +14912,16 @@ __epm_repack_to_rpm()
         fi
 
         TARGETARCH=$(epm print info -a | sed -e 's|^x86$|i586|')
+        # alien does not preserve BuildArch: noarch in generated spec,
+        # so check the original package and restore it
+        if rhas "$alpkg" "\.noarch\." && ! grep -q "^BuildArch:.*noarch" "$spec" ; then
+            sed -i "s|^Group:.*|&\nBuildArch: noarch|" "$spec"
+        fi
+
+        # check that buildroot has actual files (not just empty directories)
+        if [ -z "$(find $buildroot -not -type d -print -quit 2>/dev/null)" ] ; then
+            fatal 'Buildroot $buildroot contains only empty directories. Package content was lost during repack.'
+        fi
 
         showcmd $RPMBUILD --buildroot $buildroot --target $TARGETARCH -bb $spec
         if [ -n "$verbose" ] ; then
@@ -13264,7 +14943,7 @@ __epm_repack_to_rpm()
         # check forbidden requires only if specific repack script exists
         has_repack_script $repackscript && epm_check_repacked_rpm "$repacked_pkg"
 
-        cd "$EPMCURDIR" >/dev/null
+        cd "$EPMCURDIR" || fatal "Can't return to the working directory '$EPMCURDIR'"
 
     true
 }
@@ -13288,6 +14967,10 @@ Examples:
   epm repo add autoimports - add autoimports (from Fedora) repo
   epm repo change yandex   - change only base url part to mirror.yandex.ru server (use epm repo change --list to get possible targets)
   epm repo list            - list current repos
+
+Environment:
+  EPM_APT_SOURCES_LIST     - use specified file instead of /etc/apt/sources.list (skip sources.list.d)
+  EPM_APT_SOURCES_ROOT     - use specified root directory for /etc/apt/sources.list and sources.list.d
 '
 }
 
@@ -13323,7 +15006,10 @@ epm_repo()
         confirm_info 'You are about to set repo $repo (all repos will be removed).'
         # Remember current mirror before removing repos
         local current_mirror
-        current_mirror=$(__get_current_mirror)
+        # dnf repos are available only on one mirror
+        { [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_supports_aptrpm ; } && current_mirror=$(__get_current_mirror)
+        # keep the type of dnf repos (apt-rpm or rpm-md) for the recreated repos
+        __alt_dnf_uses_aptrpm_repos && export EPM_DNF_REPO_TYPE="apt-rpm"
         try_change_alt_repo
         epm repo rm all
         epm addrepo "$@" || fatal 'Cannot add repo "'$@'", restoring...'
@@ -13363,7 +15049,7 @@ epm_repo()
     status)                           # HELPCMD: print repo status
         epm_repostatus "$@"
         ;;
-    add)                              # HELPCMD: add package repo (etersoft, autoimports, archive 2017/01/31); run with param to get list
+    add)                              # HELPCMD: add package repo (etersoft, autoimports, --disabled); run with param to get list
         epm_addrepo "$@"
         ;;
     Add)                              # HELPCMD: like add, but do update after add
@@ -13376,7 +15062,7 @@ epm_repo()
     fix)                              # HELPCMD: fix paths in sources lists (ALT Linux only)
         epm_repofix "$@"
         ;;
-    mirrors)                          # HELPCMD: list and test ALT Linux mirrors (--speedtest to test speed)
+    mirrors)                          # HELPCMD: list and test ALT Linux mirrors (run with --help for subcommands)
         epm_repomirrors "$@"
         ;;
 
@@ -13386,10 +15072,10 @@ epm_repo()
     index)                            # HELPCMD: index repo (update indexes): [--init] [path] [name]
         epm_repoindex "$@"
         ;;
-    pkgadd)                           # HELPCMD: add to <dir> applied <package-filename1> [<package-filename2>...]
+    pkgadd)                           # HELPCMD: add to <dir> applied <package-filename|task> [...]
         epm_repo_pkgadd "$@"
         ;;
-    pkgupdate)                        # HELPCMD: replace in <dir> with new <package-filename1> [<package-filename2>...]
+    pkgupdate)                        # HELPCMD: replace in <dir> with new <package-filename|task> [...]
         epm_repo_pkgupdate "$@"
         ;;
     pkgdel)                           # HELPCMD: del from <dir> <package1> [<package2>...]
@@ -13474,8 +15160,19 @@ __epm_addkey_altlinux()
 
     if [ -n "$url" ] ; then
         tmpfile=$(__epm_get_file_from_url "$url") || fatal
-        # __epm_importgpg_altlinux "$url"
-        __epm_altgpg --import $tmpfile
+        [ -s "$tmpfile" ] || fatal 'Can'\''t download $url'
+        # /usr/lib/alt-gpgkeys belongs to alt-gpgkeys package and is replaced on its update,
+        # apt-gpgkeys-pki merges it with the keys from /etc/pki/apt-gpg/sources (APT::GPG::Homedir)
+        epm install --skip-installed apt-gpgkeys-pki
+        if [ -x /usr/bin/apt-gpgkeys ] ; then
+            sudocmd mkdir -p /etc/pki/apt-gpg/sources
+            sudocmd cp $tmpfile /etc/pki/apt-gpg/sources/$name.gpg || fatal
+            sudocmd chmod 644 /etc/pki/apt-gpg/sources/$name.gpg
+            sudocmd /usr/bin/apt-gpgkeys update || fatal
+        else
+            warning 'apt-gpgkeys-pki is not installed, the key is imported to /usr/lib/alt-gpgkeys and will be lost on alt-gpgkeys update'
+            __epm_altgpg --import $tmpfile
+        fi
     fi
 
     if [ ! -s /etc/apt/vendors.list.d/$name.list ] ; then
@@ -13500,6 +15197,46 @@ EOF
 
 }
 
+
+__epm_dearmor_to_armor()
+{
+    local file="$1"
+    grep -q -- "-----BEGIN PGP PUBLIC KEY BLOCK-----" "$file" && return
+    assure_exists gpg gnupg2
+    local tmpdir
+    tmpdir=$(mktemp -d) || fatal
+    remove_on_exit $tmpdir
+    a='' gpg --homedir $tmpdir --quiet --import "$file" 2>/dev/null || fatal 'Can'\''t import key from $file'
+    a='' gpg --homedir $tmpdir --export --armor >"$file" 2>/dev/null || fatal
+}
+
+__epm_addkey_alt_dnf()
+{
+    local name
+    local url="$1"
+    shift
+    if is_url "$url" ; then
+        name="$(basename "$url" | sed -e 's/\.\(gpg\|asc\|key\)$//')"
+    else
+        name="$url"
+        url="$1"
+        shift
+    fi
+    # compat
+    [ -n "$3" ] && name="$3"
+
+    is_url "$url" || { warning 'Skipping key $name: there is no key URL' ; return 0 ; }
+
+    local target="/etc/pki/rpm-gpg/RPM-GPG-KEY-$name"
+    local tmpfile
+    tmpfile=$(__epm_get_file_from_url "$url") || fatal
+    [ -s "$tmpfile" ] || fatal 'Can'\''t download $url'
+    __epm_dearmor_to_armor $tmpfile
+    chmod 644 $tmpfile
+    sudocmd mkdir -p /etc/pki/rpm-gpg
+    sudocmd cp $tmpfile "$target"
+    sudocmd rpm --import "$target"
+}
 
 __epm_addkey_alpine()
 {
@@ -13607,6 +15344,13 @@ remove_on_exit
 
 case $BASEDISTRNAME in
     "alt")
+        if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] ; then
+            local tmpfile
+            tmpfile=$(__epm_get_file_from_url "$1") || fatal
+            __epm_dearmor_to_armor $tmpfile
+            sudocmd rpm --import $tmpfile
+            return
+        fi
         __epm_importgpg_altlinux "$@"
         return
         ;;
@@ -13629,6 +15373,11 @@ remove_on_exit
 
 case $BASEDISTRNAME in
     "alt")
+        # APT-RPM repos of dnf check signatures by the vendor keys from vendors.list (as apt does)
+        if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] && ! __alt_dnf_supports_aptrpm ; then
+            __epm_addkey_alt_dnf "$@"
+            return
+        fi
         __epm_addkey_altlinux "$@"
         return
         ;;
@@ -13642,7 +15391,7 @@ case $PMTYPE in
     apt-dpkg)
         __epm_addkey_deb "$@"
         ;;
-    dnf-*|yum-*)
+    dnf-*|dnf5-*|yum-*)
         __epm_addkey_dnf "$@"
         ;;
 esac
@@ -13651,6 +15400,137 @@ esac
 
 
 
+# File bin/epm-repochange:
+
+
+__url_to_sed_pattern()
+{
+    echo "$1" | sed -e 's|^https:||' -e 's|/\([^/]*\)$|\\([/ ]\\)\1|'
+}
+
+__subst_with_repo_url()
+{
+    __load_alt_mirror_db
+    local input="$1"
+    local new_pattern="$2"
+
+    local name url pattern
+    while read -r name url ; do
+        [ -z "$name" ] && continue
+        pattern=$(__url_to_sed_pattern "$url")
+        input=$(echo "$input" | sed -e "s|$pattern|$new_pattern|")
+    done <<EOF
+$__ALT_MIRROR_DB
+EOF
+    echo "$input"
+}
+
+
+__change_repo_lines()
+{
+    local REPLTO="$1"
+    local NN
+    grep -v "file:/" | while read nn ; do
+        NN="$(__subst_with_repo_url "$nn" "$REPLTO")"
+        [ "$NN" = "$nn" ] && continue
+        epm addrepo "$NN" && epm removerepo "$nn" || return 1
+    done
+}
+
+__change_repo_dnf()
+{
+    local REPLTO="$1"
+    local type url newurl
+
+    # rpm-md metadata is not available on all mirrors: check before changing anything
+    __get_alt_dnf_repos | while read -r type url ; do
+        [ "$type" = "rpm-md" ] || continue
+        newurl="$(__subst_with_repo_url "$url" "$REPLTO")"
+        [ "$newurl" = "$url" ] && continue
+        eget --check-url "$newurl/repodata/repomd.xml" && continue
+        warning 'There is no rpm-md metadata at $newurl'
+        return 1
+    done || return
+
+    local f line newline tmpfile
+    for f in "$(__get_yum_repos_dir)"/*.repo ; do
+        [ -r "$f" ] || continue
+        grep -q "^[[:space:]]*baseurl[[:space:]]*=" "$f" || continue
+        tmpfile=$(mktemp) || fatal
+        remove_on_exit $tmpfile
+        while IFS= read -r line ; do
+            case "$line" in
+                baseurl*|[[:space:]]*baseurl*)
+                    newline="$(__subst_with_repo_url "$line" "$REPLTO")"
+                    ;;
+                *)
+                    newline="$line"
+                    ;;
+            esac
+            printf "%s\n" "$newline"
+        done < "$f" > $tmpfile
+        cmp -s "$f" $tmpfile && continue
+        chmod 644 $tmpfile
+        sudocmd cp $tmpfile "$f" || return
+    done
+}
+
+__change_repo()
+{
+    local REPLTO="$1"
+    case $PMTYPE in
+        dnf-rpm|dnf5-rpm)
+            __change_repo_dnf "$REPLTO" || return
+            # dnf5 takes repos from sources.list (libdnf5-plugin-apt)
+            __alt_dnf_uses_apt_sources || return 0
+            ( quiet=1 ; print_apt_sources_list ) | __change_repo_lines "$REPLTO"
+            ;;
+        *)
+            epm --quiet repo list | __change_repo_lines "$REPLTO"
+            ;;
+    esac
+}
+
+
+__epm_repochange_alt()
+{
+    local current_mirror mirror
+    current_mirror=$(__get_current_mirror)
+    mirror="$1"
+
+    case "$mirror" in
+        "--list")
+            __list_mirrors "$current_mirror" "$short"
+            ;;
+        *)
+            local pattern
+            pattern="$(__alt_mirror_change_pattern "$mirror")"
+            if [ -n "$pattern" ] ; then
+                __change_repo "$pattern"
+            else
+                fatal 'Unsupported mirror: $mirror. Use --list to see available mirrors.'
+            fi
+            ;;
+    esac
+}
+
+
+epm_repochange()
+{
+    [ "$1" = "--help" ] && message "Use --list to get all possible targets" && return
+    if [ "$1" != "--list" ] ; then
+        epm_repofix
+    fi
+    case $BASEDISTRNAME in
+        "alt")
+            __epm_repochange_alt "$@"
+            ;;
+         *)
+            fatal 'Repo change Unsupported for $BASEDISTRNAME'
+            ;;
+    esac
+}
+
 # File bin/epm-repodisable:
 
 
@@ -13658,12 +15538,18 @@ esac
 __epm_repodisable_alt()
 {
     assure_root
+    case "$1" in
+        --regex|--regexp)
+            regexp="--regexp"
+            shift
+            ;;
+    esac
     local rl
     # ^rpm means full string
     if rhas "$1" "\^rpm" ; then
         rl="$(echo "$1" | sed -e 's|\^||')"
     else
-        rl="$(epm --quiet repo list "$@")"
+        rl="$(epm --quiet $regexp repo list "$@")"
         [ -z "$rl" ] && warning 'Can'\''t find $* entries in the repos (see epm repolist output)' && return 1
     fi
     local apt_lists
@@ -13700,11 +15586,12 @@ case $PMTYPE in
         docmd yum repolist $verbose
         [ -n "$verbose" ] || info "Use --verbose if you need detail information."
         ;;
-    dnf-rpm)
-        sudocmd dnf config-manager --enable $verbose "$@"
-        ;;
-    dnf5-rpm)
-        sudocmd dnf config-manager setopt "$@.enabled=0"
+    dnf-rpm|dnf5-rpm)
+        if __alt_dnf_uses_apt_sources ; then
+            __epm_repodisable_alt "$@"
+            return
+        fi
+        __epm_dnf_set_repo_enabled 0 "$@"
         ;;
     pisi)
         docmd pisi disable-repo "$@"
@@ -13730,8 +15617,8 @@ __epm_repoenable_alt()
     # ^rpm means full string
     if rhas "$1" "\^rpm" ; then
         rl="$(echo "$1" | sed -e 's|\^||')"
-        # check if this exact line exists as a comment
-        if ! grep -q -E "^[[:space:]]*#[[:space:]]*$(sed_escape "$rl")" $APT_ALL_SOURCES_LIST 2>/dev/null ; then
+        # check if this line exists as a comment (tolerant to / vs space in paths)
+        if ! grep -q -E "^[[:space:]]*#[[:space:]]*$(sed_escape_relaxed "$rl")" $APT_ALL_SOURCES_LIST 2>/dev/null ; then
             return 1
         fi
     else
@@ -13743,7 +15630,7 @@ __epm_repoenable_alt()
     [ -z "$apt_lists" ] && return 0
     echo "$rl" | while read rp ; do
         [ -n "$dryrun" ] && message 'will uncomment $rp' && continue
-        sed -i -e "s|^[[:space:]]*#[[:space:]]*\($(sed_escape "$rp")\)|\1|" $apt_lists
+        sed -i -e "s|^[[:space:]]*#[[:space:]]*\($(sed_escape_relaxed "$rp")\)|\1|" $apt_lists
     done
 }
 
@@ -13772,11 +15659,12 @@ case $PMTYPE in
         docmd yum repolist $verbose
         [ -n "$verbose" ] || info "Use --verbose if you need detail information."
         ;;
-    dnf-rpm)
-        sudocmd dnf config-manager --disable $verbose "$@"
-        ;;
-    dnf5-rpm)
-        sudocmd dnf config-manager setopt "$@.enabled=1"
+    dnf-rpm|dnf5-rpm)
+        if __alt_dnf_uses_apt_sources ; then
+            __epm_repoenable_alt "$@"
+            return
+        fi
+        __epm_dnf_set_repo_enabled 1 "$@"
         ;;
     eoget)
         docmd eoget enable-repo "$@"
@@ -13875,8 +15763,9 @@ __alt_branch_reg='[tcp][1-3]?[0-9][.f]?[0-9]?'
 epm_reposwitch()
 {
     local TO="$1"
-    [ -n "$TO" ] || fatal "run repo switch with arg (p9, p10, Sisyphus)"
+    [ -n "$TO" ] || fatal "run repo switch with arg (p9, p10, Sisyphus, Deferred)"
     [ "$TO" = "sisyphus" ] && TO="Sisyphus"
+    [ "$TO" = "deferred" ] && TO="Deferred"
 
     case "$TO" in
         --help)
@@ -13885,13 +15774,40 @@ epm_reposwitch()
             ;;
         --list)
             [ -z "$quiet" ] && message "Possible repo switch targets:"
-            echo "p8 p9 p10 p11 c8 c9 c10f1 c10f2 Sisyphus"
+            echo "p8 p9 p10 p11 c8 c9 c10f1 c10f2 Deferred Sisyphus"
             return
             ;;
         -*)
             fatal 'Unknown option $TO'
             ;;
     esac
+
+    assure_root
+
+    __alt_dnf_uses_apt_sources || case $PMTYPE in
+        dnf-rpm|dnf5-rpm)
+            echo "$TO" | grep -q -E "^(${__alt_branch_reg}|Sisyphus|Deferred)$" || fatal 'Unsupported target form $TO. Use --list to get all targets.'
+            __epm_reposwitch_alt_dnf "$TO"
+            return
+            ;;
+    esac
+
+    # Deferred is based on Sisyphus, replaces Sisyphus URLs with Deferred
+    if [ "$TO" = "Deferred" ] ; then
+        # Deferred is available on Etersoft mirrors, not on arbitrary ALT mirrors.
+        epm --quiet repo change etersoft || fatal "Can't switch to the Etersoft mirror"
+        # first normalize branch repos to Sisyphus
+        __replace_alt_version_in_repo "$__alt_branch_reg/branch/" "Sisyphus/"
+        # replace Sisyphus with Deferred path
+        __replace_text_in_alt_repo "/^ *#/! s![/ ]ALTLinux[/ ]Sisyphus/! Etersoft/Sisyphus/Deferred/!g"
+        __alt_repofix "Sisyphus"
+        rm -fv /etc/rpm/macros.d/{p10,p11}
+        echo "%_priority_distbranch sisyphus" >/etc/rpm/macros.d/priority_distbranch
+        return
+    fi
+
+    # restore Deferred URLs back to Sisyphus before switching
+    __replace_text_in_alt_repo "/^ *#/! s!Etersoft/Sisyphus/Deferred/!ALTLinux/Sisyphus/!g"
 
     if [ "$TO" = "Sisyphus" ] ; then
         __replace_alt_version_in_repo "$__alt_branch_reg/branch/" "$TO/"
@@ -13903,20 +15819,46 @@ epm_reposwitch()
 
     __alt_repofix "$TO"
 
-    # TODO: improve for c10f1?
-    case $TO in
-        "p10"|"p11"|"Sisyphus")
-            rm -fv /etc/rpm/macros.d/{p10,p11} 
+    __alt_set_priority_distbranch "$TO"
+    #epm repo list
+}
 
-            [ "$TO" = "Sisyphus" ] && TO="sisyphus"
-            
+__alt_set_priority_distbranch()
+{
+    local TO="$1"
+    case $TO in
+        "p10"|"p11"|"Sisyphus"|"Deferred")
+            rm -fv /etc/rpm/macros.d/{p10,p11}
+
+            [ "$TO" = "Sisyphus" ] || [ "$TO" = "Deferred" ] && TO="sisyphus"
+
             echo "%_priority_distbranch $TO" >/etc/rpm/macros.d/priority_distbranch
             ;;
         *)
             rm -fv /etc/rpm/macros.d/{p10,p11,priority_distbranch}
             ;;
     esac
-    #epm repo list
+}
+
+__epm_reposwitch_alt_dnf()
+{
+    local TO="$1"
+    # keep the type of repos (apt-rpm or rpm-md) for the recreated repos
+    export EPM_DNF_REPO_TYPE="$(__alt_dnf_repo_type)"
+    # keep the mirror of APT-RPM repos
+    [ "$EPM_DNF_REPO_TYPE" = "apt-rpm" ] && export EPM_DNF_APTRPM_MIRROR="$(__alt_dnf_aptrpm_mirror)"
+    try_change_alt_repo
+    local f
+    for f in /etc/yum.repos.d/alt-*.repo ; do
+        case "$(basename "$f" .repo)" in
+            alt-sisyphus|alt-p[0-9]*|alt-c[0-9]*|alt-deferred)
+                rm -f $verbose "$f"
+                ;;
+        esac
+    done
+    epm repo add "$(echo "$TO" | tr "[:upper:]" "[:lower:]")" || fatal 'Can'\''t switch repo to $TO'
+    end_change_alt_repo
+    __alt_set_priority_distbranch "$TO"
 }
 
 
@@ -13969,86 +15911,15 @@ __fix_alt_sources_list()
     done
 }
 
-
-__url_to_sed_pattern()
-{
-    echo "$1" | sed -e 's|^https:||' -e 's|/\([^/]*\)$|/* \1|'
-}
-
-__subst_with_repo_url()
-{
-    __load_alt_mirror_db
-    local input="$1"
-    local new_pattern="$2"
-
-    local name url pattern
-    while read -r name url ; do
-        [ -z "$name" ] && continue
-        pattern=$(__url_to_sed_pattern "$url")
-        input=$(echo "$input" | sed -e "s|$pattern|$new_pattern|")
-    done <<EOF
-$__ALT_MIRROR_DB
-EOF
-    echo "$input"
-}
-
-
-__change_repo()
-{
-    local REPLTO="$1"
-    local NN
-    epm --quiet repo list | grep -v "file:/" | while read nn ; do
-        NN="$(__subst_with_repo_url "$nn" "$REPLTO")"
-        [ "$NN" = "$nn" ] && continue
-        epm addrepo "$NN" && epm removerepo "$nn" || return 1
-    done
-}
-
-
-__epm_repochange_alt()
-{
-
-    local current_mirror mirror
-    current_mirror=$(__get_current_mirror)
-    mirror="$1"
-
-    case "$mirror" in
-        "--list")
-            __list_mirrors "$current_mirror" "$short"
-            ;;
-        *)
-            local pattern
-            pattern="$(__alt_mirror_change_pattern "$mirror")"
-            if [ -n "$pattern" ] ; then
-                __change_repo "$pattern"
-            else
-                fatal 'Unsupported mirror: $mirror. Use --list to see available mirrors.'
-            fi
-            ;;
-    esac
-}
-
-
-epm_repochange()
-{
-    [ "$1" = "--help" ] && message "Use --list to get all possible targets" && return
-    [ "$1" = "--list" ] || epm_repofix
-    case $BASEDISTRNAME in
-        "alt")
-            __epm_repochange_alt "$@"
-            ;;
-         *)
-            fatal 'Repo change Unsupported for $BASEDISTRNAME'
-            ;;
-    esac
-}
-
-
 epm_repofix()
 {
 
 case $BASEDISTRNAME in
     "alt")
+        if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] && ! __alt_dnf_uses_apt_sources ; then
+            info 'Nothing to fix for $PMTYPE'
+            return
+        fi
         [ -n "$quiet" ] || docmd epm repo list
         assure_root
 
@@ -14070,6 +15941,10 @@ esac
 
 epm_repoclean()
 {
+    if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] && ! __alt_dnf_uses_apt_sources ; then
+        info 'Nothing to clean for $PMTYPE'
+        return
+    fi
     epm repo remove tasks
     epm repo remove cdroms
 }
@@ -14187,6 +16062,34 @@ __epm_repoindex_deb()
 }
 
 
+__epm_repoindex_rpmmd()
+{
+    local dir=''
+    local opt
+    while [ -n "$1" ] ; do
+        opt="$1"
+        case "$opt" in
+            --init)
+                ;;
+            --sign|--default-key=*)
+                warning '$opt is not supported for $PMTYPE'
+                ;;
+            -*)
+                fatal 'Unknown option $opt'
+                ;;
+            *)
+                [ -n "$dir" ] || dir="$opt"
+                ;;
+        esac
+        shift
+    done
+    [ -n "$dir" ] || dir="$(pwd)"
+
+    assure_exists createrepo_c
+    docmd mkdir -pv "$dir" || fatal
+    docmd createrepo_c -v --update "$dir"
+}
+
 epm_repoindex()
 {
 
@@ -14224,15 +16127,8 @@ case $PMTYPE in
         docmd createrepo -v -s md5 "$@"
         docmd verifytree
         ;;
-    dnf-rpm)
-        epm install --skip-installed createrepo || fatal
-        docmd mkdir -pv "$@"
-        docmd createrepo -v --update "$@"
-        ;;
-    dnf5-rpm)
-        epm install --skip-installed createrepo_c || fatal
-        docmd mkdir -pv "$@"
-        docmd createrepo_c -v --update "$@"
+    dnf-rpm|dnf5-rpm)
+        __epm_repoindex_rpmmd "$@"
         ;;
     eoget)
         docmd eoget index "$@"
@@ -14278,7 +16174,7 @@ __print_apt_sources_list()
 {
     local i
     for i in "$@" ; do
-        __cat_apt_sources_list "^[^#]*rpm" "$i"
+        __cat_apt_sources_list "^[^#]*$PKGFORMAT" "$i"
     done
 }
 
@@ -14286,7 +16182,7 @@ __print_apt_sources_list_full()
 {
     local i
     for i in "$@" ; do
-        __cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*rpm" "$i"
+        __cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*$PKGFORMAT" "$i"
     done
 }
 
@@ -14294,7 +16190,7 @@ __print_apt_sources_list_disabled()
 {
     local i
     for i in "$@" ; do
-        __cat_apt_sources_list "^[[:space:]]*#[[:space:]]*rpm" "$i"
+        __cat_apt_sources_list "^[[:space:]]*#[[:space:]]*$PKGFORMAT" "$i"
     done
 }
 
@@ -14307,36 +16203,42 @@ __print_file_header()
 
 __print_apt_sources_list_verbose()
 {
-    local i content
+    local i content found=''
     for i in "$@" ; do
-        content="$(__cat_apt_sources_list "^[^#]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        content="$(__cat_apt_sources_list "^[^#]*$PKGFORMAT" "$i" | __filter_repos_list $repo_filter_patterns)"
         [ -n "$content" ] || continue
+        found=1
         __print_file_header "$i"
         echo "$content" | sed -e 's|^|    |'
     done
+    [ -n "$found" ]
 }
 
 __print_apt_sources_list_verbose_full()
 {
-    local i content
+    local i content found=''
     for i in "$@" ; do
-        content="$(__cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        content="$(__cat_apt_sources_list "^[[:space:]]*#*[[:space:]]*$PKGFORMAT" "$i" | __filter_repos_list $repo_filter_patterns)"
         [ -n "$content" ] || continue
+        found=1
         __print_file_header "$i"
         # highlight commented lines
         echo "$content" | sed -e 's|^|    |' -e "s|^\(    #.*\)|$(set_color $WHITE)\1$(restore_color)|"
     done
+    [ -n "$found" ]
 }
 
 __print_apt_sources_list_verbose_disabled()
 {
-    local i content
+    local i content found=''
     for i in "$@" ; do
-        content="$(__cat_apt_sources_list "^[[:space:]]*#[[:space:]]*rpm" "$i" | __filter_repos_list $repo_filter_patterns)"
+        content="$(__cat_apt_sources_list "^[[:space:]]*#[[:space:]]*$PKGFORMAT" "$i" | __filter_repos_list $repo_filter_patterns)"
         [ -n "$content" ] || continue
+        found=1
         __print_file_header "$i"
         echo "$content" | sed -e 's|^|    |'
     done
+    [ -n "$found" ]
 }
 
 print_apt_sources_list()
@@ -14393,9 +16295,17 @@ while [ -n "$1" ] ; do
     shift
 done
 
-[ -z "$*" ] || [ "$PMTYPE" = "apt-rpm" ] || [ "$PMTYPE" = "apm-rpm" ] || [ "$PMTYPE" = "apt-dpkg" ] || fatal "No arguments are allowed here"
+if __has_backend_syntax "$@" ; then
+    __process_backend_arguments epm_repolist "$@"
+    return
+fi
+
+[ -z "$*" ] || [ "$PMTYPE" = "apt-rpm" ] || [ "$PMTYPE" = "apm-rpm" ] || [ "$PMTYPE" = "apt-dpkg" ] || [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] || fatal "No arguments are allowed here"
 
 case $PMTYPE in
+    stplr)
+        docmd stplr repo list "$@"
+        ;;
     apt-rpm|apm-rpm)
         print_apt_sources_list "$@"
         ;;
@@ -14410,8 +16320,20 @@ case $PMTYPE in
         [ -n "$verbose" ] || info "Use --verbose if you need detail information."
         ;;
     dnf-rpm|dnf5-rpm)
-        docmd dnf repolist $verbose
-        [ -n "$verbose" ] || info "Use --verbose if you need detail information."
+        # dnf5 takes repos from sources.list (libdnf5-plugin-apt): look for a source line there
+        if [ -n "$*" ] && __alt_dnf_uses_apt_sources ; then
+            print_apt_sources_list "$@"
+            return
+        fi
+        local DNFLISTOPTIONS=''
+        [ -n "$flagall" ] && DNFLISTOPTIONS="--all"
+        [ -n "$flagdisabled" ] && DNFLISTOPTIONS="--disabled"
+        if [ -n "$verbose" ] ; then
+            docmd $DNFCMD repoinfo $DNFLISTOPTIONS "$@"
+        else
+            docmd $DNFCMD repolist $DNFLISTOPTIONS "$@"
+            info "Use --verbose if you need detail information."
+        fi
         ;;
     urpm-rpm)
         docmd urpmq --list-media active --list-url
@@ -14451,6 +16373,9 @@ case $PMTYPE in
     slackpkg)
         docmd grep -v -- "^#\|^$" /etc/slackpkg/mirrors
         ;;
+    opkg)
+        docmd grep -h -v -- "^#\|^$" /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf 2>/dev/null
+        ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repolist()'
         ;;
@@ -14460,10 +16385,49 @@ esac
 
 # File bin/epm-repomirrors:
 
+
+__alt_dnf_has_rpmmd_repos()
+{
+    case $PMTYPE in
+        dnf-rpm|dnf5-rpm)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    __get_alt_dnf_repos | grep -q "^rpm-md https\?://"
+}
+
+__get_alt_repo_urls()
+{
+    case $PMTYPE in
+        dnf-rpm|dnf5-rpm)
+            # dnf5 takes repos from sources.list (libdnf5-plugin-apt)
+            if __alt_dnf_uses_apt_sources ; then
+                ( quiet=1 ; print_apt_sources_list )
+            fi
+            # repos from /etc/yum.repos.d (type apt-rpm or rpm-md)
+            __get_alt_dnf_repos | cut -d" " -f2
+            ;;
+        *)
+            epm --quiet repo list 2>/dev/null
+            ;;
+    esac
+}
+
+__is_deferred_repo()
+{
+    __get_alt_repo_urls | grep -q "Etersoft/Sisyphus/Deferred/"
+}
+
 __load_alt_mirror_db()
 {
     [ -n "$__ALT_MIRROR_DB" ] && return
     local mirror_file="$CONFIGDIR/mirrors-alt.list"
+    if __is_deferred_repo ; then
+        mirror_file="$CONFIGDIR/mirrors-deferred.list"
+        __MIRROR_TEST_PATH="Etersoft/Sisyphus/Deferred/x86_64/base/pkglist.classic.xz"
+    fi
     if [ -f "$mirror_file" ] ; then
         __ALT_MIRROR_DB="$(grep -v '^#' "$mirror_file" | grep -v '^$')"
         # visible mirrors: everything before "# Legacy" line
@@ -14475,7 +16439,7 @@ __load_alt_mirror_db()
 
 __url_to_change_pattern()
 {
-    echo "$1" | sed -e 's|^https:||' -e 's|/\([^/]*\)$| \1|'
+    echo "$1" | sed -e 's|^https:||' -e 's|/\([^/]*\)$|\\1\1|'
 }
 
 __MIRROR_TEST_PATH="Sisyphus/x86_64/base/pkglist.classic.xz"
@@ -14507,7 +16471,7 @@ __get_current_mirror()
 {
     __load_alt_mirror_db
     local repo_url
-    repo_url="$(epm --quiet repo list 2>/dev/null | head -1)"
+    repo_url="$(__get_alt_repo_urls | grep -v "file:/" | head -1)"
     [ -z "$repo_url" ] && return
 
     local name url domain
@@ -14549,13 +16513,16 @@ __list_mirrors()
         elif [ -n "$tsv" ] ; then
             printf "%s\t%s\t%s\n" "$name" "$url" "$is_current"
         else
-            # full mode: name, marker, url
+            # full mode: name, marker, url, ip
+            local domain ip
+            domain=$(__url_to_domain "$url")
+            ip=$(a= host "$domain" 2>/dev/null | sed -n 's/.* has address //p' | head -1)
             if [ "$is_current" = 1 ] ; then
                 set_boldcolor $GREEN
-                printf "%-15s *  %s\n" "$name" "$url"
+                printf "%-15s *  %-65s %s\n" "$name" "$url" "$ip"
                 restore_color
             else
-                printf "%-15s    %s\n" "$name" "$url"
+                printf "%-15s    %-65s %s\n" "$name" "$url" "$ip"
             fi
         fi
     done <<EOF
@@ -14569,15 +16536,26 @@ __measure_speed()
 {
     local url="$1"
     local speed
-    # eget does 3 measurements with 5 sec timeout, filters outliers, outputs MB/s
+    # eget does 3 measurements with 5 sec timeout, outputs MB/s
     speed=$(eget --timeout 5 --speedtest --tsv "$url" 2>/dev/null | cut -f2)
     [ -n "$speed" ] && echo "$speed" || echo "0"
+}
+
+__get_mirror_date()
+{
+    local url="$1"
+    local modified
+    modified=$(eget --timeout 5 --get-response "$url" 2>/dev/null | grep -i "^Last-Modified:" | tail -n1 | sed -e 's|^[^:]*: *||' -e 's|\r$||')
+    [ -n "$modified" ] || return
+    date -d "$modified" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "$modified"
 }
 
 __format_speed()
 {
     local speed="$1"
-    if [ "$speed" = "0" ] || [ -z "$speed" ] ; then
+    if [ -n "$2" ] ; then
+        echo "$2"
+    elif [ "$speed" = "0" ] || [ -z "$speed" ] ; then
         echo "error"
     else
         echo "${speed} MB/s"
@@ -14598,8 +16576,10 @@ __test_single_mirror()
 __test_all_mirrors()
 {
     __load_alt_mirror_db
-    local current_mirror="$1"
     local results=""
+    # dnf with rpm-md repos can use only mirrors with rpm-md metadata
+    local rpmmd_path=""
+    __alt_dnf_has_rpmmd_repos && rpmmd_path="${__MIRROR_TEST_PATH%base/*}repodata/repomd.xml"
 
     # Test each mirror sequentially with live output
     local name url
@@ -14610,31 +16590,43 @@ __test_all_mirrors()
         # Show testing status (skip in tsv mode)
         [ -z "$tsv" ] && printf "%-15s testing...  %s" "$name" "$url" >&2
 
-        local speed
-        speed=$(__measure_speed "$test_url")
+        local speed note="" mdate=""
+        if [ -n "$rpmmd_path" ] && ! eget --check-url "${url}/${rpmmd_path}" ; then
+            speed=0
+            note="no rpm-md"
+        else
+            speed=$(__measure_speed "$test_url")
+            [ "$speed" = "0" ] || mdate=$(__get_mirror_date "$test_url")
+        fi
         local formatted
-        formatted=$(__format_speed "$speed")
+        formatted=$(__format_speed "$speed" "$note")
 
         # Clear line and show result (skip in tsv mode)
-        [ -z "$tsv" ] && printf "\r%-15s %12s     %s\n" "$name" "$formatted" "$url" >&2
+        [ -z "$tsv" ] && printf "\r%-15s %12s  %-16s  %s\n" "$name" "$formatted" "$mdate" "$url" >&2
 
-        results="${results}${speed}|${name}|${url}
+        results="${results}${speed}|${name}|${url}|${note}|${mdate}
 "
     done <<EOF
 $__ALT_MIRROR_DB_VISIBLE
 EOF
 
-    # Sort by speed (descending) and format output
-    echo "$results" | sort -t'|' -k1 -rg | while IFS='|' read -r speed name url ; do
+    # Sort by speed (descending)
+    echo "$results" | sort -t'|' -k1 -rg | grep -v "^$"
+}
+
+__format_mirror_results()
+{
+    local current_mirror="$2"
+    echo "$1" | while IFS='|' read -r speed name url note mdate ; do
         [ -z "$name" ] && continue
         local formatted
-        formatted=$(__format_speed "$speed")
+        formatted=$(__format_speed "$speed" "$note")
         local status=""
         [ "$name" = "$current_mirror" ] && status="*"
         if [ -n "$tsv" ] ; then
-            printf "%s\t%s\t%s\t%s\n" "$name" "$speed" "$url" "$status"
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$speed" "$url" "$status" "$note" "$mdate"
         else
-            printf "%-15s %12s  %-1s  %s\n" "$name" "$formatted" "$status" "$url"
+            printf "%-15s %12s  %-1s  %-16s  %s\n" "$name" "$formatted" "$status" "$mdate" "$url"
         fi
     done
 }
@@ -14671,74 +16663,67 @@ __select_mirror_fzf()
 
 epm_repomirrors()
 {
-    local opt_speedtest=""
-    local opt_list=""
-    local opt_auto=""
-
-    while [ -n "$1" ] ; do
-        case "$1" in
-            -h|--help)                    # HELPCMD: show this help
-                echo "Usage: epm repo mirrors [OPTIONS]"
-                echo "List and test ALT Linux mirrors"
-                echo ""
-                echo "Options:"
-                get_help HELPCMD "$SHAREDIR/epm-repomirrors"
-                return
-                ;;
-            --list)                       # HELPCMD: list available mirrors with URLs (--short for names only)
-                opt_list=1
-                ;;
-            --speedtest)                  # HELPCMD: test download speed and show interactive selection
-                opt_speedtest=1
-                ;;
-            --auto)                       # HELPCMD: test speed and automatically switch to fastest mirror
-                opt_auto=1
-                opt_speedtest=1
-                ;;
-            *)
-                opt="$1"
-                fatal 'Unknown option: $opt'
-                ;;
-        esac
-        shift
-    done
-
-    case $BASEDISTRNAME in
-        "alt")
-            ;;
-        *)
-            fatal "epm repo mirrors is only supported for ALT Linux"
-            ;;
+    local CMD="$1"
+    [ -n "$CMD" ] && shift
+    case $CMD in
+    -h|--help|help)                       # HELPCMD: show this help
+        echo "Usage: epm repo mirrors [command]"
+        echo "List and test ALT Linux mirrors"
+        echo ""
+        echo "Commands:"
+        get_help HELPCMD "$SHAREDIR/epm-repomirrors"
+        return
+        ;;
+    ""|list)                              # HELPCMD: list available mirrors with URLs (use --short for names only)
+        __epm_repomirrors_check_alt
+        local current_mirror
+        current_mirror=$(__get_current_mirror)
+        __list_mirrors "$current_mirror" "$short"
+        ;;
+    speedtest)                            # HELPCMD: test download speed and show interactive selection
+        __epm_repomirrors_check_alt
+        __epm_repomirrors_speedtest
+        ;;
+    auto)                                 # HELPCMD: test speed and automatically switch to fastest mirror
+        __epm_repomirrors_check_alt
+        __epm_repomirrors_speedtest --auto
+        ;;
+    *)
+        fatal "Unknown command $ epm repo mirrors $CMD"
+        ;;
     esac
+}
+
+__epm_repomirrors_check_alt()
+{
+    [ "$BASEDISTRNAME" = "alt" ] || fatal "epm repo mirrors is only supported for ALT Linux"
+}
+
+__epm_repomirrors_speedtest()
+{
+    local opt_auto=""
+    [ "$1" = "--auto" ] && opt_auto=1
 
     local current_mirror
     current_mirror=$(__get_current_mirror)
-
-    # No options - show help
-    if [ -z "$opt_list" ] && [ -z "$opt_speedtest" ] ; then
-        epm_repomirrors --help
-        return
-    fi
-
-    # --list: show available mirrors
-    if [ -n "$opt_list" ] && [ -z "$opt_speedtest" ] ; then
-        __list_mirrors "$current_mirror" "$short"
-        return
-    fi
 
     # Speed test mode (uses eget --speedtest)
     [ -z "$tsv" ] && info "Testing mirrors speed (3 measurements × 5 sec per mirror)..."
 
     [ -z "$tsv" ] && echo "" >&2
-    local results
-    results=$(__test_all_mirrors "$current_mirror")
+    local raw results
+    raw=$(__test_all_mirrors)
+    results=$(__format_mirror_results "$raw" "$current_mirror")
     [ -z "$tsv" ] && echo "" >&2
 
     # --auto mode: switch to fastest
     if [ -n "$opt_auto" ] ; then
         local fastest
-        fastest=$(echo "$results" | head -1 | awk '{print $1}')
-        if [ -n "$fastest" ] && [ "$fastest" != "$current_mirror" ] ; then
+        # skip unavailable mirrors (zero speed)
+        fastest=$(echo "$raw" | awk -F'|' '$1 + 0 > 0 { print $2 ; exit }')
+        if [ -z "$fastest" ] ; then
+            warning 'No available mirrors found'
+        elif [ "$fastest" != "$current_mirror" ] ; then
             info "Switching to fastest mirror: $fastest"
             docmd epm repo change "$fastest"
         else
@@ -14831,8 +16816,9 @@ __epm_repo_pkgdel_alt()
             local rd="$REPO_DIR/$arch/RPMS.$REPO_NAME"
             [ -d $REPO_DIR/$arch/RPMS.$REPO_NAME ] || continue
             for i in $rd/$1* ; do
+                [ -e "$i" ] || continue
                 [ "$1" = "$(epm print name for package $i)" ] || continue
-                rm -v $rd/$1*
+                rm -v "$i"
             done
         done
         shift
@@ -14841,25 +16827,138 @@ __epm_repo_pkgdel_alt()
 }
 
 
+__epm_repo_pkgadd_rpmmd()
+{
+    local REPO_DIR="$1"
+    shift
+    [ -d "$REPO_DIR" ] || fatal 'Can'\''t find repo dir $REPO_DIR.'
+    [ -n "$1" ] || fatal "Missed package name"
+    while [ -s "$1" ] ; do
+        cp -v "$1" "$REPO_DIR/" || fatal
+        shift
+    done
+}
+
+__epm_repo_pkgdel_rpmmd()
+{
+    local REPO_DIR="$1"
+    shift
+    [ -d "$REPO_DIR" ] || fatal 'Can'\''t find repo dir $REPO_DIR.'
+    [ -n "$1" ] || fatal "Missed package name"
+    local i
+    while [ -n "$1" ] ; do
+        for i in "$REPO_DIR"/$1*.rpm ; do
+            [ -e "$i" ] || continue
+            [ "$1" = "$(epm print name for package "$i")" ] || continue
+            rm -v "$i"
+        done
+        shift
+    done
+}
+
 __epm_repo_pkgupdate_alt()
 {
+    local __repo_kind="${__repo_kind:-alt}"
     local dir="$1"
     shift
-    for i in "$@" ; do
-        pkg="$(epm print name for package $i)" || fatal
-        __epm_repo_pkgdel_alt "$dir" $pkg
+    # A task or a wildcard can contain several versions of the same package.
+    # Keep only the newest EVR for each name/architecture pair.
+    local selected_dir candidate candidate_name candidate_arch candidate_epoch candidate_evr
+    local selected_file selected_evr selected_package comparison
+    selected_dir="$(mktemp -d)" || fatal "Cannot create temp directory"
+
+    for candidate in "$@" ; do
+        candidate_name="$(epm print name for package "$candidate")" || fatal
+        candidate_arch="$(epm print arch for package "$candidate")" || fatal
+        candidate_epoch="$(epm print field epoch for package "$candidate")" || fatal
+        [ "$candidate_epoch" = "(none)" ] && candidate_epoch=0
+        candidate_evr="$candidate_epoch:$(epm print version-release for package "$candidate")" || fatal
+        selected_file="$selected_dir/$candidate_name.$candidate_arch"
+
+        if [ -s "$selected_file" ] ; then
+            selected_evr="$(sed -n '1p' "$selected_file")"
+            comparison="$(epm print compare version "$selected_evr" "$candidate_evr")" || fatal
+            [ "$comparison" -ge 0 ] && continue
+        fi
+        printf '%s\n%s\n' "$candidate_evr" "$candidate" > "$selected_file"
     done
-    __epm_repo_pkgadd_alt "$dir" "$@"
+
+    for selected_file in "$selected_dir"/* ; do
+        [ -s "$selected_file" ] || continue
+        selected_package="$(sed -n '2p' "$selected_file")"
+        candidate_name="$(epm print name for package "$selected_package")" || fatal
+        __epm_repo_pkgdel_$__repo_kind "$dir" "$candidate_name"
+        __epm_repo_pkgadd_$__repo_kind "$dir" "$selected_package"
+    done
+    rm -rf "$selected_dir"
 }
 
 
+
+__download_task_rpms()
+{
+    local tmpdir="$1"
+    shift
+
+    local arg task pkg_filter
+    for arg in "$@" ; do
+        task="$(get_tasknumber_from_arg "$arg")"
+        pkg_filter="$(get_pkgname_from_taskarg "$arg")"
+        [ -n "$task" ] || continue
+
+        get_task_status "$task" || continue
+
+        local plan
+        plan="$(fetch_url $ALTTASKURL/$task/plan/add-bin)" || continue
+
+        echo "$plan" | grep -E "	($DISTRARCH|noarch)	" | while IFS='	' read -r pname pver parch pfile ppath prest ; do
+            [ -n "$pkg_filter" ] && [ "$pname" != "$pkg_filter" ] && continue
+            docmd eget -O "$tmpdir/$pfile" "$ALTTASKURL/$task/$ppath" || warning "Failed to download $pfile"
+        done
+    done
+}
+
+__epm_repo_pkgadd_from_task()
+{
+    local dir="$1"
+    shift
+
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal "Cannot create temp directory"
+    __download_task_rpms "$tmpdir" "$@"
+    # check if any RPMs were downloaded
+    set +f
+    local rpms
+    rpms=$(echo "$tmpdir"/*.rpm)
+    if [ "$rpms" = "$tmpdir/*.rpm" ] ; then
+        rm -rf "$tmpdir"
+        fatal "No packages downloaded from task(s)"
+    fi
+    __epm_repo_pkgadd_${__repo_kind:-alt} "$dir" $tmpdir/*.rpm
+    rm -rf "$tmpdir"
+}
 
 epm_repo_pkgadd()
 {
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        __epm_repo_pkgadd_alt "$@"
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __epm_repo_pkgadd_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgadd_alt "$dir" "$@"
+        fi
+        ;;
+    dnf-rpm|dnf5-rpm)
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __repo_kind=rpmmd __epm_repo_pkgadd_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgadd_rpmmd "$dir" "$@"
+        fi
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgadd()'
@@ -14869,12 +16968,47 @@ esac
 }
 
 
+__epm_repo_pkgupdate_from_task()
+{
+    local dir="$1"
+    shift
+
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal "Cannot create temp directory"
+    __download_task_rpms "$tmpdir" "$@"
+    # check if any RPMs were downloaded
+    set +f
+    local rpms
+    rpms=$(echo "$tmpdir"/*.rpm)
+    if [ "$rpms" = "$tmpdir/*.rpm" ] ; then
+        rm -rf "$tmpdir"
+        fatal "No packages downloaded from task(s)"
+    fi
+    __epm_repo_pkgupdate_alt "$dir" $tmpdir/*.rpm
+    rm -rf "$tmpdir"
+}
+
 epm_repo_pkgupdate()
 {
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        __epm_repo_pkgupdate_alt "$@"
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __epm_repo_pkgupdate_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgupdate_alt "$dir" "$@"
+        fi
+        ;;
+    dnf-rpm|dnf5-rpm)
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __repo_kind=rpmmd __epm_repo_pkgupdate_from_task "$dir" "$@"
+        else
+            __repo_kind=rpmmd __epm_repo_pkgupdate_alt "$dir" "$@"
+        fi
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgupdate()'
@@ -14890,6 +17024,9 @@ epm_repo_pkgdel()
 case $PMTYPE in
     apt-rpm|apm-rpm)
         __epm_repo_pkgdel_alt "$@"
+        ;;
+    dnf-rpm|dnf5-rpm)
+        __epm_repo_pkgdel_rpmmd "$@"
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgdel()'
@@ -14943,6 +17080,38 @@ __restore_alt_repo_lists()
     rmdir "$SAVELISTDIR/apt/sources.list.d" "$SAVELISTDIR/apt"
 }
 
+__save_yum_repo_lists()
+{
+    assure_root
+    info 'Creating copy of all repo files to $SAVELISTDIR ...'
+    rm -rf $verbose $SAVELISTDIR 2>/dev/null
+    mkdir -p $SAVELISTDIR/yum.repos.d/
+    local i
+    for i in /etc/yum.repos.d/*.repo ; do
+        [ -s "$i" ] || continue
+        cp -af $verbose "$i" $SAVELISTDIR/yum.repos.d/ || fatal 'Can'\''t save repo files to $SAVELISTDIR'
+    done
+}
+
+__restore_yum_repo_lists()
+{
+    assure_root
+    [ -d "$SAVELISTDIR/yum.repos.d" ] || return 0
+    info 'Restoring copy of all repo files from $SAVELISTDIR ...'
+    local i
+    # remove repo files added after save
+    for i in /etc/yum.repos.d/*.repo ; do
+        [ -e "$i" ] || continue
+        [ -e "$SAVELISTDIR/yum.repos.d/$(basename "$i")" ] || rm -f $verbose "$i"
+    done
+    mkdir -p /etc/yum.repos.d/
+    for i in $SAVELISTDIR/yum.repos.d/*.repo ; do
+        [ -e "$i" ] || continue
+        mv -f $verbose "$i" /etc/yum.repos.d/ || warning 'Can'\''t restore $i file'
+    done
+    rmdir "$SAVELISTDIR/yum.repos.d"
+}
+
 __on_error_restore_alt_repo_lists()
 {
     warning "An error occurred..."
@@ -14972,6 +17141,13 @@ case $PMTYPE in
         fi
         __save_alt_repo_lists
         ;;
+    dnf-*|dnf5-*|yum-*)
+        if ! is_root ; then
+            sudoepm repo save
+            return
+        fi
+        __save_yum_repo_lists
+        ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_reposave()'
         ;;
@@ -14989,6 +17165,13 @@ case $PMTYPE in
         fi
         __restore_alt_repo_lists
         ;;
+    dnf-*|dnf5-*|yum-*)
+        if ! is_root ; then
+            sudoepm repo restore
+            return
+        fi
+        __restore_yum_repo_lists
+        ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_reporestore()'
         ;;
@@ -15001,6 +17184,10 @@ epm_reporeset()
 case $BASEDISTRNAME in
     alt)
         sudoepm repo set $DISTRVERSION
+        return
+        ;;
+    astra)
+        sudoepm repo set astra
         return
         ;;
 esac
@@ -15033,6 +17220,17 @@ case $PMTYPE in
             return 1
         fi
         ;;
+    dnf-rpm|dnf5-rpm)
+        local days
+        if [ -n "$short" ] ; then
+            days="$(__epm_check_dnf_db_days)" && return 0
+            echo "$days"
+            return 1
+        fi
+        days="$(__epm_check_dnf_db_days)" && info "$PMTYPE metadata is actual." && return 0
+        info '$PMTYPE metadata is $days.'
+        return 1
+        ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repostatus()'
         ;;
@@ -15047,6 +17245,11 @@ __epm_filter_out_base_alt_reqs()
     grep -E -v "(^rpmlib\(|^/bin/sh|^/bin/bash|^rtld\(GNU_HASH\)|ld-linux)" | grep -E -v " or " | sed -e 's/\(\.so[.0-9]*\)([^)]\+)/\1()/g' | sort -u
 }
 
+__epm_filter_debian_reqs()
+{
+    grep -v '^lib' | grep -v '^rpmlib(' | grep -v '^/' | sed -e 's| .*||' | sort -u | tr '\n' ', ' | sed -e 's/,$//' -e 's/^,//'
+}
+
 __epm_alt_rpm_requires()
 {
     if [ -n "$short" ] ; then
@@ -15059,7 +17262,7 @@ __epm_alt_rpm_requires()
 
 get_linked_shared_libs()
 {
-    assure_exists readelf binutils
+    assure_exists readelf binutils >&2
     #is_command readelf || fatal "Can't get required shared library: readelf is missed. Try install binutils package."
     #ldd "$exe" | sed -e 's|[[:space:]]*||' | grep "^lib.*[[:space:]]=>[[:space:]]\(/usr/lib\|/lib\)" | sed -e 's|[[:space:]].*||'
     LC_ALL=C a="" readelf -d "$1" | grep "(NEEDED)" | grep "Shared library:" | sed -e 's|.*Shared library: \[||' -e 's|\]$||' | grep "^lib"
@@ -15194,9 +17397,21 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         if is_installed $pkg_names ; then
+            if [ "$BASEDISTRNAME" = "alt" ] ; then
+                __epm_alt_rpm_requires $pkg_names
+                return
+            fi
             CMD="rpm -q --requires"
         else
-            CMD="dnf repoquery --requires"
+            CMD="$DNFCMD repoquery --requires"
+            if [ "$BASEDISTRNAME" = "alt" ] ; then
+                if [ -n "$short" ] ; then
+                    docmd $CMD $pkg_names | __epm_filter_out_base_alt_reqs | sed -e "s| .*||"
+                else
+                    docmd $CMD $pkg_names | __epm_filter_out_base_alt_reqs
+                fi
+                return
+            fi
         fi
         ;;
     pacman)
@@ -15267,9 +17482,13 @@ epm_requires()
 
     [ -n "$pkg_filenames" ] || fatal "Requires: package name is missed"
 
-    epm_requires_files $pkg_files
-    # shellcheck disable=SC2046
-    epm_requires_names $(print_name $pkg_names)
+    if [ -n "$debian" ] ; then
+        ( epm_requires_files $pkg_files ; epm_requires_names $(print_name $pkg_names) ) | __epm_filter_debian_reqs
+    else
+        epm_requires_files $pkg_files
+        # shellcheck disable=SC2046
+        epm_requires_names $(print_name $pkg_names)
+    fi
 }
 
 # File bin/epm-restore:
@@ -15306,6 +17525,35 @@ fill_sign()
     echo "$2" | grep -E -- "$sign[[:space:]]*[0-9.]+?" | sed -E -e "s|.*$sign[[:space:]]*([0-9.]+?).*|\1|"
 }
 
+
+__epm_pmtype_enforces_install_version()
+{
+    case $PMTYPE in
+        apt-rpm|apm-rpm|apt-dpkg|aptitude-dpkg|apk) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+__epm_restore_glue_version()
+{
+    if __epm_pmtype_enforces_install_version ; then
+        sed -e 's| ||g'
+    else
+        cut -d' ' -f 1
+    fi
+}
+
+__epm_restore_emit()
+{
+    local macro="$1" name="$2" vspec="$3"
+    if [ -n "$dryrun" ] ; then
+        echo "$macro $name${vspec:+ $vspec}"
+    elif [ -n "$vspec" ] && __epm_pmtype_enforces_install_version ; then
+        echo "$name$(printf '%s' "$vspec" | tr -d ' ')"
+    else
+        echo "$name"
+    fi
+}
 
 __epm_pi_sign_to_rpm()
 {
@@ -15408,7 +17656,7 @@ __epm_restore_pip()
         return
     else
         info 'Install requirements from $req_file ...'
-        ilist="$(cat $req_file | __epm_restore_convert_to_rpm_notation | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+        ilist="$(cat $req_file | __epm_restore_convert_to_rpm_notation | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
     fi
 
     ilist="$(estrlist list $ilist)"
@@ -15466,7 +17714,7 @@ __epm_restore_pyproject()
         return
     else
         info "Install requirements from $req_file ..."
-        ilist="$(__epm_restore_print_pyproject "$req_file" | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+        ilist="$(__epm_restore_print_pyproject "$req_file" | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
     fi
 
     ilist="$(estrlist list $ilist)"
@@ -15525,7 +17773,7 @@ $l"
             __epm_restore_print_comment "$req_file" "" " $(__epm_get_array_name "$section")"
             __epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | sed -e "s|^|$reqmacro |"
         else
-            ilist="$ilist $(__epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+            ilist="$ilist $(__epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
         fi
         section=''
         ar=''
@@ -15543,36 +17791,21 @@ __epm_print_npm_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local l name ver vspec cleanver
     while read l ; do
         # "tap": "^14.10.7"
         echo "$l" | grep -q '"\(.*\)": "\(.*\)"' || continue
-        local name="$(echo "$l" | sed -e 's|.*"\(.*\)": ".*|\1|')"
+        name="$(echo "$l" | sed -e 's|.*"\(.*\)": ".*|\1|')"
         [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's|.*"\(.*\)": "\(.*\)".*|\2|')" #'
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign
-            if echo "$ver" | grep -q "^\^" ; then
-                sign=">="
-            else
-                sign="="
-            fi
-            ll=$(echo "$ver" | sed -e 's|^[^~]||')
-            pi="$pi$reqmacro node-$name $sign $ll"
-            echo "$pi"
-            continue
-        else
-            local pi="node-$name"
-            #echo "    $l -> $name -> $pi"
+        ver="$(echo "$l" | sed -e 's|.*"\(.*\)": "\(.*\)".*|\2|')" #'
+        # npm versions: ^X.Y.Z (caret), ~X.Y.Z (tilde), bare X.Y.Z → lower bound ">= X.Y.Z".
+        vspec=''
+        if echo "$ver" | grep -qE "^[\^~]?[0-9]" ; then
+            cleanver="$(echo "$ver" | sed -e 's|^[\^~]||')"
+            vspec=">= $cleanver"
         fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        __epm_restore_emit "$reqmacro" "node-$name" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 
@@ -15580,75 +17813,29 @@ __epm_print_perl_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local l name ver vspec
     for l in $(cat) ; do
         # perl(Class::ErrorHandler)>=0
         echo "$l" | grep -q '^perl(' || continue
-        local name="$(echo "$l" | sed -e 's|>=.*||' -e 's|::|/|g' -e 's|)|.pm)|')"
+        name="$(echo "$l" | sed -e 's|>=.*||' -e 's|::|/|g' -e 's|)|.pm)|')"
+        [ -z "$name" ] && continue
         [ "$name" = "perl(perl.pm)" ] && continue
-        [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's|.*>=||')"
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign=''
-            [ "$ver" = "0" ] || sign=" >= $ver"
-            pi="$pi$reqmacro $name$sign"
-            echo "$pi"
-            continue
-        else
-            local pi="$name"
-            #echo "    $l -> $name -> $pi"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        ver="$(echo "$l" | sed -e 's|.*>=||')"
+        vspec=''
+        [ "$ver" = "0" ] || vspec=">= $ver"
+        __epm_restore_emit "$reqmacro" "$name" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
-}
-
-__epm_print_perl_list_shyaml()
-{
-    local reqmacro="$1"
-    local req_file="$2"
-    local l
-    while read l ; do
-        # Convert::ASN1: 0.10
-        echo "$l" | grep -q '^ *\(.*\): \(.*\)' || continue
-        local name="$(echo "$l" | sed -e 's| *\(.*\): \(.*\)|\1|' -e 's|::|/|g')".pm
-        [ "$name" = "perl.pm" ] && continue
-        [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's| *\(.*\): \(.*\)|\2|')"
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign=''
-            [ "$ver" = "0" ] || sign=" >= $ver"
-            pi="$pi$reqmacro perl($name)$sign"
-            echo "$pi"
-            continue
-        else
-            local pi="perl($name)"
-            #echo "    $l -> $name -> $pi"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
-    done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 
 __epm_print_nupkg_list()
 {
-    a= dotnet list $1 package | grep "^   > " | while read n name req other; do
-        if [ -n "$dryrun" ] ; then
-            echo "BuildRequires: nupkg($name) >= $req"
-        else
-            echo "nupkg($name)"
-        fi
+    local req_file="$1"
+    local n name req other vspec
+    a= dotnet list "$req_file" package | grep "^   > " | while read n name req other ; do
+        vspec=''
+        [ -n "$req" ] && vspec=">= $req"
+        __epm_restore_emit "BuildRequires:" "nupkg($name)" "$vspec"
     done
 }
 
@@ -15671,25 +17858,15 @@ __epm_print_meson_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local name sign ver other vspec
     while read name sign ver other ; do
         # gtk4-wayland
         # gtk4 >= 4.6
         [ -n "$other" ] && continue
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            pi="$reqmacro pkgconfig($name)"
-            [ -n "$sign" ] && pi="$pi $sign $ver"
-            echo "$pi"
-            continue
-        else
-            local pi="pkgconfig($name)"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        vspec=''
+        [ -n "$sign" ] && [ -n "$ver" ] && vspec="$sign $ver"
+        __epm_restore_emit "$reqmacro" "pkgconfig($name)" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 __epm_restore_meson()
@@ -15782,39 +17959,93 @@ __epm_restore_perl()
     docmd epm install $ilist
 }
 
-__epm_restore_perl_shyaml()
+__epm_print_cpanfile_specs()
+{
+    # $1 = cpanfile
+    a= /usr/bin/perl -MModule::CPANfile -e '
+        my $f = shift;
+        my $prereqs = Module::CPANfile->load($f)->prereqs;
+        for my $phase (qw(runtime build configure test develop)) {
+            my $req = eval { $prereqs->requirements_for($phase, "requires") };
+            next unless $req;
+            my $h = $req->as_string_hash;          # { Mod => ">= 1.85" | "4.00" | "0" }
+            for my $mod (sort keys %$h) {
+                next if $mod eq "perl";
+                print "$phase\t$mod\t$h->{$mod}\n";
+            }
+        }
+    ' "$1"
+}
+
+__epm_cpanfile_spec_to_rpm()
+{
+    local spec="$1"
+    [ -n "$spec" ] || return
+    [ "$spec" = "0" ] && return
+
+    local part saved ver
+    local OLDIFS="$IFS"
+    IFS=','
+    for part in $spec ; do
+        IFS="$OLDIFS"
+        part="${part# }"; part="${part% }"
+        [ -n "$part" ] || continue
+        case "$part" in "!="*) continue ;; esac
+        [ -n "$saved" ] && continue
+        case "$part" in
+            ">="*|">"*|"<="*|"<"*) saved="$part" ;;
+            "=="*) ver="${part#??}"; ver="${ver# }"; saved=">= $ver" ;;
+            "="*)  ver="${part#?}";  ver="${ver# }"; saved=">= $ver" ;;
+            *)     saved=">= $part" ;;
+        esac
+    done
+    IFS="$OLDIFS"
+    [ -n "$saved" ] || return
+    echo "$saved"
+}
+
+__epm_print_cpanfile_list()
+{
+    local req_file="$1"
+    local phase mod spec name vspec macro
+    while IFS="$(printf '\t')" read phase mod spec ; do
+        case "$phase" in
+            runtime) macro="Requires:" ;;
+            *)       macro="BuildRequires:" ;;
+        esac
+        name="perl($(printf '%s' "$mod" | sed -e 's|::|/|g').pm)"
+        vspec="$(__epm_cpanfile_spec_to_rpm "$spec")"
+        __epm_restore_emit "$macro" "$name" "$vspec"
+    done < $req_file
+}
+
+__epm_restore_cpanfile()
 {
     local req_file="$1"
 
-    assure_exists shyaml
+    # Module::CPANfile (ALT package perl-Module-CPANfile) is the canonical cpanfile parser
+    if ! a= /usr/bin/perl -MModule::CPANfile -e 'exit 0' 2>/dev/null ; then
+        info "Installing perl-Module-CPANfile to parse cpanfile ..."
+        docmd epm install perl-Module-CPANfile || fatal "Can't install perl-Module-CPANfile"
+    fi
+
+    local lt
+    lt=$(mktemp) || fatal
+    remove_on_exit $lt
+    __epm_print_cpanfile_specs "$req_file" >$lt
 
     if [ -n "$dryrun" ] ; then
-        local lt
-        lt=$(mktemp) || fatal
-        remove_on_exit $lt
-        a= shyaml get-value requires <$req_file >$lt
-        # all requirements will autodetected during packing, put it to the buildreq
         echo
         __epm_restore_print_comment "$req_file"
-        __epm_print_perl_list "BuildRequires:" $lt
-
-        echo
-        __epm_restore_print_comment "$req_file" " build_requires"
-        a= shyaml get-value build_requires <$req_file >$lt
-        __epm_print_perl_list "BuildRequires:" $lt
+        __epm_print_cpanfile_list $lt
         rm -f $lt
         return
     fi
 
     info "Install requirements from $req_file ..."
-    local lt
-    lt=$(mktemp) || fatal
-    remove_on_exit $lt
-    a= shyaml get-value requires <$req_file >$lt
-    ilist="$(__epm_print_perl_list "" $lt)"
-    a= shyaml get-value build_requires <$req_file >$lt
-    ilist="$ilist $(__epm_print_perl_list "" $lt)"
+    ilist="$(__epm_print_cpanfile_list $lt)"
     rm -f $lt
+    ilist="$(estrlist list $ilist)"
     docmd epm install $ilist
 }
 
@@ -15859,7 +18090,14 @@ __epm_restore_by()
             [ -s "$req_file" ] && __epm_restore_meson "$req_file"
             ;;
         Makefile.PL)
+            # cpanfile is the canonical modern source (Makefile.PL is often generated
+            # from it); if both are present, prefer cpanfile to avoid a second, less
+            # precise dependency block.
+            [ -s "$(dirname "$req_file")/cpanfile" ] && return
             [ -s "$req_file" ] && __epm_restore_perl "$req_file"
+            ;;
+        cpanfile)
+            [ -s "$req_file" ] && __epm_restore_cpanfile "$req_file"
             ;;
         *.sln|*.csproj)
             local PROJ="$(echo $req_file)"
@@ -15873,30 +18111,40 @@ __epm_restore_by()
 
 epm_restore()
 {
-    req_file="$pkg_filenames"
-    if [ -n "$pkg_urls" ] && echo "$pkg_urls" | grep -qE "^https?://" ; then
-        req_file="$(basename "$pkg_urls")"
-        #assure eget
-        [ -r "$req_file" ] && fatal "File $req_file is already exists in $(pwd)"
-        info "Downloading '$req_file' from '$pkg_urls' ..."
-        eget "$pkg_urls"
-        [ -s "$req_file" ] || fatal "Can't download $req_file from '$pkg_urls'"
-    fi
-
-    if [ -n "$req_file" ] ; then
-        __epm_restore_by $req_file
+    # Requirement files or URLs given explicitly on the command line.
+    if [ $# -gt 0 ] ; then
+        local arg fn
+        for arg in "$@" ; do
+            if is_url "$arg" ; then
+                fn="$(basename "$arg")"
+                #assure eget
+                [ -r "$fn" ] && fatal "File $fn is already exists in $(pwd)"
+                info "Downloading '$fn' from '$arg' ..."
+                eget "$arg"
+                [ -s "$fn" ] || fatal "Can't download $fn from '$arg'"
+                __epm_restore_by "$fn"
+            elif [ -s "$arg" ] ; then
+                __epm_restore_by "$arg"
+            else
+                fatal "Can't read requirements file '$arg'"
+            fi
+        done
         return
     fi
 
 
-    # if run with empty args
+    # if run with empty args — auto-search known requirement files
+    local i
     for i in requirements.txt requirements/default.txt requirements_dev.txt requirements-dev.txt requirements/dev.txt dev-requirements.txt \
              requirements-test.txt requirements_test.txt requirements/test.txt test-requirements.txt requirements/coverage.txt \
-             Gemfile requires.txt package.json setup.py python_dependencies.py Makefile.PL meson.build pyproject.toml \
+             Gemfile requires.txt package.json setup.py python_dependencies.py cpanfile Makefile.PL meson.build pyproject.toml \
              *.sln *.csproj ; do
         __epm_restore_by $i
     done
 
+    # auto-search is best-effort; ignore the status of the last glob probe
+    # (otherwise 'epm restore --dry-run' with no matching *.sln/*.csproj exits 1)
+    return 0
 }
 
 # File bin/epm-search:
@@ -15955,7 +18203,7 @@ case $PMTYPE in
         CMD="yum search"
         ;;
     dnf-rpm|dnf5-rpm)
-        CMD="dnf search"
+        CMD="$DNFCMD search"
         ;;
     zypper-rpm)
         CMD="zypper search -d --"
@@ -16158,7 +18406,7 @@ __alt_search_file_output()
 __alt_local_content_search()
 {
 
-    check_alt_contents_index || init_alt_contents_index
+    assure_alt_contents_index
     update_repo_if_needed
 
     if [ ! -s "$ALT_CONTENTS_INDEX_LIST" ] ; then
@@ -16208,7 +18456,7 @@ case $PMTYPE in
     dnf-rpm|dnf5-rpm)
         # TODO
         info "Search by full packages list is not implemented yet"
-        CMD="dnf provides"
+        CMD="$DNFCMD provides"
         ;;
     urpm-rpm)
         CMD="urpmf"
@@ -16259,6 +18507,17 @@ is_taskarg() {
     return 1
 }
 
+
+is_taskurl()
+{
+    local pkg_urls="$1"
+    [ -n "$pkg_urls" ] || return
+
+    echo "$pkg_urls" | grep -q -E "https://packages.altlinux.org/ru/tasks/[0-9]+/*$" || \
+    echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/[0-9]+/*$" || \
+    echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/archive/done/_[0-9]+/[0-9]+/*$"
+}
+
 get_tasknumber_from_arg()
 {
     local arg="$1"
@@ -16301,10 +18560,53 @@ get_pkgname_from_taskarg()
 
 ALTTASKURL="http://git.altlinux.org/tasks"
 
+get_task_state()
+{
+    local tn="$1"
+    fetch_url "$ALTTASKURL/$tn/task/state" 2>/dev/null
+}
+
 get_task_status()
 {
     local tn="$1"
     docmd eget --check-url $ALTTASKURL/$tn/plan/add-bin
+}
+
+get_task_repo()
+{
+    local tn="$1"
+    fetch_url "$ALTTASKURL/$tn/task/repo" 2>/dev/null
+}
+
+__alt_has_vendor()
+{
+    grep -qs "^[[:space:]]*simple-key[[:space:]]*\"$1\"" /etc/apt/vendors.list /etc/apt/vendors.list.d/*.list
+}
+
+get_task_sign()
+{
+    local tn="$1"
+    local branch vendor
+    branch="$(get_task_repo "$tn")"
+    case "$branch" in
+        sisyphus)
+            vendor="alt"
+            ;;
+        p[0-9]*)
+            vendor="$branch"
+            ;;
+        c[0-9]*)
+            vendor="updates"
+            ;;
+        *)
+            return
+            ;;
+    esac
+    if ! __alt_has_vendor "$vendor" ; then
+        warning 'Vendor $vendor is missed in vendors.list, the signature of task $tn repo will not be checked'
+        return
+    fi
+    echo "[$vendor]"
 }
 
 get_task_arepo_status()
@@ -16338,12 +18640,243 @@ get_task_packages()
     for arg in "$@" ; do
         is_taskarg "$arg" || continue
         tn=$(get_tasknumber_from_arg "$arg")
-        get_task_status "$tn" || continue
+        if ! get_task_status "$tn" ; then
+            local state
+            state="$(get_task_state "$tn")"
+            if [ -n "$state" ] ; then
+                warning 'Task $tn state is $state, packages are not yet available.'
+            else
+                warning 'Task $tn not found.'
+            fi
+            continue
+        fi
         get_task_packages_list "$tn"
         [ "$DISTRARCH" = "x86_64" ] || continue
         get_task_arepo_status "$tn" || continue
         get_task_arepo_packages_list "$tn"
     done
+}
+
+__alt_dnf_uses_apt_sources()
+{
+    [ "$PMTYPE" = "dnf5-rpm" ] || return
+    local conf=/etc/dnf/libdnf5-plugins/apt.conf
+    grep -qsE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*(1|yes|true|on)[[:space:]]*$' $conf || return
+    ! grep -qsE '^[[:space:]]*sources[[:space:]]*=[[:space:]]*(0|no|false|off)[[:space:]]*$' $conf
+}
+
+__get_yum_repos_dir()
+{
+    echo "${EPM_YUM_REPOS_DIR:-/etc/yum.repos.d}"
+}
+
+__get_alt_dnf_repos()
+{
+    local f
+    for f in "$(__get_yum_repos_dir)"/*.repo ; do
+        [ -r "$f" ] || continue
+        awk '
+            function flush() { if (url != "" && enabled) print (type == "apt-rpm" ? type : "rpm-md"), url }
+            /^[[:space:]]*\[/ { flush(); url = ""; type = ""; enabled = 1; next }
+            /^[[:space:]]*baseurl[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); url = $1; next }
+            /^[[:space:]]*type[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); type = $1; next }
+            /^[[:space:]]*enabled[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); enabled = ($1 ~ /^(1|yes|true|on)$/); next }
+            END { flush() }
+        ' "$f"
+    done
+}
+
+__alt_dnf_repo_type()
+{
+    if [ -n "$EPM_DNF_REPO_TYPE" ] ; then
+        echo "$EPM_DNF_REPO_TYPE"
+        return
+    fi
+    if grep -qsE '^[[:space:]]*type[[:space:]]*=[[:space:]]*apt-rpm[[:space:]]*$' "$(__get_yum_repos_dir)"/*.repo ; then
+        echo "apt-rpm"
+        return
+    fi
+    echo "rpm-md"
+}
+
+__alt_dnf_uses_aptrpm_repos()
+{
+    case "$PMTYPE" in
+        dnf-rpm|dnf5-rpm)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    [ "$(__alt_dnf_repo_type)" = "apt-rpm" ]
+}
+
+__alt_dnf_supports_aptrpm()
+{
+    __alt_dnf_uses_apt_sources || __alt_dnf_uses_aptrpm_repos
+}
+
+__alt_dnf_aptrpm_vendor()
+{
+    local repo="$1"
+    local vendor
+    case "$repo" in
+        sisyphus|deferred*)
+            vendor="alt"
+            ;;
+        c[0-9]*)
+            vendor="cert8"
+            ;;
+        *)
+            vendor="$repo"
+            ;;
+    esac
+    if ! __alt_has_vendor "$vendor" ; then
+        warning 'Vendor $vendor is missed in vendors.list, the signature of $repo repo will not be checked'
+        return
+    fi
+    echo "$vendor"
+}
+
+__alt_dnf_aptrpm_mirror()
+{
+    if [ -n "$EPM_DNF_APTRPM_MIRROR" ] ; then
+        echo "$EPM_DNF_APTRPM_MIRROR"
+        return
+    fi
+    local url host mirror
+    if __alt_dnf_uses_apt_sources && __get_alt_mirror_baseurl "$1" 2>/dev/null ; then
+        return
+    fi
+    for url in $(__get_alt_dnf_repos | sed -n 's|^apt-rpm ||p') ; do
+        host="$(echo "$url" | sed -nE 's|^https?://([^/]+).*|\1|p')"
+        [ -n "$host" ] || continue
+        mirror="$(__get_alt_mirror_url_by_host "$host")"
+        [ -n "$mirror" ] && echo "$mirror" && return
+    done
+    echo "http://ftp.basealt.ru/pub/distributions/ALTLinux"
+}
+
+__alt_dnf_aptrpm_baseurl()
+{
+    case "$1" in
+        sisyphus|Sisyphus)
+            echo "$(__alt_dnf_aptrpm_mirror sisyphus)/Sisyphus"
+            ;;
+        deferred)
+            echo "https://download.etersoft.ru/pub/Etersoft/Sisyphus/Deferred"
+            ;;
+        deferred.org)
+            echo "http://mirror.eterfund.org/pub/Etersoft/Sisyphus/Deferred"
+            ;;
+        deferred-devel)
+            echo "https://download.etersoft.ru/pub/Etersoft/Sisyphus/Deferred_DEVEL"
+            ;;
+        deferred-beta)
+            echo "https://download.etersoft.ru/pub/Etersoft/Sisyphus/Deferred_BETA"
+            ;;
+        p[0-9]*|c[0-9]*)
+            echo "$(__alt_dnf_aptrpm_mirror "$1")/$1/branch"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+__alt_dnf_aptrpm_probe_url()
+{
+    local url="$1"
+    local arch rd comp
+    for arch in $(__alt_dnf_archlist) ; do
+        eget --check-url "$url/$arch/base/" 2>/dev/null || continue
+        rd="$(eget --list "$url/$arch/RPMS.*" 2>/dev/null)"
+        [ -n "$rd" ] || continue
+        comp="$(echo "$rd" | head -n1 | sed -e 's|/*$||' -e 's|.*\.||')"
+        [ "$comp" = "*" ] && continue
+        echo "$arch $comp"
+    done
+}
+
+__alt_dnf_aptrpm_repo_options()
+{
+    local id="$1"
+    echo "--repofrompath=$id,$2 --setopt=$id.type=apt-rpm --setopt=$id.apt_component=$3${4:+ --setopt=$id.apt_vendor=$4}"
+}
+
+__epm_addrepo_alt_dnf_gpgkey()
+{
+    local keyfile="$1"
+    [ -s "$keyfile" ] && return
+
+    local keyring=/usr/lib/alt-gpgkeys
+    local vendors=/etc/apt/vendors.list.d/alt.list
+    [ -d "$keyring" ] || fatal 'Missed $keyring (install alt-gpgkeys package).'
+    assure_exists gpg gnupg2
+
+    # 80EF7625 (ALT Security Team) is not in vendors list, but still signs some old Sisyphus packages
+    local keys="80EF7625"
+    [ -s "$vendors" ] && keys="$keys $(sed -n 's/.*Fingerprint "\([0-9A-F]*\)".*/\1/p' $vendors | sort -u)"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    a='' gpg --homedir $keyring --export --armor $keys >$tmpfile 2>/dev/null
+    [ -s "$tmpfile" ] || fatal 'Can'\''t export ALT keys from $keyring'
+    chmod 644 $tmpfile
+    sudocmd mkdir -p "$(dirname "$keyfile")"
+    sudocmd cp $tmpfile "$keyfile"
+}
+
+ALT_DNF_MIRROR="http://download.etersoft.ru/pub"
+ALT_DNF_MIRROR_KEYURL="$ALT_DNF_MIRROR/Etersoft/RPM-GPG-KEY-etersoft-mirror-metadata"
+ALT_DNF_MIRROR_KEYFPR="24F2AD07095B62CC48D5AC7C81C29C26E0056291"
+ALT_DNF_MIRROR_KEYFILE="/etc/pki/rpm-gpg/RPM-GPG-KEY-etersoft-mirror-metadata"
+
+__alt_dnf_baseurl()
+{
+    case "$1" in
+        sisyphus|Sisyphus)
+            echo "$ALT_DNF_MIRROR/ALTLinux/Sisyphus"
+            ;;
+        deferred)
+            echo "$ALT_DNF_MIRROR/Etersoft/Sisyphus/Deferred"
+            ;;
+        deferred.org)
+            echo "http://mirror.eterfund.org/pub/Etersoft/Sisyphus/Deferred"
+            ;;
+        deferred-devel)
+            echo "$ALT_DNF_MIRROR/Etersoft/Sisyphus/Deferred_DEVEL"
+            ;;
+        deferred-beta)
+            echo "$ALT_DNF_MIRROR/Etersoft/Sisyphus/Deferred_BETA"
+            ;;
+        p[0-9]*|c[0-9]*)
+            echo "$ALT_DNF_MIRROR/ALTLinux/$1/branch"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+__alt_dnf_archlist()
+{
+    echo "noarch"
+    echo "$DISTRARCH"
+    [ "$DISTRARCH" = "x86_64" ] && echo "x86_64-i586"
+    return 0
+}
+
+__alt_dnf_installonly_opt()
+{
+    local cur
+    cur="$(a='' $DNFCMD --dump-main-config 2>/dev/null | sed -n 's/^installonlypkgs = //p')"
+    [ -n "$cur" ] || cur="kernel"
+    local modules
+    modules="$(estrlist union "$* $(a='' rpm -qa --qf '%{NAME}\n' 'kernel-modules-*' 2>/dev/null)")"
+    [ -n "$modules" ] || return 0
+    echo "--setopt=installonlypkgs=$cur,$(echo $modules | tr ' ' ',')"
 }
 
 # File bin/epm-sh-altlinux-contents-index:
@@ -16411,6 +18944,7 @@ eget_alt_contents_index()
     local TD="$2"
     local res
     [ -n "$USER" ] && [ -f $TD ] && sudorun chown -R $USER $TD
+    [ -z "$quiet" ] && info "    $URL -> $TD"
     eget --timestamping --compressed -O $TD $URL
     res=$?
     [ -f "$TD" ] && sudorun chmod a+rw "$TD"
@@ -16422,8 +18956,27 @@ get_url_to_etersoft_mirror()
     local REPOPATH
     local ETERSOFT_MIRROR="rsync://download.etersoft.ru/pub"
     local ALTREPO=$(get_alt_repo_path "$1")
-    echo "$ALTREPO" | grep -q "^ALTLinux" || echo "$ALTREPO" | grep -q "^altlinux" || return
-    echo "$ETERSOFT_MIRROR/$(echo "$ALTREPO" | sed -E 's@^(ALTLinux|altlinux)/@ALTLinux/contents_index/@')"
+    case "$ALTREPO" in
+        ALTLinux/*|altlinux/*)
+            echo "$ETERSOFT_MIRROR/$(echo "$ALTREPO" | sed -E 's@^(ALTLinux|altlinux)/@ALTLinux/contents_index/@')"
+            ;;
+        Etersoft/Sisyphus/Deferred/*|Etersoft/Sisyphus/Deferred_DEVEL/*|Etersoft/Sisyphus/Deferred_BETA/*)
+            # Deferred repositories already publish contents_index.gz in base/.
+            echo "$ETERSOFT_MIRROR/$ALTREPO"
+            ;;
+    esac
+}
+
+__test_contents_index_file()
+{
+    case "$1" in
+        *.gz)
+            a='' gzip -t "$1" 2>/dev/null
+            ;;
+        *)
+            erc --quiet test "$1" >/dev/null 2>/dev/null
+            ;;
+    esac
 }
 
 __add_to_contents_index_list()
@@ -16432,7 +18985,7 @@ __add_to_contents_index_list()
     local file="$2"
     [ -n "$verbose" ] && info 'Put $comment -> $file'
     [ -s "$file" ] || return
-    if rhas "$file" "\." && ! erc test "$file" 2>/dev/null ; then
+    if rhas "$file" "\." && ! __test_contents_index_file "$file" ; then
         warning "Broken contents_index: $file" ; rm -f "$file" ; return 1
     fi
     echo "$file" >>$ALT_CONTENTS_INDEX_LIST
@@ -16452,6 +19005,12 @@ __add_better_to_contents_index_list()
 check_alt_contents_index()
 {
     [ -f "$ALT_CONTENTS_INDEX_LIST" ]
+}
+
+assure_alt_contents_index()
+{
+    [ -s "$ALT_CONTENTS_INDEX_LIST" ] && return
+    init_alt_contents_index
 }
 
 clean_alt_contents_index()
@@ -16478,14 +19037,14 @@ update_alt_contents_index()
 
     info "Retrieving contents_index ..."
 
-    mapfile -t URL_LIST < <(
-        (quiet=1 epm_repolist) | \
+    local URL_LIST_FILE
+    URL_LIST_FILE="$(mktemp)" || return
+    (quiet=1 epm_repolist) | \
         grep -v " task$" | \
         grep -E "rpm.*(ftp://|http://|https://|rsync://|file:/)" | \
-        sed -e "s@.*rpm.*file:/@/@" -e "s@^.*\]@@" -e "s@^rpm *@@"
-    )
+        sed -e "s@.*rpm.*file:/@/@" -e "s@^.*\]@@" -e "s@^rpm *@@" > "$URL_LIST_FILE"
 
-    for line in "${URL_LIST[@]}"; do
+    while read -r line; do
         URL1=$(echo "$line" | awk '{print $1}')
         URL2=$(echo "$line" | awk '{print $2}')
         component=$(echo "$line" | awk '{print $3}')
@@ -16559,22 +19118,757 @@ update_alt_contents_index()
 
         #warning "Can't download contents_index from $URL/base"
 
+    done < "$URL_LIST_FILE"
+    rm -f "$URL_LIST_FILE"
+}
+
+# File bin/epm-sh-altlinux-kernel:
+
+
+
+
+
+
+__ak_is_dnf()
+{
+    [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ]
+}
+
+__ak_apt_parse_version()
+{
+    local v="$1" bt=''
+    case "$v" in
+        *@*)
+            bt="${v##*@}"
+            v="${v%@*}"
+            ;;
+    esac
+    # strip epoch and disttag
+    echo "$v" | grep -q -E '^[0-9]+:' && v="${v#*:}"
+    v="${v%%:*}"
+    echo "$v $bt"
+}
+
+__ak_apt_repo_ids()
+{
+    local id
+    a='' apt-cache $__EPM_APT_REPO_OPTIONS pkgnames "$1#" 2>/dev/null | while read -r id ; do
+        a='' apt-cache $__EPM_APT_REPO_OPTIONS policy "$id" 2>/dev/null | grep -q -w 'pkglist$' && echo "$id"
     done
 }
 
+__ak_repo_versions()
+{
+    if __ak_is_dnf ; then
+        a='' $DNFCMD -q repoquery --qf '%{version}-%{release} %{buildtime}\n' "$1" 2>/dev/null
+        return
+    fi
+    local id
+    for id in $(__ak_apt_repo_ids "$1") ; do
+        __ak_apt_parse_version "${id#*#}"
+    done
+}
+
+__ak_repo_kernels()
+{
+    if __ak_is_dnf ; then
+        a='' $DNFCMD -q repoquery --qf '%{name} %{version}-%{release} %{buildtime}\n' 'kernel-image-*' 2>/dev/null | grep -v -- "-debuginfo "
+        return
+    fi
+    local name id
+    for name in $(a='' apt-cache $__EPM_APT_REPO_OPTIONS pkgnames 'kernel-image-' 2>/dev/null | grep '#' | grep -v -- '-debuginfo#' | sed -e 's|#.*||' | sort -u) ; do
+        for id in $(__ak_apt_repo_ids "$name") ; do
+            echo "$name $(__ak_apt_parse_version "${id#*#}")"
+        done
+    done
+}
+
+__ak_repo_modules()
+{
+    local flavour="$1" version="$2"
+    if __ak_is_dnf ; then
+        a='' $DNFCMD -q repoquery --qf '%{name} %{version}-%{release}\n' --whatrequires "kernel-image-$flavour-$version" 2>/dev/null | grep "^kernel-modules-.*-$flavour " | sort -u
+        return
+    fi
+    local id
+    id="$(__ak_apt_repo_ids "kernel-image-$flavour" | while read -r id ; do
+        [ "$(__ak_apt_parse_version "${id#*#}" | cut -d' ' -f1)" = "$version" ] && echo "$id"
+    done | head -n1)"
+    [ -n "$id" ] || return 0
+    a='' apt-cache $__EPM_APT_REPO_OPTIONS whatdepends "$id" 2>/dev/null | grep "kernel-modules-.*-$flavour#" | \
+        sed -e 's|-[^-]*-[^-]*$||' -e 's|^ *||' | sort -u | while read -r id ; do
+            echo "${id%%#*} $(__ak_apt_parse_version "${id#*#}" | cut -d' ' -f1)"
+    done
+}
+
+__ak_install()
+{
+    local yes=''
+    [ -n "$non_interactive" ] || [ -n "$force" ] && yes='-y'
+    if __ak_is_dnf ; then
+        local items='' i modules=''
+        for i in "$@" ; do
+            case "$i" in
+                *=*)
+                    items="$items ${i%%=*}-${i#*=}"
+                    ;;
+                *)
+                    items="$items $i"
+                    ;;
+            esac
+            case "$i" in
+                kernel-modules-*)
+                    modules="$modules ${i%%=*}"
+                    ;;
+            esac
+        done
+        sudocmd $DNFCMD $yes $(subst_option dryrun --assumeno) $(subst_option download_only --downloadonly) $(__alt_dnf_installonly_opt $modules) install $items
+        local RES=$?
+        # dnf returns error on --assumeno
+        [ -n "$dryrun" ] && return 0
+        return $RES
+    fi
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS install -o APT::Install::Virtual=true $yes $reinstall $(subst_option dryrun --simulate) $(subst_option download_only -d) "$@"
+}
+
+__ak_remove()
+{
+    local yes=''
+    [ -n "$non_interactive" ] || [ -n "$force" ] && yes='-y'
+    if __ak_is_dnf ; then
+        local items='' i
+        for i in "$@" ; do
+            items="$items ${i%%=*}-${i#*=}"
+        done
+        # dnf removes kernel modules for removed kernels as dependent packages
+        sudocmd $DNFCMD $yes $(subst_option dryrun --assumeno) remove $items
+        local RES=$?
+        [ -n "$dryrun" ] && return 0
+        return $RES
+    fi
+    sudocmd apt-get $yes $(subst_option dryrun --simulate) remove "$@"
+}
+
+
+
+__ak_uname_r()
+{
+    a='' uname -r
+}
+
+__ak_flavour_from_release()
+{
+    local f="${1#*-}"
+    echo "${f%-*}"
+}
+
+__ak_version_from_release()
+{
+    local ver="${1%%-*}" rel="${1##*-}"
+    echo "$ver-$rel"
+}
+
+__ak_evrdtcmp()
+{
+    local v
+    v="$(a='' rpmevrcmp "$1" "$3")"
+    if [ "$v" = "0" ] && [ -n "$2" ] && [ -n "$4" ] ; then
+        [ "$2" -gt "$4" ] 2>/dev/null && v=1
+        [ "$2" -lt "$4" ] 2>/dev/null && v=-1
+    fi
+    echo "$v"
+}
+
+__ak_version_le()
+{
+    [ "$(__ak_evrdtcmp "$1" '' "$2" '')" -le 0 ]
+}
+
+__ak_max_line()
+{
+    local max='' maxv='' maxbt='' line v bt rest
+    while read -r v bt rest ; do
+        [ -n "$v" ] || continue
+        if [ -z "$maxv" ] || [ "$(__ak_evrdtcmp "$v" "$bt" "$maxv" "$maxbt")" -gt 0 ] ; then
+            maxv="$v"
+            maxbt="$bt"
+            max="$(echo "$v $bt $rest" | sed -e 's| *$||')"
+        fi
+    done
+    [ -n "$max" ] && echo "$max"
+    return 0
+}
+
+__ak_sort_versions_desc()
+{
+    local lines max
+    lines="$(cat | grep -v '^ *$')"
+    while [ -n "$lines" ] ; do
+        max="$(echo "$lines" | __ak_max_line)"
+        echo "$max"
+        lines="$(echo "$lines" | awk -v m="$max" '!done && $0 == m { done = 1 ; next } { print }')"
+    done
+}
+
+__ak_pkg_version()
+{
+    if __ak_repo_versions "$1" | grep -q "^$2 " ; then
+        echo "$1=$2"
+    else
+        echo "$1"
+    fi
+}
+
+__ak_max_version()
+{
+    __ak_max_line
+}
+
+__ak_installed_modules()
+{
+    a='' rpm -qa --qf '%{NAME}\n' "kernel-modules-*-$1" 2>/dev/null | sed -e "s|^kernel-modules-||" -e "s|-$1\$||" | sort -u
+}
+
+__ak_next_flavours()
+{
+    local cutoff="${1:-0.0}" mainline="$2"
+    __ak_repo_kernels | sed -e 's|^kernel-image-||' | grep -E '^(std-def|un-def|[0-9]+\.[0-9]+) ' | \
+        { if [ -n "$mainline" ] ; then cat ; else grep -v -E ' [^ ]*\brc[0-9]' ; fi ; } | \
+        while read -r flavour version bt ; do
+            __ak_version_le "$cutoff" "$version" && echo "$version $bt $flavour"
+        done | __ak_sort_versions_desc | cut -d' ' -f3 | awk '!seen[$0]++'
+}
+
+__ak_x11_setup_drv()
+{
+    [ -x /usr/bin/Xorg ] || return 0
+    echo "$*" | grep -q -E "drm|fglrx|nvidia" || return 0
+    [ -x /usr/bin/x11setupdrv ] && sudocmd /usr/bin/x11setupdrv
+    if [ -x /usr/sbin/x11presetdrv ] ; then
+        sudocmd /usr/sbin/x11presetdrv
+    else
+        message "You might need to run x11presetdrv: video drivers updated but /usr/sbin/x11presetdrv is missing"
+    fi
+    sudocmd ldconfig
+}
+
+__ak_list_kernels()
+{
+    local kernel_flavour="$1"
+    local uname_r rflv def now
+    uname_r="$(__ak_uname_r)"
+    rflv="${kernel_flavour:-$(__ak_flavour_from_release "$uname_r")}"
+    def="$(readlink /boot/vmlinuz 2>/dev/null)"
+    def="${def#vmlinuz-}"
+    now="$(date +%s)"
+
+    local repo installed
+    repo="$(__ak_repo_kernels | grep "^kernel-image-${kernel_flavour}")"
+    installed="$(a='' rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{BUILDTIME}\n' "kernel-image-${kernel_flavour}*" 2>/dev/null | grep -v -- "-debuginfo ")"
+    [ -n "$kernel_flavour" ] && installed="$(echo "$installed" | grep "^kernel-image-$kernel_flavour ")"
+
+    message 'List of available kernels:'
+    local files
+    files="$(a='' rpm -qa --qf '[%{NAME}\t%{FILENAMES}\n]' 'kernel-*' 2>/dev/null)"
+
+    local count=0 pkg version bt flv kver mark addons
+    while read -r pkg version bt ; do
+        [ -n "$pkg" ] || continue
+        flv="${pkg#kernel-image-}"
+        kver="${version%-*}-$flv-${version##*-}"
+        mark="   "
+        echo "$repo" | grep -q "^$pkg $version " && mark="  *"
+        if [ -n "$bt" ] && [ "$bt" -gt 0 ] 2>/dev/null ; then
+            printf "%s %7s %s" "$mark" "($(( (now - bt) / 86400 )) d)" "$pkg-$version"
+        else
+            printf "%s %7s %s" "$mark" "?" "$pkg-$version"
+        fi
+        if a='' rpm -q "$pkg-$version" >/dev/null 2>&1 ; then
+            [ "$def" = "$kver" ] && printf ' [default]' || printf ' [installed]'
+        elif [ "$mark" = "  *" ] && [ "$rflv" = "$flv" ] ; then
+            printf ' <--- upgrade'
+        fi
+        [ "$uname_r" = "$kver" ] && printf ' RUNNING'
+        addons="$(echo "$files" | grep -e "/lib/modules/$kver/" -e "	/usr/include/linux-${version%-*}-$flv\$" | cut -f1 | sort -u | \
+            grep -v "^$pkg\$" | sed -e "s|^kernel-modules-||" -e "s|^kernel-||" -e "s|-$flv\$||" | xargs)"
+        [ -n "$addons" ] && printf ' | %s' "$addons"
+        echo
+        count=$((count + 1))
+    done <<EOF
+$( { echo "$repo" ; echo "$installed" ; } | sort -u -k1,2 | awk '{ print $2, $3, $1 }' | __ak_sort_versions_desc | awk '{ print $3, $1, $2 }' | tac)
+EOF
+    if [ "$count" -eq 0 ] ; then
+        message "Nothing found."
+    else
+        message "[*] Latest available in repo. (d) Package age in days."
+    fi
+}
+
+__ak_parse_release()
+{
+    local r="$1" ver flv rel
+    r="${r#kernel-image-}"
+    if echo "$r" | grep -q -E '^[0-9]+\.[0-9]+[-=#][0-9:]+\.[0-9]+\.[0-9.]+-[^-]+$' ; then
+        # package format with x.y flavour: 6.18-6.18.44-alt1
+        flv="${r%%[-=#]*}"
+        rel="${r#"$flv"[-=#]}"
+        ak_release="${rel#*:}"
+    elif echo "$r" | grep -q -E '^[0-9]+\.[0-9.]+-.*-[^-]+$' ; then
+        # uname -r compatible format
+        ver="${r%%-*}"
+        rel="${r##*-}"
+        flv="${r#"$ver"-}"
+        flv="${flv%-"$rel"}"
+        ak_release="$ver-$rel"
+    elif echo "$r" | grep -q -E '^(kernel-image-)?.*[-=#][0-9:]+\.[0-9.]+-[^-]+$' ; then
+        # package format
+        ver="${r#kernel-image-}"
+        flv="${ver%[-=#]*-*}"
+        rel="${ver#"$flv"[-=#]}"
+        ak_release="${rel#*:}"
+    else
+        ak_release="$r"
+        return 0
+    fi
+    if [ -n "$ak_flavour" ] && [ "$ak_flavour" != "$flv" ] ; then
+        fatal 'Kernel flavour from -t $ak_flavour does not match flavour from -r ($flv).'
+    fi
+    ak_flavour="$flv"
+    ak_user_flavour="-r"
+}
+
+epm_alt_update_kernel_help()
+{
+    message 'epm update-kernel - install the latest kernel and external modules (the same as update-kernel)
+Usage: epm update-kernel [options]
+
+Options:
+  -l, --list           list available kernels
+  -a, --all            select all available kernel modules to install
+  -i, --interactive    interactive modules selection (via fzf)
+  -H, --headers        add kernel headers to install
+  --debuginfo          add debuginfo package to install
+  --fw, --firmware     add firmware packages to install
+  -A modulename        include (add) external module (by a short name)
+  -D modulename        exclude (del) external module from install
+  -f, -y, --force      force kernel upgrade
+  -t, --type           select desired kernel flavour (6.12, std-def, etc),
+                       by default it is the same as the booted kernel,
+                       latest selects the newest flavour, mainline also allows -rc kernels
+  -r, --release        desired kernel release for the current or specified flavour
+                       (alt1, 6.12.10-alt1, 6.12.10-6.12-alt1, kernel-image-6.12-6.12.10-alt1)
+  -u, --update         update package database before
+  -n, --dry-run        simulate install
+  -d, --download-only  download packages, but do not install
+  --no-kernel          exclude the kernel-image from install
+
+Run epm remove-old-kernels to uninstall unused kernels.
+'
+}
+
+epm_alt_update_kernel()
+{
+    local ak_flavour='' ak_release='' ak_user_flavour=''
+    local all='' list='' headers='' debuginfo='' firmware='' nokernel='' update=''
+    local addmodules='' delmodules='' opt
+    local interactive_select=''
+    while [ -n "$1" ] ; do
+        opt="$1"
+        case "$opt" in
+            -t|--type)
+                ak_flavour="$2"
+                ak_user_flavour="-t"
+                shift
+                ;;
+            -r|--release)
+                local release_arg="$2"
+                shift
+                ;;
+            -a|--all)
+                all=1
+                ;;
+            -l|--list)
+                list=1
+                ;;
+            -i|--interactive)
+                interactive_select=1
+                ;;
+            -A|--add)
+                addmodules="$addmodules $2"
+                shift
+                ;;
+            -D|--del)
+                delmodules="$delmodules $2"
+                shift
+                ;;
+            -H|--headers)
+                headers=1
+                ;;
+            --fw|--firmware)
+                firmware=1
+                ;;
+            --debuginfo)
+                debuginfo=1
+                ;;
+            --no-kernel)
+                nokernel=1
+                ;;
+            -u|--update)
+                update=1
+                ;;
+            -h|--help)
+                epm_alt_update_kernel_help
+                return
+                ;;
+            -d|--download-only)
+                download_only="--download-only"
+                ;;
+            -n|--dry-run)
+                dryrun="--dry-run"
+                ;;
+            -f|-y|--force)
+                force="--force"
+                ;;
+            --reinstall)
+                reinstall="--reinstall"
+                ;;
+            -v|--verbose)
+                verbose="--verbose"
+                ;;
+            *)
+                fatal 'Unknown option $opt for update-kernel'
+                ;;
+        esac
+        shift
+    done
+    [ -n "$release_arg" ] && __ak_parse_release "$release_arg"
+
+    if [ -n "$update" ] ; then
+        docmd epm update || return
+    else
+        epm --quiet repo status >/dev/null 2>&1 || warning "Your package database is not up to date. Run # epm update"
+    fi
+
+    local uname_r current_flavour
+    uname_r="$(__ak_uname_r)"
+    if [ -n "$UPDATE_KERNEL_SYS_FLAVOUR" ] ; then
+        current_flavour="$UPDATE_KERNEL_SYS_FLAVOUR"
+    else
+        current_flavour="$(__ak_flavour_from_release "$uname_r")"
+    fi
+
+    # mainline is latest with -rc kernels
+    local mainline=''
+    if [ "$ak_flavour" = "mainline" ] ; then
+        mainline=1
+        ak_flavour=latest
+    fi
+    if [ "$ak_flavour" = "latest" ] ; then
+        ak_flavour="$(__ak_next_flavours "" "$mainline" | head -n1)"
+        [ -n "$ak_flavour" ] || fatal "Latest flavour not found."
+        info 'Currently available latest flavour is $ak_flavour'
+    fi
+
+    if [ -n "$list" ] ; then
+        __ak_list_kernels "$ak_flavour"
+        return
+    fi
+
+    local current_kernel_package
+    current_kernel_package="$(a='' rpm -qf --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' "/boot/vmlinuz-$uname_r" 2>/dev/null)" || current_kernel_package=''
+    if [ -n "$current_kernel_package" ] ; then
+        info 'Running kernel: $current_kernel_package'
+    else
+        info 'Running kernel: $uname_r is not from package'
+    fi
+
+    local kernel_flavour="${ak_flavour:-$current_flavour}"
+
+    # get available kernels, switch to the next flavour if the current one is not available
+    local kernels
+    kernels="$(__ak_repo_versions "kernel-image-$kernel_flavour")"
+    if [ -z "$kernels" ] ; then
+        info 'There are no available kernels with flavour $kernel_flavour'
+        [ -z "$ak_user_flavour" ] || fatal 'Remove $ak_user_flavour to attempt an automatic upgrade.'
+        local current_kver="$uname_r"
+        echo "$kernel_flavour" | grep -q -E '^[0-9]+\.[0-9]+$' && current_kver="$kernel_flavour"
+        info 'Searching for a newer flavour (>= $current_kver) ...'
+        kernel_flavour="$(__ak_next_flavours "$current_kver" | tail -n1)"
+        [ -n "$kernel_flavour" ] || fatal "No newer flavours found. Use -t to select another flavour."
+        info 'Upgrade to the next available flavour $kernel_flavour'
+        kernels="$(__ak_repo_versions "kernel-image-$kernel_flavour")"
+    fi
+
+    if [ -n "$ak_release" ] ; then
+        kernels="$(echo "$kernels" | while read -r version bt ; do
+            [ "$version" = "$ak_release" ] || [ "${version#*-}" = "$ak_release" ] && echo "$version $bt"
+        done)"
+        [ -n "$kernels" ] || fatal 'There are no available $kernel_flavour kernels with package release $ak_release'
+    fi
+
+    local kmax kmaxver kmaxbt
+    kmax="$(echo "$kernels" | __ak_max_version)"
+    kmaxver="${kmax% *}"
+    kmaxbt="${kmax#* }"
+    [ -n "$kmaxver" ] || fatal "Requested kernel not found."
+
+    if a='' rpm -q "kernel-image-$kernel_flavour-$kmaxver" >/dev/null 2>&1 ; then
+        info 'Latest available kernel kernel-image-$kernel_flavour-$kmaxver is already installed on your system.'
+    else
+        info 'Latest available kernel is kernel-image-$kernel_flavour-$kmaxver'
+    fi
+    if [ -n "$kmaxbt" ] && [ "$kmaxbt" != "$kmaxver" ] ; then
+        local mons=$(( ($(date +%s) - kmaxbt) / 2592000 ))
+        [ "$mons" -gt 0 ] && warning 'Selected kernel is $mons months old.'
+    fi
+
+    local extra=''
+    # add headers
+    if [ -n "$headers" ] || a='' rpm -q kernel-headers-common >/dev/null 2>&1 ; then
+        extra="$extra $(__ak_pkg_version "kernel-headers-$kernel_flavour" "$kmaxver")"
+    fi
+    # install kernel-headers-modules if there is DKMS because it may need it at once
+    if [ -n "$headers" ] || a='' rpm -q "kernel-headers-modules-$current_flavour" >/dev/null 2>&1 || \
+       a='' rpm -q "kernel-headers-modules-$kernel_flavour" >/dev/null 2>&1 || is_command dkms ; then
+        extra="$extra $(__ak_pkg_version "kernel-headers-modules-$kernel_flavour" "$kmaxver")"
+    fi
+    if [ -n "$debuginfo" ] ; then
+        if [ -n "$(__ak_repo_versions "kernel-image-$kernel_flavour-debuginfo" | grep "^$kmaxver ")" ] ; then
+            extra="$extra kernel-image-$kernel_flavour-debuginfo=$kmaxver"
+        else
+            warning "Debuginfo package not found for the new kernel."
+        fi
+    fi
+    if [ -n "$firmware" ] ; then
+        extra="$extra $(a='' rpm -qa --qf '%{NAME}\n' 'firmware-*' VENDOR='ALT Linux Team' 2>/dev/null | xargs)"
+        a='' rpm -q firmware-linux >/dev/null 2>&1 || extra="$extra firmware-linux"
+    fi
+
+    # available external modules for the target kernel ("name version")
+    local allmodules allnames
+    allmodules="$(__ak_repo_modules "$kernel_flavour" "$kmaxver")"
+    allnames="$(echo "$allmodules" | cut -d' ' -f1 | sed -e "s|^kernel-modules-||" -e "s|-$kernel_flavour\$||" | grep -v -- "-debuginfo\$" | sort -u)"
+    local num_modules
+    num_modules="$(echo $allnames | wc -w)"
+    info 'Kernel $kernel_flavour version $kmaxver has $num_modules external modules.'
+
+    if [ -n "$delmodules" ] ; then
+        local missed
+        missed="$(estrlist exclude "$allnames" "$delmodules")"
+        [ -n "$missed" ] && warning 'Modules requested for exclusion but not found:' $missed
+        allnames="$(estrlist exclude "$delmodules" "$allnames")"
+    fi
+
+    # check if selected kernel has all external modules installed for the booted kernel
+    local lost
+    lost="$(estrlist exclude "$allnames" "$(__ak_installed_modules "$current_flavour")")"
+    lost="$(estrlist exclude "$delmodules" "$lost")"
+    if [ -n "$lost" ] ; then
+        warning 'Selected kernel does not have the following external module(s) which you have installed for your booted $current_flavour kernel:' $lost
+        warning "Do not answer yes if these modules are important for your system."
+    fi
+
+    # select modules: all, user selected, installed for booted or target flavour
+    local selected
+    if [ -n "$all" ] ; then
+        selected="$allnames"
+    else
+        selected="$(estrlist union "$(__ak_installed_modules "$kernel_flavour") $(__ak_installed_modules "$current_flavour") $addmodules")"
+        if [ -n "$interactive_select" ] ; then
+            assure_exists fzf
+            local chosen
+            chosen="$(echo "$allnames" | a='' fzf -m --prompt="Select modules (Tab to mark)> " --header="Kernel $kernel_flavour $kmaxver external modules")"
+            selected="$(estrlist union "$selected $chosen")"
+        fi
+        local missed
+        missed="$(estrlist exclude "$allnames" "$addmodules")"
+        [ -n "$missed" ] && warning 'Modules requested for install but not found:' $missed
+        selected="$(estrlist intersection "$selected" "$allnames")"
+    fi
+
+    local modules='' m mv
+    for m in $selected ; do
+        mv="$(echo "$allmodules" | grep "^kernel-modules-$m-$kernel_flavour " | cut -d' ' -f2 | __ak_max_line)"
+        [ -n "$mv" ] && modules="$modules kernel-modules-$m-$kernel_flavour=$mv"
+    done
+    [ -n "$selected" ] && info 'The following extra modules will be installed:' $selected
+
+    local kernel_to_install=''
+    [ -n "$nokernel" ] || kernel_to_install="kernel-image-$kernel_flavour=$kmaxver"
+
+    # do we need to work?
+    local needwork="$force$reinstall" i
+    if [ -z "$needwork" ] ; then
+        for i in $kernel_to_install $modules $extra ; do
+            a='' rpm -q "$(echo "$i" | sed -e 's|=|-|')" >/dev/null 2>&1 || needwork=1
+        done
+    fi
+    if [ -z "$needwork" ] ; then
+        message "Everything is already installed, thus no upgrade is possible. Use -f to force install."
+        return 0
+    fi
+
+    __ak_install $kernel_to_install $modules $extra || fatal 'Failed to install kernel $kernel_flavour-$kmaxver packages'
+    [ -n "$dryrun" ] || [ -n "$download_only" ] && return 0
+    sync
+    __ak_x11_setup_drv $selected
+}
+
+__ak_backup_kernel_release()
+{
+    [ -f /var/log/wtmp ] || return
+    a='' last -a reboot 2>/dev/null | awk '$ 10 ~ /+/ {print $11; exit }'
+}
+
+epm_alt_remove_old_kernels_help()
+{
+    message 'epm remove-old-kernels - remove old kernels (the same as remove-old-kernels)
+Usage: epm remove-old-kernels [options]
+
+Options:
+  -f, -y, --force   do not ask for removal confirmation
+  -n, --dry-run     just simulate removal
+  -t, --type        remove old kernels for the specified flavour (6.12, un-def, etc)
+  -a, --all         remove old kernels for all flavours (keep latest for each one)
+  -A, --purge       purge other flavours
+  --no-backup       do not keep the backup kernel
+
+Note: currently booted and backup kernels will not be removed.
+The backup kernel is the latest kernel with uptime of more than a day.
+All numeric kernels (x.y) are considered to be a single flavour.
+'
+}
+
+epm_alt_remove_old_kernels()
+{
+    local kernel_flavour='' all='' nobackup='' opt
+    while [ -n "$1" ] ; do
+        opt="$1"
+        case "$opt" in
+            -t|--type)
+                kernel_flavour="$2"
+                shift
+                ;;
+            -a|--all)
+                all=all
+                ;;
+            -A|--purge)
+                all=purge
+                ;;
+            --no-backup)
+                nobackup=1
+                ;;
+            -h|--help)
+                epm_alt_remove_old_kernels_help
+                return
+                ;;
+            -n|--dry-run)
+                dryrun="--dry-run"
+                ;;
+            -f|-y|--force)
+                force="--force"
+                ;;
+            *)
+                fatal 'Unknown option $opt for remove-old-kernels'
+                ;;
+        esac
+        shift
+    done
+
+    local uname_r current_kernel_package current_flavour
+    uname_r="$(__ak_uname_r)"
+    current_kernel_package="$(a='' rpm -qf --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' "/lib/modules/$uname_r/kernel" 2>/dev/null)" || current_kernel_package=''
+    current_flavour="$(__ak_flavour_from_release "$uname_r")"
+    if [ -n "$current_kernel_package" ] ; then
+        info 'Running kernel version: $uname_r'
+    else
+        info 'Running kernel version: $uname_r (package not found)'
+    fi
+
+    # installed kernels as "flavour version buildtime" lines
+    local all_kernels
+    all_kernels="$(a='' rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{BUILDTIME}\n' 'kernel-image-*' 2>/dev/null | grep -v -- "-debuginfo " | sed -e 's|^kernel-image-||')"
+
+    if [ -z "$kernel_flavour" ] && echo "$current_flavour" | grep -q -E '^[0-9]+\.[0-9]+$' ; then
+        # booted into one of x.y flavours
+        kernel_flavour=latest
+    fi
+
+    local flavours
+    if [ -n "$all" ] ; then
+        flavours="$(echo "$all_kernels" | cut -d' ' -f1 | sort -u)"
+    elif [ "$kernel_flavour" = "latest" ] ; then
+        flavours="$(echo "$all_kernels" | grep -v -E ' [^ ]*\brc[0-9]' | cut -d' ' -f1 | grep -E '^(std-def|un-def|[0-9]+\.[0-9]+)$' | sort -u)"
+    elif [ -n "$kernel_flavour" ] ; then
+        flavours="$kernel_flavour"
+    else
+        flavours="$current_flavour"
+    fi
+
+    local backup_package=''
+    if [ -z "$nobackup" ] ; then
+        local backup_release
+        backup_release="$(__ak_backup_kernel_release)"
+        if [ -n "$backup_release" ] && [ "$backup_release" != "$uname_r" ] ; then
+            backup_package="$(a='' rpm -qf --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' "/lib/modules/$backup_release/kernel" 2>/dev/null)" || backup_package=''
+            [ -n "$backup_package" ] && info 'Previous kernel with uptime more than a day: $backup_package (backup)'
+        elif [ -z "$backup_release" ] ; then
+            warning "Backup kernel is not determined."
+        fi
+    fi
+
+    # the highest numeric flavour is used for the newest kernel check
+    local newest_stable_kernel='' newest_stable_flavour
+    newest_stable_flavour="$(echo "$flavours" | grep -E '^[0-9]+\.[0-9]+$' | __ak_max_line)"
+    [ -n "$newest_stable_flavour" ] && newest_stable_kernel="kernel-image-$newest_stable_flavour-$(echo "$all_kernels" | grep "^$newest_stable_flavour " | cut -d' ' -f2,3 | __ak_max_line | cut -d' ' -f1)"
+
+    local flavour versions newest kernel package keep='' remove='' remove_items=''
+    for flavour in $flavours ; do
+        versions="$(echo "$all_kernels" | grep "^$flavour " | cut -d' ' -f2,3 | __ak_sort_versions_desc | tac | cut -d' ' -f1)"
+        newest="kernel-image-$flavour-$(echo "$versions" | tail -n1)"
+        echo "$flavour" | grep -q -E '^[0-9]+\.[0-9]+$' && newest="$newest_stable_kernel"
+        local pkglisted=1
+        [ "$all" = "purge" ] || [ -n "$(__ak_repo_versions "kernel-image-$flavour")" ] || pkglisted=''
+        for kernel in $versions ; do
+            package="kernel-image-$flavour-$kernel"
+            if [ "$package" = "$current_kernel_package" ] || [ "$package" = "$backup_package" ] ; then
+                keep="$keep $package"
+            elif [ "$all" = "purge" ] && [ "$flavour" != "$kernel_flavour" ] ; then
+                remove="$remove $package"
+            elif [ "$all" != "purge" ] && [ -z "$pkglisted" ] ; then
+                # EOL flavour
+                remove="$remove $package"
+            elif [ "$package" = "$newest" ] ; then
+                keep="$keep $package"
+            else
+                remove="$remove $package"
+            fi
+            echo " $remove " | grep -q " $package " && remove_items="$remove_items kernel-image-$flavour=$kernel"
+        done
+    done
+
+    [ -n "$keep" ] && message "Keeping kernels:" $keep
+    if [ -z "$remove" ] ; then
+        message "Nothing to remove."
+        return 0
+    fi
+    message "Will be removing kernels:" $remove
+
+    __ak_remove $remove_items
+}
 
 # File bin/epm-sh-backend:
 
-VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
+VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm dnf5-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
 
 __has_backend_syntax()
 {
-    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z]*:'
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z0-9-]*:'
 }
 
 __has_repo_syntax()
 {
-    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9]*/'
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9._-]*/'
 }
 
 __get_tpmtype() {
@@ -16582,7 +19876,7 @@ __get_tpmtype() {
     local tpmtype="$(echo "$arg" | cut -d: -f1)"
 
     # need first three chars
-    echo "$arg" | grep -q "^[a-z][a-z][a-z-]*:" || return
+    echo "$arg" | grep -q "^[a-z][a-z][a-z0-9-]*:" || return
 
     # aliases
     [ "$tpmtype" = "pkcon" ] && tpmtype="packagekit"
@@ -16601,7 +19895,7 @@ __get_repo_name() {
     # ALT Linux branches
     [ "$trepo" = "sisyphus" ] && trepo="Sisyphus"
     [ "$trepo" = "SS" ] && trepo="Sisyphus"
-    [ "$trepo" = "archive" ] && repo="archive $(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
+    [ "$trepo" = "archive" ] && repo="archive/$(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
 
     # Fedora Copr: copr/owner/project/package
     if [ "$trepo" = "copr" ] ; then
@@ -16616,6 +19910,14 @@ __get_repo_name() {
     # Arch Linux AUR
     if [ "$(echo "$arg" | cut -d/ -f1)" = "aur" ] && [ "$PMTYPE" = "pacman" ] ; then
         repo="aur"
+        name=$(echo "$arg" | cut -d/ -f2)
+        return
+    fi
+
+    # Named repo in sources.list.d
+    local orig_repo="$(echo "$arg" | cut -d/ -f1)"
+    if __find_named_repo_file "$orig_repo" >/dev/null 2>&1 ; then
+        repo="named:$orig_repo"
         name=$(echo "$arg" | cut -d/ -f2)
     fi
 }
@@ -16647,9 +19949,63 @@ __process_backend_arguments() {
         package_groups["$pmtype"]+="$name "
     done
 
+    local dnfcmd res=0
     for pmtype in "${!package_groups[@]}"; do
-        (PMTYPE="$pmtype" PPARGS=1 $func ${package_groups[$pmtype]})
+        dnfcmd="$DNFCMD"
+        case "$pmtype" in
+            dnf5-rpm)
+                dnfcmd="dnf5"
+                ;;
+            dnf-rpm)
+                dnfcmd="dnf"
+                ;;
+        esac
+        (PMTYPE="$pmtype" DNFCMD="$dnfcmd" PPARGS=1 $func ${package_groups[$pmtype]}) || res=$?
     done
+    return $res
+}
+
+__get_alt_mirror_hosts()
+{
+    local f="$CONFIGDIR/mirrors-alt.list"
+    [ -r "$f" ] || return 1
+    # second field is the URL; strip the scheme and path, keep the host
+    awk '{print $2}' "$f" | sed -nE 's|^[a-z]+://([^/]+).*|\1|p' | tr "[:upper:]" "[:lower:]"
+}
+
+__get_alt_mirror_url_by_host()
+{
+    local f="$CONFIGDIR/mirrors-alt.list"
+    local host="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    [ -r "$f" ] || return 1
+    awk -v host="$host" '{
+        url=$2
+        sub(/^[a-z]+:\/\//, "", url)
+        sub(/\/.*/, "", url)
+        if (tolower(url) == host) { print $2; exit }
+    }' "$f"
+}
+
+__get_alt_mirror_baseurl()
+{
+    local repolo src alt_lines url host
+    repolo="$(echo "${1:-}" | tr "[:upper:]" "[:lower:]")"
+    src="$(__get_system_sourceslist)"
+    # enabled rpm lines with http(s) URLs, preferring the ones for the requested branch
+    # the branch is a path component in the DIST field (e.g. .../p10/branch/... or p10/branch/...)
+    if [ -n "$repolo" ] ; then
+        alt_lines="$(echo "$src" | grep -E '^[[:space:]]*rpm.*https?://' | grep -iE "(^|[ /])$repolo(/|$)" || true)"
+    fi
+    [ -n "$alt_lines" ] || alt_lines="$(echo "$src" | grep -E '^[[:space:]]*rpm.*https?://')"
+    [ -n "$alt_lines" ] || return 1
+    # take the first http(s) URL from the selected lines
+    url="$(echo "$alt_lines" | sed -nE 's|.*[[:space:]](https?://[^[:space:]]*).*|\1|p' | head -1)"
+    [ -n "$url" ] || return 1
+    host="$(echo "$url" | sed -nE 's|^https?://([^/]+).*|\1|p' | tr "[:upper:]" "[:lower:]")"
+    [ -n "$host" ] || return 1
+    # reuse the mirror only if its host is one of the known ALT mirrors
+    __get_alt_mirror_hosts 2>/dev/null | grep -Fxq "$host" || return 1
+    __get_alt_mirror_url_by_host "$host"
 }
 
 __generate_alt_sourceslist()
@@ -16667,9 +20023,10 @@ __generate_alt_sourceslist()
     else
         local repo="$1"
         repolo="$(echo "$repo" | tr "[:upper:]" "[:lower:]")"
-        baseurl="http://ftp.basealt.ru/pub/distributions"
+        # reuse the configured known mirror (URL already includes the ALTLinux path)
+        baseurl="$(__get_alt_mirror_baseurl "$repo" 2>/dev/null)"
+        [ -n "$baseurl" ] || baseurl="http://ftp.basealt.ru/pub/distributions/ALTLinux"
         [ "$repolo" = "sisyphus" ] && repopart="Sisyphus" || repopart="$repo/branch"
-        repopart="ALTLinux/$repopart"
     fi
 
     # sign logic from __get_sign in epm-addrepo
@@ -16693,10 +20050,14 @@ __generate_alt_sourceslist()
     esac
 }
 
+__epm_apt_cache_dir()
+{
+    echo "${BIGTMPDIR:-/var/tmp}/eepm/apt-cache"
+}
+
 __setup_tmp_apt_dir()
 {
-    __EPM_APT_TMPDIR="$(mktemp -d)" || fatal
-    remove_on_exit "$__EPM_APT_TMPDIR"
+    __EPM_APT_TMPDIR="$(__epm_apt_cache_dir)"
     mkdir -p "$__EPM_APT_TMPDIR/lists/partial" "$__EPM_APT_TMPDIR/sourceparts"
     cat > "$__EPM_APT_TMPDIR/apt.conf" <<EOF
 Dir::Etc::sourcelist "$__EPM_APT_TMPDIR/sources.list";
@@ -16706,13 +20067,22 @@ Dir::Cache::pkgcache "$__EPM_APT_TMPDIR/pkgcache.bin";
 Dir::Cache::srcpkgcache "$__EPM_APT_TMPDIR/srcpkgcache.bin";
 EOF
     __EPM_APT_REPO_OPTIONS="-c $__EPM_APT_TMPDIR/apt.conf"
+    # symlink existing system apt lists to avoid re-downloading on update
+    # (refresh: drop dangling links from a previous run, then link current files)
+    find "$__EPM_APT_TMPDIR/lists/" -maxdepth 1 -type l ! -exec test -e {} \; -delete 2>/dev/null
+    ln -sf /var/lib/apt/lists/*.* "$__EPM_APT_TMPDIR/lists/" 2>/dev/null
 }
 
 __get_system_sourceslist()
 {
-    cat /etc/apt/sources.list 2>/dev/null
+    if [ -n "$EPM_APT_SOURCES_LIST" ] ; then
+        cat "$EPM_APT_SOURCES_LIST" 2>/dev/null
+        return
+    fi
+    local root="${EPM_APT_SOURCES_ROOT:-}"
+    cat "$root/etc/apt/sources.list" 2>/dev/null
     local f
-    for f in /etc/apt/sources.list.d/*.list ; do
+    for f in "$root/etc/apt/sources.list.d"/*.list ; do
         [ -s "$f" ] || continue
         cat "$f"
     done
@@ -16746,9 +20116,113 @@ __use_tmp_apt_for_branch()
 __use_tmp_apt_for_tasks()
 {
     __setup_tmp_apt_dir
-    { __get_system_sourceslist ; __generate_task_sourceslist "$@" ; } > "$__EPM_APT_TMPDIR/sources.list"
+    { __get_system_sourceslist ; echo ; __generate_task_sourceslist "$@" ; } > "$__EPM_APT_TMPDIR/sources.list"
     # tolerate partial failures (some system repos may have broken GPG keys etc.)
     __epm_update || warning "Some repos failed to update, but continuing anyway"
+}
+
+__find_named_repo_file()
+{
+    local name="$1"
+
+    case $PMTYPE in
+        dnf-*|dnf5-*|yum-*)
+            local f
+            for f in /etc/yum.repos.d/$name.repo /etc/yum.repos.d/alt-$name.repo ; do
+                [ -s "$f" ] && echo "$f" && return
+            done
+            return 1
+            ;;
+    esac
+
+
+    [ -n "$APT_SOURCES_LIST_D" ] || return 1
+
+    local file="$APT_SOURCES_LIST_D/$name.list"
+    [ -s "$file" ] && echo "$file" && return
+
+    return 1
+}
+
+__get_named_repo_lines()
+{
+    local file="$1"
+    # output active lines as-is
+    grep "^\(rpm\|deb\)" "$file" 2>/dev/null
+    # uncomment disabled lines
+    grep "^#[[:space:]]*\(rpm\|deb\)" "$file" 2>/dev/null | sed 's/^#[[:space:]]*//'
+}
+
+__use_tmp_apt_with_named_repo()
+{
+    local name="$1"
+    local file
+    file="$(__find_named_repo_file "$name")" || fatal "Can't find repo '$name' in sources.list.d"
+    __setup_tmp_apt_dir
+    # skip duplicates: the same source twice makes apt-get update hang (downloads to the same partial file)
+    { __get_system_sourceslist ; __get_named_repo_lines "$file" ; } | awk 'NF { $1=$1 ; if (!seen[$0]++) print }' > "$__EPM_APT_TMPDIR/sources.list"
+    __epm_update || warning "Some repos failed to update, but continuing anyway"
+}
+
+__use_tmp_dnf_for_branch()
+{
+    local repo="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    local baseurl arch ids='' vendor=''
+    __EPM_DNF_REPO_OPTIONS=''
+    # dnf reads APT-RPM repos: use APT-RPM indexes (available on all mirrors)
+    if __alt_dnf_supports_aptrpm ; then
+        baseurl="$(__alt_dnf_aptrpm_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+        vendor="$(__alt_dnf_aptrpm_vendor "$repo")"
+        # the vendor key of a branch does not sign old packages: check them by all ALT keys
+        local keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-$repo"
+        case "$repo" in
+            sisyphus|deferred*)
+                keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-sisyphus"
+                ;;
+        esac
+        __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+        for arch in $(__alt_dnf_archlist) ; do
+            __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS $(__alt_dnf_aptrpm_repo_options "tmp-$repo-$arch" "$baseurl/$arch" classic "$vendor") --setopt=tmp-$repo-$arch.gpgkey=file://$keyfile"
+            ids="$ids${ids:+,}tmp-$repo-$arch"
+        done
+        __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repo=$ids"
+        return
+    fi
+    baseurl="$(__alt_dnf_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    for arch in $(__alt_dnf_archlist) ; do
+        __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repofrompath=tmp-$repo-$arch,$baseurl/$arch --setopt=tmp-$repo-$arch.gpgcheck=1"
+        ids="$ids${ids:+,}tmp-$repo-$arch"
+    done
+    __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repo=$ids"
+}
+
+__use_tmp_dnf_for_tasks()
+{
+    local tn url vendor arch comp
+    __EPM_DNF_REPO_OPTIONS=''
+    for tn in "$@" ; do
+        url="$(eget --get-real-url "https://git.altlinux.org/tasks/$tn/build/repo")" || { warning "Can't access task $tn repo" ; continue ; }
+        url="${url%/}"
+        vendor="$(get_task_sign "$tn" | tr -d '[]')"
+        while read -r arch comp ; do
+            [ -n "$comp" ] || continue
+            __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS $(__alt_dnf_aptrpm_repo_options "tmp-task-$tn-$arch" "$url/$arch" "$comp" "$vendor")"
+        done <<EOF
+$(__alt_dnf_aptrpm_probe_url "$url")
+EOF
+    done
+    [ -n "$__EPM_DNF_REPO_OPTIONS" ]
+}
+
+__use_dnf_with_named_repo()
+{
+    local name="$1"
+    local file
+    file="$(__find_named_repo_file "$name")" || fatal "Can't find repo '$name' in /etc/yum.repos.d"
+    local ids
+    ids="$(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' "$file" | tr '\n' ',' | sed -e 's|,$||')"
+    [ -n "$ids" ] || fatal "There are no repos in $file"
+    __EPM_DNF_REPO_OPTIONS="--enablerepo=$ids"
 }
 
 __process_repo_arguments() {
@@ -16770,23 +20244,199 @@ __process_repo_arguments() {
         repo_groups["$repo"]+="$name "
     done
 
+    local res=0
     for repo in "${!repo_groups[@]}"; do
         if [ "$repo" = '.' ] ; then
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         elif [ "$repo" = 'aur' ] ; then
             # Arch Linux AUR
-            (PMTYPE=aur-pacman PPARGS=1 $func ${repo_groups[$repo]})
+            (PMTYPE=aur-pacman PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         elif startwith "$repo" "copr/" ; then
             # Fedora Copr: enable repo, then install
             epm repo add "$repo"
             epm update
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+        elif [ "$BASEDISTRNAME" = "alt" ] && [ "$PMTYPE" != "apt-rpm" ] ; then
+            case "$repo" in
+                archive/*)
+                    fatal 'Repo $repo is not supported for $PMTYPE on ALT'
+                    ;;
+                named:*)
+                    __use_dnf_with_named_repo "${repo#named:}"
+                    ;;
+                *)
+                    __use_tmp_dnf_for_branch "$repo"
+                    ;;
+            esac
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+            __EPM_DNF_REPO_OPTIONS=''
+        elif startwith "$repo" "archive/" ; then
+            # ALT Linux archive: archive/DATE/package -> use current branch + date
+            local datestr="${repo#archive/}"
+            datestr="$(echo "$datestr" | sed 's|-|/|g')"
+            __use_tmp_apt_for_branch archive "$DISTRVERSION" "$datestr" || return 1
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+        elif startwith "$repo" "named:" ; then
+            # Named repo from sources.list.d
+            local reponame="${repo#named:}"
+            __use_tmp_apt_with_named_repo "$reponame" || return 1
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         else
             # ALT Linux: use temporary APT directory instead of modifying system repos
             __use_tmp_apt_for_branch "$repo" || return 1
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         fi
     done
+    return $res
+}
+
+# File bin/epm-sh-create-rpm:
+
+
+__set_name_version_by_tarball()
+{
+    local tarname
+    tarname="$(basename "$1" .tar)"
+    name="$(echo "$tarname" | sed -E 's/-[0-9][^-]*$//')"
+    version="$(echo "$tarname" | sed -E 's/^.*-([0-9])/\1/')"
+    if [ "$name" = "$tarname" ] || [ -z "$version" ] ; then
+        name="$tarname"
+        version="0"
+    fi
+}
+
+
+__set_yaml_field_if_empty()
+{
+    local yaml_file="$1"
+    local field="$2"
+    local value="$3"
+    grep -q "^${field}:" "$yaml_file" && return
+    echo "${field}: ${value}" >> "$yaml_file"
+}
+
+
+__fill_yaml_from_tarball()
+{
+    local yaml_file="$1"
+    local tarball="$2"
+
+    [ -e "$yaml_file" ] || touch "$yaml_file"
+
+    local name version
+    __set_name_version_by_tarball "$tarball"
+
+    __set_yaml_field_if_empty "$yaml_file" "name" "$name"
+    __set_yaml_field_if_empty "$yaml_file" "version" "$version"
+    __set_yaml_field_if_empty "$yaml_file" "release" "1"
+    __set_yaml_field_if_empty "$yaml_file" "license" "unknown"
+    __set_yaml_field_if_empty "$yaml_file" "group" "Converted/unknown"
+}
+
+
+__set_name_version_by_yaml()
+{
+    yaml_load_vars "$1" name version
+}
+
+
+__generate_spec_by_yaml()
+{
+    local yaml_file="$1"
+    local tmpbuilddir="$2"
+
+    local name version release summary license group
+    local description url upstream_file upstream_url
+    local requires provides conflicts obsoletes buildarch
+
+    yaml_load_vars "$yaml_file" name version release summary description upstream_file upstream_url url group license requires provides conflicts obsoletes buildarch
+
+    [ -n "$summary" ] || summary="$name"
+
+    # description
+    local spec_description
+    if [ -n "$description" ] ; then
+        if [ -n "$upstream_file" ] || [ -n "$upstream_url" ] ; then
+            [ -n "$upstream_url" ] && upstream_file="$upstream_url"
+            [ -n "$upstream_file" ] || upstream_file="binary package $name"
+            spec_description="$description
+(Repacked from $upstream_file with EPM $(epm --short --version))"
+        else
+            spec_description="$description"
+        fi
+    else
+        spec_description="$summary"
+    fi
+
+    # write spec
+    local specfile="$tmpbuilddir/$name.spec"
+    cat > "$specfile" <<EOF
+Name: $name
+Version: $version
+Release: $release
+Summary: $summary
+License: $license
+Group: $group
+EOF
+    [ -n "$url" ] && echo "URL: $url" >> "$specfile"
+    [ -n "$buildarch" ] && echo "BuildArch: $buildarch" >> "$specfile"
+    local r
+    for r in $requires ; do
+        echo "Requires: $r" >> "$specfile"
+    done
+    for r in $provides ; do
+        echo "Provides: $r" >> "$specfile"
+    done
+    for r in $conflicts ; do
+        echo "Conflicts: $r" >> "$specfile"
+    done
+    for r in $obsoletes ; do
+        echo "Obsoletes: $r" >> "$specfile"
+    done
+    cat >> "$specfile" <<EOF
+
+%define _rpmdir ../
+%define _rpmfilename %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm
+%define _unpackaged_files_terminate_build 0
+
+%description
+$spec_description
+
+%files
+EOF
+}
+
+
+__unpack_files_from_tarball()
+{
+    local yaml_file="$1"
+    local tarball="$2"
+    local tmpbuilddir="$3"
+
+    local name version
+    yaml_load_vars "$yaml_file" name version
+
+    local buildroot="$tmpbuilddir/$name-$version"
+    mkdir -p "$buildroot"
+
+    # extract tarball directly to buildroot (resolve path first)
+    # use --here to preserve internal directory structure (don't flatten single dirs)
+    local abstarball
+    abstarball="$(realpath "$tarball")"
+    a='' erc --here -C "$buildroot" unpack "$abstarball" || fatal "Can't extract $tarball"
+
+    # fix permissions for tarball contents
+    chmod $verbose -R a+rX "$buildroot"
+
+    # append %files list to spec
+    local specfile="$tmpbuilddir/$name.spec"
+    ( cd "$buildroot" && find . -mindepth 1 | sed 's|^\./|/|' | LANG=C sort | while read -r f ; do
+        if [ -d "$buildroot$f" ] && [ ! -L "$buildroot$f" ] ; then
+            echo "%dir \"$f\""
+        else
+            echo "\"$f\""
+        fi
+    done ) >> "$specfile"
 }
 
 # File bin/epm-sh-install:
@@ -16795,7 +20445,9 @@ __process_repo_arguments() {
 __fast_hack_for_filter_out_installed_rpm()
 {
     LC_ALL=C xargs -n1 rpm -q 2>&1 | grep 'is not installed' |
-        sed -e 's|^.*package \(.*\) is not installed.*|\1|g'
+        sed -e 's|^.*package \(.*\) is not installed.*|\1|g' |
+        LC_ALL=C xargs -n1 rpm -q --whatprovides 2>&1 | grep 'no package provides' |
+        sed -e 's|^.*no package provides \(.*\)|\1|g'
 }
 
 filter_out_installed_packages()
@@ -16907,11 +20559,11 @@ __epm_check_vendor()
         bi="$(basename $i)"
         if ! epm_status_validate "$i" ; then
             # it is missed package probably (package remove case)
-            if is_installed "$i" ; then
+            if is_installed_real "$i" ; then
                 warning 'Can'\''t get any info for $i package. Scripts are DISABLED for package $bi. Use --scripts if you need run scripts from such packages.'
                 noscripts="--noscripts"
             fi
-            # don't set --noscripts for non existent packages (will run scripts when remove by provides, see https://github.com/Etersoft/eepm/issues/236)
+            # don't set --noscripts for virtual or non existent packages (will run scripts when remove by provides, see https://github.com/Etersoft/eepm/issues/236)
             continue
         fi
 
@@ -16946,7 +20598,8 @@ __epm_repack_if_needed()
     local f
     for f in "$@" ; do
         [ "$(get_package_type "$f")" = "$PKGFORMAT" ] && continue
-        docmd exec epm repack --install "$@"
+        docmd epm repack --install "$@"
+        exit
     done
     return 1
 }
@@ -16954,9 +20607,16 @@ __epm_repack_if_needed()
 
 # File bin/epm-sh-repo:
 
-APT_SOURCES_LIST="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list"
-APT_SOURCES_LIST_D="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list.d"
-APT_ALL_SOURCES_LIST="$APT_SOURCES_LIST_D/*.list $APT_SOURCES_LIST_D/*.sources $APT_SOURCES_LIST"
+
+if [ -n "$EPM_APT_SOURCES_LIST" ] ; then
+    APT_SOURCES_LIST="$EPM_APT_SOURCES_LIST"
+    APT_SOURCES_LIST_D=''
+    APT_ALL_SOURCES_LIST="$EPM_APT_SOURCES_LIST"
+else
+    APT_SOURCES_LIST="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list"
+    APT_SOURCES_LIST_D="${EPM_APT_SOURCES_ROOT%/}/etc/apt/sources.list.d"
+    APT_ALL_SOURCES_LIST="$APT_SOURCES_LIST_D/*.list $APT_SOURCES_LIST_D/*.sources $APT_SOURCES_LIST"
+fi
 
 __convert_deb822_to_oneline()
 {
@@ -17033,7 +20693,7 @@ __deb822_remove()
 
 __filter_repos_list()
 {
-    local i
+    local i pattern
     [ -z "$*" ] && cat && return
 
     # Check if this is a full repo line (rpm or deb) - use literal matching for the entire string
@@ -17042,8 +20702,106 @@ __filter_repos_list()
         return
     fi
 
+    local result
+    result="$(cat)"
+
+    # process each argument preserving spaces in patterns
+    for i in "$@" ; do
+        case "$i" in
+            ~*)
+                # exclusion pattern
+                pattern="${i#\~}"
+                [ -z "$regexp" ] && pattern=$(__epm_glob_to_regexp "$pattern")
+                result="$(echo "$result" | grep -E -i -v -- "$pattern")"
+                ;;
+            *)
+                # inclusion pattern (AND logic)
+                pattern="$i"
+                [ -z "$regexp" ] && pattern=$(__epm_glob_to_regexp "$pattern")
+                result="$(echo "$result" | grep -E -i -- "$pattern")"
+                ;;
+        esac
+    done
+
+    [ -n "$result" ] && echo "$result"
+}
+
+__epm_dnf_set_repo_enabled()
+{
+    local value="$1"
+    shift
+    local repo f ids found
+    for repo in "$@" ; do
+        found=''
+        for f in /etc/yum.repos.d/*.repo ; do
+            [ -e "$f" ] || continue
+            if [ "$f" = "/etc/yum.repos.d/$repo.repo" ] || [ "$f" = "/etc/yum.repos.d/alt-$repo.repo" ] ; then
+                ids="*"
+            elif grep -q -F "[$repo]" "$f" ; then
+                ids="$repo"
+            else
+                continue
+            fi
+            found=1
+            local tmpfile
+            tmpfile=$(mktemp) || fatal
+            remove_on_exit $tmpfile
+            awk -v ids="$ids" -v value="$value" '
+                /^\[.*\]/ { insec = (ids == "*" || $0 == "[" ids "]"); print; if (insec) print "enabled=" value; next }
+                insec && /^[[:space:]]*enabled[[:space:]]*=/ { next }
+                { print }' "$f" >$tmpfile
+            cmp -s $tmpfile "$f" && continue
+            chmod 644 $tmpfile
+            sudocmd cp $tmpfile "$f"
+        done
+        [ -n "$found" ] || warning 'Repo $repo is not found in /etc/yum.repos.d'
+    done
+    return 0
+}
+
+# File bin/epm-sh-search:
+
+
+__epm_get_longest_word()
+{
+    local longest=""
+    local word
+    for word in "$@" ; do
+        # skip exclusion patterns
+        case "$word" in
+            ~*) continue ;;
+        esac
+        # clean glob characters for PM search
+        word=$(echo "$word" | sed -e "s/[?*\[\]]//g")
+        [ -z "$word" ] && continue
+        if [ ${#word} -gt ${#longest} ] ; then
+            longest="$word"
+        fi
+    done
+    echo "$longest"
+}
+
+__epm_glob_to_regexp()
+{
+    local pattern="$1"
+    # escape: . { } +
+    # keep \ ^ $ ( ) | [ ] for extended patterns and escaping
+    echo "$pattern" | sed \
+        -e 's|[.{}+]|\\&|g' \
+        -e 's|\*|.*|g' \
+        -e 's|?|.|g' \
+        -e 's|\[!|\[^|g'
+}
+
+__epm_build_grep_filter()
+{
+    local i
+    [ -z "$*" ] && return
+
     local list=""
     local listN=""
+
+    # separate include and exclude patterns
     for i in "$@" ; do
         case "$i" in
             ~*)
@@ -17055,24 +20813,66 @@ __filter_repos_list()
         esac
     done
 
-    # convert glob to regexp
-    list=$(__convert_glob__to_regexp "$list")
-    listN=$(__convert_glob__to_regexp "$listN")
+    list=$(echo "$list" | sed 's/^ *//' | sed 's/ *$//')
+    listN=$(echo "$listN" | sed 's/^ *//' | sed 's/ *$//' | sed 's/ /|/g')
 
-    listN=$(strip_spaces $listN | sed -e 's/ /|/g')
+    # convert to regexp (unless --regexp mode)
+    if [ -z "$regexp" ] ; then
+        list=$(__epm_glob_to_regexp "$list")
+        listN=$(__epm_glob_to_regexp "$listN")
+    fi
 
-    local result
-    result="$(cat)"
+    # short mode: strip description
+    if [ -n "$short" ] ; then
+        echon " | sed -e 's| .*||g'"
+    fi
 
-    # exclude patterns
-    [ -n "$listN" ] && result="$(echo "$result" | grep -E -i -v -- "$listN")"
+    # exclusion filter
+    [ -n "$listN" ] && echon " | grep -E -i -v -- \"$listN\""
 
-    # include patterns (AND)
-    for i in $list ; do
-        result="$(echo "$result" | grep -E -i -- "$i")"
+    # inclusion filters (one per word if multiple)
+    local word_count
+    word_count=$(echo "$list" | wc -w)
+    if [ "$word_count" -gt 1 ] ; then
+        for i in $list ; do
+            echon " | grep -E -i -- \"$i\""
+        done
+    fi
+
+    # colorize matches
+    local COLO=""
+    for i in $list $listN ; do
+        [ -n "$COLO" ] && COLO="$COLO|"
+        COLO="$COLO$i"
     done
 
-    [ -n "$result" ] && echo "$result"
+    if [ -n "$list" ] ; then
+        echon " | grep -E -i $EGREPCOLOR -- \"($COLO)\""
+    fi
+}
+
+__epm_colorize_pkg_names()
+{
+    if [ -z "$USETTY" ] ; then
+        cat
+        return
+    fi
+
+    # Use awk for reliable ANSI color handling
+    awk -v cyan="$(printf '\033[36m')" -v reset="$(printf '\033[0m')" '
+    {
+        if (match($0, /^[^ ]+ - /)) {
+            # format: "package - description"
+            pkg = substr($0, 1, index($0, " - ") - 1)
+            rest = substr($0, index($0, " - "))
+            print cyan pkg reset rest
+        } else if (match($0, /^[^ ]+$/)) {
+            # format: "package" only
+            print cyan $0 reset
+        } else {
+            print
+        }
+    }'
 }
 
 # File bin/epm-sh-warmup:
@@ -17190,8 +20990,8 @@ _epm_do_simulate()
 
     case $PMTYPE in
         apt-rpm|apt-dpkg)
-            CMD="apt-get --simulate install"
-            ;;
+            dryrun=--dry-run __epm_apt_install "$@"
+            return $? ;;
         aptitude-dpkg)
             CMD="aptitude -s install"
             ;;
@@ -17211,7 +21011,7 @@ EOF
             return $RES ;;
         dnf-rpm|dnf5-rpm)
             set_sudo
-            store_output sudocmd dnf --assumeno install $filenames
+            store_output sudocmd $DNFCMD --assumeno install $filenames
             __check_yum_result $RC_STDOUT $?
             RES=$?
             clean_store_output
@@ -17241,8 +21041,8 @@ EOF
             done
             return $res ;;
         opkg)
-            docmd --noaction install $filenames
-            return $res ;;
+            docmd opkg --noaction install $filenames
+            return $? ;;
         pacman)
             set_sudo
             store_output sudocmd pacman -v -S $filenames <<EOF
@@ -17297,7 +21097,6 @@ epm_simulate()
     fi
     return $RES
 }
-
 
 # File bin/epm-site:
 
@@ -17544,7 +21343,7 @@ epm_status_supported() {
     local distro
     distro=$(epm print info -s)
     case "$distro" in
-        alt|redos|rosa*|mos|fedora|debian|ubuntu)
+        alt|redos|rosa*|mos|astra|fedora|debian|ubuntu)
             return 0
             ;;
         *)
@@ -17558,6 +21357,36 @@ epm_status_validate()
     local pkg="$1"
     local version="$(epm print field Version for "$pkg" 2>/dev/null)"
     [ -n "$version" ]
+}
+
+__epm_status_have_sign()
+{
+    local pkg="$1"
+    local sig="$(epm print field sigpgp for "$pkg" 2>/dev/null)"
+    [ "$sig" != "(none)" ] && return 0
+    # check DSA signature (old packages signed with DSA key)
+    sig="$(epm print field siggpg for "$pkg" 2>/dev/null)"
+    [ "$sig" != "(none)" ]
+}
+
+epm_status_signed()
+{
+    local pkg="$1"
+    case $DISTRNAME in
+        ALTLinux)
+            # use alt-rpmkeys-checksig for cryptographic signature verification
+            assure_exists alt-rpmkeys-checksig alt-rpmkeys-utils || return 1
+            if [ -n "$quiet" ] ; then
+                alt-rpmkeys-checksig "$pkg" >/dev/null 2>&1
+            else
+                docmd alt-rpmkeys-checksig "$pkg"
+            fi
+            ;;
+        *)
+            # TODO: implement for other distros
+            return 1
+            ;;
+    esac
 }
 
 epm_status_original()
@@ -17638,6 +21467,18 @@ epm_status_original()
             echo "$release" | grep -qi "debian" || return 1
             return 0
             ;;
+        AstraLinux*)
+            epm_status_validate $pkg || return 1
+            epm_status_repacked $pkg && return 1
+
+            local maintainer="$(epm print field Maintainer for "$pkg" 2>/dev/null)"
+            echo "$release" | grep -qi "astra" && return 0
+            echo "$maintainer" | grep -q "astralinux" && return 0
+            echo "$maintainer" | grep -q "rusbitech" && return 0
+            echo "$maintainer" | grep -q "Debian" && return 0
+            echo "$maintainer" | grep -q "@debian.org" && return 0
+            return 1
+            ;;
         *)
             warning 'Status checking is not supported yet for $DISTRNAME'
             return 1
@@ -17651,7 +21492,7 @@ epm_status_repacked()
     local pkg="$1"
 
     # dpkg package missing packager field
-    local repacked="$(epm print field Description for "$1" 2>/dev/null | grep -i "alien")"
+    local repacked="$(epm print field Description for "$1" 2>/dev/null | grep -i "with EPM")"
     local packager="$(epm print field Packager for "$1" 2>/dev/null)"
 
     #is_installed $pkg || fatal "FIXME: implemented for installed packages as for now"
@@ -17732,6 +21573,18 @@ epm_status_thirdparty()
             epm_status_repacked $pkg && return 1
             return 0
             ;;
+        astra)
+            epm_status_validate $pkg || return 1
+
+            local release="$(epm print release from package "$pkg" 2>/dev/null)"
+            echo "$release" | grep -qi "astra" && return 1
+            echo "$maintainer" | grep -q "Debian" && return 1
+            echo "$maintainer" | grep -q "@debian.org" && return 1
+            echo "$maintainer" | grep -q "astralinux" && return 1
+            echo "$maintainer" | grep -q "rusbitech" && return 1
+            epm_status_repacked $pkg && return 1
+            return 0
+            ;;
         *)
             fatal "Unsupported $BASEDISTRNAME"
             ;;
@@ -17790,7 +21643,7 @@ epm_status()
             epm_status_repacked "$@"
             return
             ;;
-        --validate)           # HELPOPT: check if package is accessible (we can get fields from it)
+        --valid)              # HELPOPT: check if package is accessible (we can get fields from it)
             epm_status_validate "$@"
             return
             ;;
@@ -18012,14 +21865,11 @@ __save_available_packages()
 
 __epm_update_content_index()
 {
-case $BASEDISTRNAME in
-    "alt")
+case $PMTYPE in
+    apt-rpm)
         update_alt_contents_index
         return
         ;;
-esac
-
-case $PMTYPE in
     apt-dpkg)
         is_command apt-file || return 0
         try_assure_exists apt-file || return 0
@@ -18031,13 +21881,40 @@ esac
 
 __epm_list_content_index()
 {
-case $BASEDISTRNAME in
-    "alt")
+case $PMTYPE in
+    apt-rpm)
         cat $ALT_CONTENTS_INDEX_LIST
         return
         ;;
 esac
 
+}
+
+__epm_update_apt()
+{
+    # hack against cd to cwd in apt-get on ALT
+    case $PMTYPE in
+        apt-rpm) cd / ;;
+    esac
+
+    local APTOPTIONS="$dryrun $(subst_option non_interactive -y) $(subst_option debug "-o Acquire::Verbose=1 -o Debug::pkgAcquire::Auth=1 -o Debug::identcdrom=1 -o Debug::Acquire::http=1 ")"
+    local UPDATE_LOG
+    UPDATE_LOG="$(mktemp)" || fatal
+    remove_on_exit "$UPDATE_LOG"
+    local CMDSTATUS="$UPDATE_LOG.status"
+    showcmd apt-get $__EPM_APT_REPO_OPTIONS update $APTOPTIONS
+    ( sudorun apt-get $__EPM_APT_REPO_OPTIONS update $APTOPTIONS 2>&1 ; echo $? >"$CMDSTATUS" ) | tee "$UPDATE_LOG"
+    ret="$(cat "$CMDSTATUS")"
+    rm -f "$CMDSTATUS"
+
+    case $PMTYPE in
+        apt-rpm) cd - >/dev/null ;;
+    esac
+
+    if [ "$ret" != "0" ] && [ -z "$quiet" ] ; then
+        __analyze_apt_update_errors "$UPDATE_LOG"
+    fi
+    return $ret
 }
 
 __epm_update()
@@ -18055,41 +21932,10 @@ case $PMTYPE in
         ;;
 esac
 
-case $BASEDISTRNAME in
-    "alt")
-        # TODO: hack against cd to cwd in apt-get on ALT
-        cd /
-        local APTOPTIONS="$dryrun $(subst_option non_interactive -y) $(subst_option debug "-o Acquire::Verbose=1 -o Debug::pkgAcquire::Auth=1 -o Debug::identcdrom=1 -o Debug::Acquire::http=1 ")"
-        local UPDATE_LOG
-        UPDATE_LOG="$(mktemp)" || fatal
-        remove_on_exit "$UPDATE_LOG"
-        local CMDSTATUS="$UPDATE_LOG.status"
-        showcmd apt-get $__EPM_APT_REPO_OPTIONS update $APTOPTIONS
-        ( sudorun apt-get $__EPM_APT_REPO_OPTIONS update $APTOPTIONS 2>&1 ; echo $? >"$CMDSTATUS" ) | tee "$UPDATE_LOG"
-        ret="$(cat "$CMDSTATUS")"
-        rm -f "$CMDSTATUS"
-        cd - >/dev/null
-        if [ "$ret" != "0" ] && [ -z "$quiet" ] ; then
-            __analyze_apt_update_errors "$UPDATE_LOG"
-        fi
-        return $ret
-        ;;
-esac
-
-
 case $PMTYPE in
-    apt-rpm)
-        # TODO: hack against cd to cwd in apt-get on ALT
-        cd /
-        sudocmd apt-get $__EPM_APT_REPO_OPTIONS update
-        ret="$?"
-        cd - >/dev/null
-        return $ret
-        ;;
-    apt-dpkg)
-        sudocmd apt-get update || return
-        # apt-get update retrieve Contents file too
-        #sudocmd apt-file update
+    apt-rpm|apt-dpkg)
+        __epm_update_apt
+        return
         ;;
     apm-rpm)
         sudocmd apm system update
@@ -18106,11 +21952,8 @@ case $PMTYPE in
     yum-rpm)
         sudocmd yum makecache
         ;;
-    dnf-rpm)
-        sudocmd dnf makecache
-        ;;
-    dnf5-rpm)
-        sudocmd dnf5 makecache
+    dnf-rpm|dnf5-rpm)
+        sudocmd $DNFCMD makecache --refresh
         ;;
     urpm-rpm)
         sudocmd urpmi.update -a
@@ -18270,6 +22113,11 @@ epm_upgrade_alt_tasks()
         [ -n "$tn" ] && task_numbers="$task_numbers $tn"
     done
 
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        __epm_install_alt_task_files "$installlist" $task_numbers
+        return
+    fi
+
     local res
     __use_tmp_apt_for_tasks $task_numbers || return 1
     (pkg_names="$installlist" epm_install)
@@ -18293,6 +22141,36 @@ epm_upgrade()
     return $_ret
 }
 
+__epm_upgrade_download_only()
+{
+    # named packages/files/urls: download to the current dir (as install --download-only does)
+    if [ -n "$pkg_names$pkg_files$pkg_urls" ] ; then
+        (pkg_names="$pkg_names" pkg_files="$pkg_files" pkg_urls="$pkg_urls" epm_install)
+        return $?
+    fi
+
+    # bare: download all upgradable packages via the native backend flag (into the package cache)
+    info "Downloading packages for upgrade ..."
+    case $PMTYPE in
+        apt-rpm|apt-dpkg)
+            sudocmd apt-get $__EPM_APT_REPO_OPTIONS $(subst_option non_interactive -y) -d dist-upgrade
+            ;;
+        dnf-rpm|dnf5-rpm)
+            sudocmd $DNFCMD $(subst_option non_interactive -y) upgrade --downloadonly
+            ;;
+        yum-rpm)
+            sudocmd yum $(subst_option non_interactive -y) upgrade --downloadonly
+            ;;
+        pacman)
+            sudocmd pacman -Suw $(subst_option non_interactive --noconfirm) $force
+            ;;
+        *)
+            warning 'Download only for "upgrade all" is not implemented for $PMTYPE, specify package names'
+            return 1
+            ;;
+    esac
+}
+
 __epm_upgrade_do()
 {
     local CMD
@@ -18308,7 +22186,7 @@ __epm_upgrade_do()
             return
         fi
 
-        if [ -z "$*" ] ; then
+        if [ -z "$*" ] && [ -z "$download_only" ] ; then
             __epm_check_container_issue_43533
 
             __check_upgrade_conditions || fatal "upgrade conditions is not satisfied."
@@ -18326,6 +22204,11 @@ __epm_upgrade_do()
     if [ -n "$pkg_urls" ] ; then
         info "Downloading packages assigned to upgrade ..."
         __handle_pkg_urls_to_install
+    fi
+
+    if [ -n "$download_only" ] ; then
+        __epm_upgrade_download_only "$@"
+        return
     fi
 
     info "Running command for upgrade packages"
@@ -18353,12 +22236,15 @@ __epm_upgrade_do()
     case $PMTYPE in
     apt-rpm|apt-dpkg)
         local APTOPTIONS="$dryrun $(subst_option non_interactive -y) $(subst_option debug "-V -o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
-        if [ -n "$parallel" ] && [ "$BASEDISTRNAME" = "alt" ] ; then
+        if [ -n "$parallel" ] && [ "$PMTYPE" = "apt-rpm" ] ; then
             info "Downloading packages to the cache... "
             __epm_alt_download_to_cache $APTOPTIONS dist-upgrade
         fi
 
-        CMD="apt-get $__EPM_APT_REPO_OPTIONS $APTOPTIONS $noremove $force_yes dist-upgrade"
+        # --force-yes is deprecated in Debian apt, use --allow-* instead
+        local apt_force_yes="$force_yes"
+        [ "$PMTYPE" = "apt-dpkg" ] && [ "$apt_force_yes" = "--force-yes" ] && apt_force_yes="--allow-unauthenticated --allow-downgrades --allow-change-held-packages"
+        CMD="apt-get $__EPM_APT_REPO_OPTIONS $APTOPTIONS $noremove $apt_force_yes dist-upgrade"
         ;;
     apm-rpm)
         CMD="apm system upgrade"
@@ -18376,8 +22262,14 @@ __epm_upgrade_do()
         CMD="yum $OPTIONS upgrade $*"
         ;;
     dnf-rpm|dnf5-rpm)
-        local OPTIONS="$(subst_option non_interactive -y)"
-        CMD="dnf $OPTIONS upgrade $*"
+        local OPTIONS="$(subst_option non_interactive -y) $(subst_option dryrun --assumeno) $__EPM_DNF_REPO_OPTIONS"
+        # keep kernel modules for all installed kernels
+        if [ "$BASEDISTRNAME" = "alt" ] ; then
+            OPTIONS="$OPTIONS $(__alt_dnf_installonly_opt)"
+        fi
+        CMD="$DNFCMD $OPTIONS upgrade"
+        # dnf returns error on --assumeno
+        local ignore_dryrun_error="$dryrun"
         ;;
     snappy)
         CMD="snappy update"
@@ -18468,7 +22360,10 @@ __epm_upgrade_do()
         ;;
     esac
 
-    sudocmd $CMD "$@"
+    sudocmd $CMD "$@" && return
+    local RES=$?
+    [ -n "$ignore_dryrun_error" ] && return 0
+    return $RES
 
 }
 
@@ -18490,8 +22385,8 @@ epm_whatdepends()
     local CMD
     local pkg
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         [ -n "$@" ] || fatal "Missed package name or some provides"
         pkg="$(print_name "$@")"
 
@@ -18535,7 +22430,8 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         # check command: dnf repoquery --whatrequires
-        CMD="dnf repoquery --whatrequires"
+        # --whatrequires takes the next arg as its value, so it must be the last option
+        CMD="$DNFCMD repoquery $([ -n "$short" ] && echo '--qf %{name}\n') --whatrequires"
         ;;
     emerge)
         assure_exists equery
@@ -18666,7 +22562,7 @@ case $PMTYPE in
         CMD="urpmq --whatprovides"
         ;;
     dnf-rpm|dnf5-rpm)
-        CMD="dnf repoquery --whatprovides"
+        CMD="$DNFCMD repoquery --whatprovides"
         ;;
     zypper-rpm)
         CMD="zypper what-provides"
@@ -18808,6 +22704,7 @@ pkgvendor()
     [ "$DISTRIB_ID" = "openSUSETumbleweed" ] && echo "suse" && return
     [ "$DISTRIB_ID" = "openSUSELeap" ] && echo "suse" && return
     [ "$DISTRIB_ID" = "UBLinux" ] && echo "ublinux" && return
+    [ "$DISTRIB_ID" = "OpenWrt" ] && echo "openwrt" && return
     if [ -n "$VENDOR_ID" ] ; then
         echo "$VENDOR_ID"
         return
@@ -19205,18 +23102,29 @@ case "$DISTRIB_ID" in
             DISTRIB_RELEASE="$(echo "$VERSION" | sed 's| branch||')"
         fi
         DISTRIB_CODENAME="$DISTRIB_RELEASE"
-        # FIXME: fast hack for fallback: 10.1 -> p10 for /etc/os-release
-        if echo "$DISTRIB_RELEASE" | grep -q "^0" ; then
+        # Ximper Linux is based on ALT Sisyphus regardless of its product
+        # version (for example, VERSION_ID=1.0 must not become p1).
+        if [ "$DISTRO_NAME" = "Etersoft Ximper" ] ; then
+            DISTRIB_RELEASE="Sisyphus"
+            DISTRIB_CODENAME="$DISTRIB_RELEASE"
+        # ALT_BRANCH_ID identifies the package repository branch and is more
+        # precise than deriving it from the product version (10.2.1 -> p10).
+        elif [ -n "$ALT_BRANCH_ID" ] ; then
+            if [ "$ALT_BRANCH_ID" = "sisyphus" ] ; then
+                DISTRIB_RELEASE="Sisyphus"
+                DISTRIB_FULL_RELEASE="$DISTRIB_RELEASE"
+            else
+                DISTRIB_RELEASE="$ALT_BRANCH_ID"
+            fi
+            DISTRIB_CODENAME="$DISTRIB_RELEASE"
+        # FIXME: fast hack for fallback: 10.1 -> p10 for old /etc/os-release
+        elif echo "$DISTRIB_RELEASE" | grep -q "^0" ; then
             DISTRIB_RELEASE="Sisyphus"
             DISTRIB_CODENAME="$DISTRIB_RELEASE"
         elif echo "$DISTRIB_RELEASE" | grep -q "^[0-9]" && echo "$DISTRIB_RELEASE" | grep -q -v "[0-9][0-9][0-9]"  ; then
             DISTRIB_CODENAME="$(echo p$DISTRIB_RELEASE | sed -e 's|\..*||')"
             # TODO: change p10 to 10
             DISTRIB_RELEASE="$DISTRIB_CODENAME"
-        elif [ "$ALT_BRANCH_ID" = "sisyphus" ] ; then
-            DISTRIB_RELEASE="Sisyphus"
-            DISTRIB_CODENAME="$DISTRIB_RELEASE"
-            DISTRIB_FULL_RELEASE="$DISTRIB_RELEASE"
         fi
         ;;
     "ALTServer")
@@ -19646,9 +23554,54 @@ get_core_count()
     echo $detected
 }
 
+get_proc_core_mhz()
+{
+    LC_ALL=C awk -F: '/^cpu MHz[[:space:]]*:/ && $2 + 0 > 0 { printf "%d\n", $2; exit }' "$ROOTDIR/proc/cpuinfo" 2>/dev/null
+}
+
+# CPUFreq attributes are in kHz. Missing/zero values do not mean 0 MHz.
+get_cpufreq_mhz()
+{
+    LC_ALL=C awk 'NF == 1 && $1 ~ /^[0-9]+$/ && $1 + 0 > 0 { printf "%.3f\n", $1 / 1000; exit }' "$1" 2>/dev/null | sed 's/0*$//; s/\.$//'
+}
+
+get_cpufreq_info()
+{
+    local policy cpus current maximum separator="" found=""
+    for policy in "$ROOTDIR"/sys/devices/system/cpu/cpufreq/policy* ; do
+        [ -d "$policy" ] || continue
+        current="$(get_cpufreq_mhz "$policy/scaling_cur_freq")"
+        maximum="$(get_cpufreq_mhz "$policy/cpuinfo_max_freq")"
+        [ -n "$current$maximum" ] || continue
+        cpus="$(cat "$policy/related_cpus" 2>/dev/null | awk '{$1=$1; print}')"
+        [ -z "$cpus" ] || cpus=" (CPUs $cpus)"
+        current="${current:+$current MHz}"
+        maximum="${maximum:+$maximum MHz}"
+        printf '%s%s%s: current %s, max %s' "$separator" "${policy##*/}" "$cpus" "${current:-unknown}" "${maximum:-unknown}"
+        separator="; "
+        found=1
+    done
+    [ -n "$found" ]
+}
+
 get_core_mhz()
 {
-    cat /proc/cpuinfo | grep "cpu MHz" | head -n1 | cut -d':' -f2 | cut -d' ' -f2 | cut -d'.' -f1
+    local detected="$(get_proc_core_mhz)"
+    # Keep the historical numeric output where /proc/cpuinfo supplies MHz.
+    [ -z "$detected" ] || { echo "$detected"; return; }
+    get_cpufreq_info || printf 'unknown'
+    echo
+}
+
+get_cpu_frequency_info()
+{
+    local detected="$(get_proc_core_mhz)"
+    if [ -n "$detected" ] ; then
+        echo "$detected MHz"
+    else
+        get_cpufreq_info || printf 'unknown'
+        echo
+    fi
 }
 
 
@@ -19749,7 +23702,7 @@ distro_info v$PROGVERSION $EV: Copyright © 2007-2026 Etersoft
             Base OS name (-o) / CPU arch (-a): $(get_base_os_name) $(get_arch)
                  CPU norm register size  (-b): $(get_bit_size) bit
                           Virtualization (-i): $(get_virt)
-                        CPU Cores/MHz (-c/-z): $(get_core_count) / $(get_core_mhz) MHz
+                        CPU Cores/MHz (-c/-z): $(get_core_count) / $(get_cpu_frequency_info)
                       System memory size (-m): $(get_memory_size) MiB
                  Running service manager (-y): $(get_service_manager)
             Bug report URL (--bug-report-url): $(print_bug_report_url)
@@ -19770,7 +23723,7 @@ print_help()
     echo " -i                     - print virtualization type"
     echo " -m                     - print system memory size (in MB)"
     echo " -y|--service-manager   - print running service manager"
-    echo " -z                     - print current CPU MHz"
+    echo " -z                     - print current CPU MHz (CPUFreq domains if unavailable in /proc/cpuinfo)"
     echo " --glibc-version        - print system glibc version"
     echo
     echo " -d|--base-distro-name  - print distro id (short distro name)"
@@ -20164,7 +24117,7 @@ filter_glob()
 {
 	[ -z "$1" ] && cat && return
 	# translate glob to regexp
-	grep "$(echo "$1" | sed -e 's|\.|\\.|g' -e 's|\*|.*|g' -e 's|\?|.|g' )$"
+	grep "$(echo "$1" | sed -e 's|\.|\\.|g' -e 's|\*|.*|g' )$"
 }
 
 filter_order()
@@ -20219,6 +24172,14 @@ is_strange_url()
     return 1
 }
 
+# A downloaded package/binary is never HTML. If we got an HTML page the server
+# most likely redirected to a landing/error page - reject it and do not cache.
+is_html_file()
+{
+    LANG=C head -c 1024 "$1" 2>/dev/null \
+        | grep -qiE '<!doctype html|<html[ >]|<head[ >]'
+}
+
 is_ipfs_hash()
 {
     # CIDv0: starts with Qm, 46 chars, alphanumeric only
@@ -20256,8 +24217,8 @@ is_rsyncurl()
 # SSH/rsync URL: user@host:/path or host:/path (but not scheme://)
 is_sshurl()
 {
-    # Exclude scheme:// first, then match host:path
-    case "$1" in *://*) return 1 ;; *:*) return 0 ;; esac
+    # Exclude scheme:// and scheme:/ first, then match host:path
+    case "$1" in *://*) return 1 ;; *:/*) return 1 ;; *:*) return 0 ;; esac
     return 1
 }
 
@@ -20290,6 +24251,7 @@ __calc_avg_filtered()
     # Calculate mean and standard deviation, filter outliers, return average
     echo "$values" | awk '{
         n = NF
+        if (n == 0) { print "0"; exit }
         sum = 0
         for (i = 1; i <= n; i++) sum += $i
         avg = sum / n
@@ -20312,6 +24274,19 @@ __calc_avg_filtered()
     }'
 }
 
+# Get current time in nanoseconds (integer) for precise timing
+# Falls back to seconds if %N is not supported (BusyBox)
+__get_time_ns()
+{
+    local t
+    t=$(date +%s%N 2>/dev/null)
+    # If %N not supported, date outputs literal 'N' — fall back to seconds
+    case "$t" in
+        *N*) echo "$(date +%s)000000000" ;;
+        *) echo "$t" ;;
+    esac
+}
+
 # Single speedtest measurement with timeout (returns speed in MB/s)
 # Downloads to temp file using eget, counts bytes with pv or wc -c
 # Args: URL [timeout] [total_size]
@@ -20321,25 +24296,28 @@ __speedtest_single()
     local timeout="${2:-3}"
     local total_size="$3"
     local tmpfile start_time end_time size
+    local maxsize_opt=""
+
+    [ "$MAXSIZE_VALUE" ] && maxsize_opt="--max-size $MAXSIZE_VALUE"
 
     tmpfile=$(mktemp)
-    start_time=$(date +%s.%N)
+    start_time=$(__get_time_ns)
     if [ -n "$verbose" ] && which pv >/dev/null 2>&1 ; then
         # pv shows progress to stderr (-s for total size if known)
         local pv_opts="-f"
         [ -n "$total_size" ] && pv_opts="$pv_opts -s $total_size"
-        timeout "$timeout" eget -q -O - "$URL" 2>/dev/null | pv $pv_opts > "$tmpfile" || true
+        eget -q --read-timeout "$timeout" $maxsize_opt -O - "$URL" 2>/dev/null | pv $pv_opts > "$tmpfile" || true
     else
-        timeout "$timeout" eget -q --force -O "$tmpfile" "$URL" 2>/dev/null || true
+        eget -q --force --read-timeout "$timeout" $maxsize_opt -O "$tmpfile" "$URL" 2>/dev/null || true
     fi
-    end_time=$(date +%s.%N)
+    end_time=$(__get_time_ns)
     size=$(wc -c < "$tmpfile")
     rm -f "$tmpfile"
 
-    # Calculate speed: size / time in MB/s
+    # Calculate speed: size / time_ns in MB/s
     echo "$size $start_time $end_time" | awk '{
-        time = $3 - $2
-        if (time > 0) printf "%.2f", ($1 / time) / 1024 / 1024
+        time_ns = $3 - $2
+        if (time_ns > 0) printf "%.2f", ($1 / (time_ns / 1000000000)) / 1024 / 1024
         else print "0"
     }'
 }
@@ -20390,6 +24368,7 @@ USERAGENT=''
 HEADER_VALUE=''
 TIMEOUT_VALUE=''
 READTIMEOUT_VALUE=''
+MAXSIZE_VALUE=''
 TRIES_VALUE=''
 COOKIES_FILE=''
 USEOUTPUTDIR=''
@@ -20437,8 +24416,18 @@ eget_help()
 {
 cat <<EOF
 
-eget - wget like downloader wrapper with wildcard support in filename part of URL
-Usage: eget [options] http://somesite.ru/dir/na*.log
+eget - wget like downloader wrapper with wildcard (*) support in filename part of URL
+
+Usage modes:
+  eget [options] URL                      - download a single file by direct URL
+  eget [options] URL URL2 URL3            - download multiple files
+  eget [options] "http://site/dir/*.rpm"  - wildcard in URL: the URL is split into
+                                  directory + mask, the directory listing page is fetched
+                                  and files matching the mask are downloaded
+  eget [options] http://site/page "*.rpm" - page search: eget fetches any page HTML,
+                                  extracts all links (<a href=...>) and downloads those
+                                  matching the mask (works on any page with links, not
+                                  just directory listings, e.g. release pages)
 
 Options:
     -q|--quiet                - quiet mode
@@ -20461,17 +24450,21 @@ Options:
     --force|--allow-overwrite - force overwrite existing file
     -N|--timestamping         - only download if remote file is newer than local
     -i|--input-file FILE      - read URLs from FILE, one per line; each line can contain multiple mirror URLs (use - for stdin)
-    -T|--timeout=N            - set  the network timeout to N seconds
-    --read-timeout=N          - set the read (and write) timeout to N seconds
+    -T|--timeout=N            - set the connection timeout to N seconds
+    --read-timeout|--max-time=N - set the read/total timeout to N seconds
+    --max-size=N              - limit download size to N bytes (Range header or curl --max-filesize)
     --retry-connrefused       - consider “connection refused” a transient error and try again
     -t|--tries                - set number of tries to number. Specify 0 or ‘inf’ for infinite retrying
     --load-cookies file       - load cookies from file before the first HTTP retrieval
+
+EGET specific options:
     --latest                  - print only latest version of a file
     --second-latest           - print only second to latest version of a file
     --allow-mirrors           - try mirrors from EGET_MIRRORS if url is not accessible
     --trust-server-names      - use the name specified by the redirection
-
     --list|--list-only        - print only URLs
+
+Commands:
     --check-url URL           - check if the URL exists (returns HTTP 200 OK)
     --check-site URL          - check if the site is accessible (returns HTTP 200 OK or 404 Not found)
     --get-response URL        - get response with all headers (ever if HEAD is not acceptable)
@@ -20479,6 +24472,9 @@ Options:
     --get-filesize URL        - print file size in bytes (via Content-Length)
     --get-real-url URL        - print URL after all redirects
     --get-ipfs-cid URL        - print CID for URL (after all redirects)
+    --speedtest URL           - measure download speed for the URL
+    --tsv                     - output --speedtest results in TSV format
+    --measurements N       - number of measurements for --speedtest (default: 3)
 
 Supported URLs:
   ftp:// http:// https:// file:/ ipfs:// rsync:// [user@]host:/path
@@ -20486,13 +24482,20 @@ Supported URLs:
 Supported backends (set like EGET_BACKEND=curl)
   wget, curl and partially aria2c, axel, rsync
 
-Also you can set EGET_OPTIONS variable with needed options
-Set EGET_MIRRORS to override default mirrors for --allow-mirrors (default: eterfund mirrors)
+Environment variables:
+  EGET_BACKEND              - force specific backend (wget, wget2, curl, aria2c, axel)
+  EGET_OPTIONS              - extra options applied after command line args
+  EGET_MIRRORS              - override default mirrors for --allow-mirrors
+  EGET_WGET_OPTIONS         - extra options passed to wget
+  EGET_CURL_OPTIONS         - extra options passed to curl
+  EGET_ARIA2_OPTIONS        - extra options passed to aria2c
+  EGET_AXEL_OPTIONS         - extra options passed to axel
 
 Examples:
   $ eget http://ftp.somesite.ru/package-*.x64.tar
   $ eget http://ftp.somesite.ru/package *.tar
   $ eget https://github.com/owner/project package*.ext
+  $ eget https://disk.yandex.ru/d/HASH
   $ eget -O myname ipfs://QmVRUjnsnxHWkjq91KreCpUk4D9oZEbMwNQ3rzdjwND5dR
   $ eget --list http://ftp.somesite.ru/package-*.tar
   $ eget --check-url http://ftp.somesite.ru/test
@@ -20504,7 +24507,7 @@ EOF
 
 
 if [ -z "$1" ] ; then
-    echo "eget - wget like downloader wrapper with wildcard support, uses wget or curl as backend" >&2
+    echo "eget - wget like downloader wrapper with wildcard (*) support, uses wget or curl as backend" >&2
     echo "Run $0 --help to get help" >&2
     exit 1
 fi
@@ -20603,6 +24606,15 @@ while [ -n "$1" ] ; do
         --speedtest)
             SPEEDTEST="$1"
             ;;
+        --measurements)
+            if [ -z "$argvalue" ];then
+                shift
+                argvalue="$1"
+            fi
+            [ -z "$argvalue" ] && fatal "Error: --measurements requires an argument"
+            ! is_numeric "$argvalue" && fatal "Error: --measurements requires a numeric value, got '$argvalue'"
+            SPEEDTEST_COUNT="$argvalue"
+            ;;
         --tsv)
             TSV="$1"
             ;;
@@ -20657,7 +24669,7 @@ while [ -n "$1" ] ; do
             ! is_numeric "$argvalue" && fatal "Error: --timeout requires a numeric value, got '$argvalue'"
             TIMEOUT_VALUE="$argvalue"
             ;;
-        --read-timeout)
+        --read-timeout|--max-time)
             if [ -z "$argvalue" ];then
                 shift
                 argvalue="$1"
@@ -20665,6 +24677,15 @@ while [ -n "$1" ] ; do
             [ -z "$argvalue" ] && fatal "Error: --read-timeout requires an argument"
             ! is_numeric "$argvalue" && fatal "Error: --read-timeout requires a numeric value, got '$argvalue'"
             READTIMEOUT_VALUE="$argvalue"
+            ;;
+        --max-size)
+            if [ -z "$argvalue" ];then
+                shift
+                argvalue="$1"
+            fi
+            [ -z "$argvalue" ] && fatal "Error: --max-size requires an argument"
+            ! is_numeric "$argvalue" && fatal "Error: --max-size requires a numeric value (bytes), got '$argvalue'"
+            MAXSIZE_VALUE="$argvalue"
             ;;
         --retry-connrefused)
             retryconnrefused=1
@@ -20833,12 +24854,38 @@ select_ipfs_mode()
 
 
 # Functions for work with eget ipfs db
+
+# tac all IPFS DB files (last file first, so most recent entries come first)
+__eget_ipfs_db_tac()
+{
+	local f files=""
+	local IFS=': '
+	for f in $EGET_IPFS_DB ; do
+		[ -r "$f" ] && files="$f $files"
+	done
+	IFS=' '
+	for f in $files ; do
+		tac "$f"
+	done
+}
+
+# get last IPFS DB file (for writing)
+__eget_ipfs_db_last()
+{
+	local f last
+	local IFS=': '
+	for f in $EGET_IPFS_DB ; do
+		[ -n "$f" ] && last="$f"
+	done
+	echo "$last"
+}
+
 get_cid_by_url()
 {
     local URL="$1"
-    [ -r "$EGET_IPFS_DB" ] || return
+    [ -n "$EGET_IPFS_DB" ] || return
     is_fileurl "$URL" && return 1
-    tac "$EGET_IPFS_DB" | grep -F "$URL Qm" | cut -f2 -d" " | grep -E "Qm[[:alnum:]]{44}" | head -n1
+    __eget_ipfs_db_tac | grep -F "$URL Qm" | cut -f2 -d" " | grep -E "Qm[[:alnum:]]{44}" | head -n1
 }
 
 put_cid_and_url()
@@ -20846,35 +24893,40 @@ put_cid_and_url()
     local URL="$1"
     local CID="$2"
     local FN="$3"
-    [ -w "$EGET_IPFS_DB" ] || return
+    local DBFILE
+    DBFILE="$(__eget_ipfs_db_last)"
+    [ -w "$DBFILE" ] || return
 
     is_fileurl "$URL" && return
 
-    local ac="$(get_url_by_cid)"
+    local ac="$(get_url_by_cid "$CID")"
     if [ "$ac" = "$URL" ] ; then
         info "CID $CID is already exist as the same URL $URL in IPFS DB, skipping"
         return
     fi
-    echo "$URL $CID $FN" >> "$EGET_IPFS_DB"
-    info "Placed in $EGET_IPFS_DB: $URL $CID $FN"
+    echo "$URL $CID $FN" >> "$DBFILE"
+    info "Placed in $DBFILE: $URL $CID $FN"
 }
 
 get_filename_by_cid()
 {
     local CID="$1"
     [ -z "$EGET_IPFS_DB" ] && basename "$CID" && return
-    tac "$EGET_IPFS_DB" | grep -F " $CID " | head -n1 | cut -f3 -d" "
+    __eget_ipfs_db_tac | grep -F " $CID " | head -n1 | cut -f3 -d" "
 }
 
 get_url_by_cid()
 {
     local CID="$1"
+    [ -z "$CID" ] && fatal "get_url_by_cid: CID is empty"
     [ -z "$EGET_IPFS_DB" ] && echo "$CID" && return
-    tac "$EGET_IPFS_DB" | grep -F " $CID " | head -n1 | cut -f1 -d" "
+    __eget_ipfs_db_tac | grep -F " $CID " | head -n1 | cut -f1 -d" "
 }
 
 ###################
 
+# Save original backend before IPFS autodetection may call eget() recursively
+ORIG_EGET_BACKEND="$EGET_BACKEND"
 
 ipfs_mode="$EGET_IPFS"
 
@@ -20888,10 +24940,11 @@ fi
 
 
 if [ -n "$ipfs_mode" ] && [ -n "$EGET_IPFS_DB" ] ; then
-    ddb="$(dirname "$EGET_IPFS_DB")"
+    DBFILE="$(__eget_ipfs_db_last)"
+    ddb="$(dirname "$DBFILE")"
     if [ -d "$ddb" ] ; then
         info "Using eget IPFS db $EGET_IPFS_DB"
-        [ -r "$EGET_IPFS_DB" ] || touch "$EGET_IPFS_DB"
+        [ -r "$DBFILE" ] || touch "$DBFILE"
     else
         EGET_IPFS_DB=''
     fi
@@ -21031,8 +25084,6 @@ fi
 
 
 
-ORIG_EGET_BACKEND="$EGET_BACKEND"
-
 # override backend by URL type
 if is_fileurl "$1" ; then
     EGET_BACKEND="file"
@@ -21053,9 +25104,15 @@ case "$orig_EGET_BACKEND" in
         RSYNC="$(print_command_path rsync)"
         [ -n "$RSYNC" ] || fatal "There are no rsync in the system. Install it with $ epm install rsync"
         ;;
-    */wget)
+    */wget|*/wget2)
         WGET="$orig_EGET_BACKEND"
         [ -x "$WGET" ] || fatal "There are no $orig_EGET_BACKEND in the system but you forced using it via EGET_BACKEND. Install it with $ epm install wget"
+        EGET_BACKEND="wget"
+        ;;
+    wget2)
+        WGET="$(print_command_path wget2)"
+        [ -n "$WGET" ] || fatal "There are no wget2 in the system but you forced using it via EGET_BACKEND. Install it with $ epm install wget2"
+        EGET_BACKEND="wget"
         ;;
     wget)
         WGET="$(print_command_path wget)"
@@ -21069,15 +25126,17 @@ case "$orig_EGET_BACKEND" in
         CURL="$(print_command_path curl)"
         [ -n "$CURL" ] || fatal "There are no curl in the system but you forced using it via EGET_BACKEND. Install it with $ epm install curl"
         ;;
-    */aria2)
+    */aria2|*/aria2c)
         ARIA2="$orig_EGET_BACKEND"
         [ -x "$ARIA2" ] || fatal "There are no $orig_EGET_BACKEND in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+        EGET_BACKEND="aria2"
         # aria2 needs wget for headers and stdout
         WGET="$(print_command_path wget)"
         ;;
-    aria2)
-        ARIA2="$(print_command_path aria2)"
-        [ -n "$ARIA2" ] || fatal "There are no aria2 in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+    aria2|aria2c)
+        ARIA2="$(print_command_path aria2c || print_command_path aria2)"
+        [ -n "$ARIA2" ] || fatal "There are no aria2c in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+        EGET_BACKEND="aria2"
         # aria2 needs wget for headers and stdout
         WGET="$(print_command_path wget)"
         ;;
@@ -21112,29 +25171,57 @@ case "$orig_EGET_BACKEND" in
         ;;
 esac
 
+# Detect wget2 (incompatible --spider -S output format for header operations)
+# Detect busybox wget (no --version support, lacks --tries and most long options)
+if [ -n "$WGET" ] ; then
+    if $WGET --version 2>&1 | head -1 | grep -q "^GNU Wget2" ; then
+        WGET2=1
+    elif ! $WGET --version >/dev/null 2>&1 ; then
+        BUSYBOX_WGET=1
+    fi
+fi
 
 # Wrapper for wget command with all configured options
 # Defined globally so it can be used by aria2/axel backends for header operations
 __wget()
 {
-    [ "$USEOUTPUTDIR" ] && set -- -P "$USEOUTPUTDIR" "$@"
+    local outputdir="$USEOUTPUTDIR"
+    if [ -n "$WGET2" ] ; then
+        local arg
+        for arg in "$@" ; do
+            case "$arg" in
+                ftp://*|ftps://*)
+                    fatal "wget2 does not support FTP, use EGET_BACKEND=wget or EGET_BACKEND=curl" ;;
+            esac
+        done
+        # wget2 treats absolute -P path as relative to the current dir, so make it relative via ../
+        case "$outputdir" in
+            /*) outputdir="$(echo "$PWD" | sed -e 's|/[^/]*|../|g')${outputdir#/}" ;;
+        esac
+    fi
+    [ "$outputdir" ] && set -- -P "$outputdir" "$@"
     [ "$USERAGENT" ] && set -- -U "$USERAGENT" "$@"
     [ "$trustservernames" ] && set -- --trust-server-names "$@"
     [ "$COOKIES_FILE" ] && set -- --load-cookies "$COOKIES_FILE" "$@"
     # Default: --tries 1 (single attempt), can be overridden
-    set -- --tries "${TRIES_VALUE:-1}" "$@"
+    # busybox wget doesn't support --tries
+    [ -z "$BUSYBOX_WGET" ] && set -- --tries "${TRIES_VALUE:-1}" "$@"
     [ "$retryconnrefused" ] && set -- --retry-connrefused "$@"
-    [ "$READTIMEOUT_VALUE" ] && set -- --read-timeout "$READTIMEOUT_VALUE" "$@"
     [ "$TIMEOUT_VALUE" ] && set -- --timeout "$TIMEOUT_VALUE" "$@"
     [ "$nodirectories" ] && set -- -nd "$@"
     [ "$nosslcheck" ] && set -- --no-check-certificate "$@"
     [ "$HEADER_VALUE" ] && set -- --header="$HEADER_VALUE" "$@"
-    [ "$compressed" ] && set -- --compression=auto "$@"
+    # wget2 requests and decodes compressed content by default and has no --compression=auto
+    [ "$compressed" ] && [ -z "$WGET2" ] && set -- --compression=auto "$@"
     [ "$NOGLOB" ] && set -- --no-glob "$@"
     [ "$showprogress" ] && set -- --show-progress "$@"
     [ "$quiet" ] && set -- -q "$@"
     [ "$FORCEIPV" ] && set -- "$FORCEIPV" "$@"
-    docmd $WGET $EGET_WGET_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $WGET $EGET_WGET_OPTIONS "$@"
+    else
+        docmd $WGET $EGET_WGET_OPTIONS "$@"
+    fi
 }
 
 # wget wrapper for downloads (adds -c/-N flags)
@@ -21142,6 +25229,7 @@ __wget_download()
 {
     [ -n "$CONTINUE" ] && set -- -c "$@"
     [ -n "$TIMESTAMPING" ] && set -- -N "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __wget "$@"
 }
 
@@ -21152,8 +25240,11 @@ __timestamping_download()
     local TARGETFILE="$2"
     local DOWNLOAD_CMD="$3"  # will be "__aria2 ..." or "__axel ..."
 
-    # If file doesn't exist, just download
-    [ ! -f "$TARGETFILE" ] && eval "$DOWNLOAD_CMD" && return
+    # If file doesn't exist or is empty, just download
+    if [ ! -s "$TARGETFILE" ] ; then
+        eval "$DOWNLOAD_CMD"
+        return
+    fi
 
     # Get Last-Modified header
     local remote_modified="$(url_get_header "$URL" "Last-Modified")"
@@ -21185,6 +25276,54 @@ __timestamping_download()
     else
         info "Local file is up to date, skipping download"
     fi
+}
+
+# Transform wget2 -S output to standard HTTP header format
+# wget2 uses ":status: NNN" instead of "HTTP/1.1 NNN Status"
+# and lowercase header names without leading spaces
+__wget2_filter_response()
+{
+	# --save-headers keeps CRLF line endings; wget2 2.x prints "Enqueuing URL" for redirects
+	tr -d '\r' | \
+	sed -n -e 's/^:status: \([0-9]*\)/HTTP\/2 \1/p' -e '/^HTTP\//p' -e '/^[A-Za-z][A-Za-z-]*: /p' -e 's|^Enqueu[a-z]* \(https\?://.*\)|location: \1|p' | \
+	sed -e 's/^\([A-Za-z-]*:\)/\L\1/'
+}
+
+# Extract HTTP headers from wget1 -S output and normalize:
+# strip leading spaces, convert header names to lowercase
+__wget1_filter_response()
+{
+	sed -n -e 's/^ *\(HTTP\/[12.]*\)/\1/p' -e 's/^  \([A-Za-z].*: \)/\1/p' | \
+	sed -e 's/^\([A-Za-z-]*:\)/\L\1/'
+}
+
+# get HTTP response headers (wget-based, used by wget/aria2/axel backends)
+__wget_url_get_response()
+{
+	local URL="$1"
+	local answer
+
+	if [ -n "$WGET2" ] ; then
+		# wget2 -S is broken for HTTP/1.1 (shows only a few headers),
+		# use --save-headers to stdout and filter header lines.
+		# wget2 -q suppresses -S output (unlike wget1), so don't use quiet=1
+		answer="$(__wget --timeout 20 --tries 1 --method=HEAD --save-headers -O - "$URL" 2>&1 | tr -d '\0' | __wget2_filter_response)"
+		if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+			__wget --timeout 20 --tries 1 --save-headers --header="Range: bytes=0-0" -O - "$URL" 2>&1 | tr -d '\0' | __wget2_filter_response
+			return
+		fi
+		echo "$answer"
+		return
+	fi
+
+	answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1 | __wget1_filter_response)"
+	# HTTP/1.1 405 Method Not Allowed
+	# HTTP/1.1 404 Not Found
+	if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+		quiet=1 __wget --timeout 20 --tries 1 -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1 | __wget1_filter_response
+		return
+	fi
+	echo "$answer"
 }
 
 if [ "$EGET_BACKEND" = "file" ] ; then
@@ -21222,13 +25361,13 @@ url_pget()
 url_check_accessible()
 {
     local URL="$1"
-    test -f "$(path_from_url "$URL")"
+    test -e "$(path_from_url "$URL")"
 }
 
 url_check_available()
 {
     local URL="$1"
-    test -f "$(path_from_url "$URL")"
+    test -e "$(path_from_url "$URL")"
 }
 
 url_get_filename()
@@ -21344,7 +25483,12 @@ url_sget()
        scat "$URL"
        return
     elif [ -n "$2" ] ; then
-       download_with_mirroring __wget_download "$URL" -O "$2"
+       if [ -n "$TIMESTAMPING" ] ; then
+           # wget's -N is incompatible with -O, use manual timestamping
+           __timestamping_download "$URL" "$2" "TIMESTAMPING='' download_with_mirroring __wget_download \"$URL\" -O \"$2\""
+       else
+           download_with_mirroring __wget_download "$URL" -O "$2"
+       fi
        return
     fi
 # TODO: поддержка rsync для известных хостов?
@@ -21372,16 +25516,7 @@ sget_with_mirrors()
 
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "curl" ] ; then
@@ -21400,9 +25535,8 @@ __curl()
         esac
     fi
     [ "$retryconnrefused" ] && set -- --retry-connrefused "$@"
-    # curl uses READTIMEOUT_VALUE as fallback for --max-time if TIMEOUT_VALUE not set
-    [ -z "$TIMEOUT_VALUE" ] && [ "$READTIMEOUT_VALUE" ] && set -- --max-time "$READTIMEOUT_VALUE" "$@"
-    [ "$TIMEOUT_VALUE" ] && set -- --max-time "$TIMEOUT_VALUE" "$@"
+    [ "$READTIMEOUT_VALUE" ] && set -- --max-time "$READTIMEOUT_VALUE" "$@"
+    [ "$TIMEOUT_VALUE" ] && set -- --connect-timeout "$TIMEOUT_VALUE" "$@"
     [ "$nosslcheck" ] && set -- -k "$@"
     [ "$HEADER_VALUE" ] && set -- --header "$HEADER_VALUE" "$@"
     [ "$compressed" ] && set -- --compressed "$@"
@@ -21417,6 +25551,7 @@ __curl()
 __curl_download()
 {
     [ -n "$CONTINUE" ] && set -- -C - "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header "Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __curl "$@"
 }
 # put remote content to stdout
@@ -21451,7 +25586,7 @@ url_sget()
        scat "$1"
        return
     elif [ -n "$2" ] ; then
-       if [ -n "$TIMESTAMPING" ] && [ -f "$2" ] ; then
+       if [ -n "$TIMESTAMPING" ] && [ -s "$2" ] ; then
            __curl_check_timestamp "$URL"
            download_with_mirroring __curl_download "$URL" -z "$2" --output "$2"
        else
@@ -21462,7 +25597,7 @@ url_sget()
 
     local FILENAME="$(url_get_filename "$URL")"
     if [ -n "$FILENAME" ] ; then
-        if [ -n "$TIMESTAMPING" ] && [ -f "$FILENAME" ] ; then
+        if [ -n "$TIMESTAMPING" ] && [ -s "$FILENAME" ] ; then
             __curl_check_timestamp "$URL"
             download_with_mirroring __curl_download "$URL" -z "$FILENAME" $CURLNAMEOPTIONS --output "$FILENAME"
         else
@@ -21474,7 +25609,7 @@ url_sget()
     if [ -n "$TIMESTAMPING" ] ; then
         # Need to get filename first to use -z
         FILENAME="$(basename "$URL")"
-        if [ -f "$FILENAME" ] ; then
+        if [ -s "$FILENAME" ] ; then
             __curl_check_timestamp "$URL"
             download_with_mirroring __curl_download "$URL" -z "$FILENAME" $CURLFILENAMEOPTIONS
         else
@@ -21512,11 +25647,11 @@ url_get_response()
     local URL="$1"
     local answer
     # Don't use -C - for header requests
-    answer="$(quiet=1 __curl --max-time 20 --retry 0 -LI "$URL" 2>&1)"
+    answer="$(quiet=1 __curl --max-time 20 --retry 0 -LI "$URL" 2>&1 | sed -e 's/\r$//' -e 's/ $//')"
     # HTTP/1.1 405 Method Not Allowed
     # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __curl --max-time 20 --retry 0 -L -i -r0-0 "$URL" 2>&1)
+    if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+        quiet=1 __curl --max-time 20 --retry 0 -L -D - -o /dev/null -r0-0 "$URL" 2>&1 | sed -e 's/\r$//' -e 's/ $//'
         return
     fi
     echo "$answer"
@@ -21528,13 +25663,18 @@ __aria2()
     [ "$USEOUTPUTDIR" ] && set -- -d "$USEOUTPUTDIR" "$@"
     [ "$showprogress" ] && set -- --show-console-readout=true "$@"
     # aria2 has no direct quiet flag, but --show-console-readout=false reduces output
-    docmd $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    else
+        docmd $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    fi
 }
 
 # aria2 wrapper for downloads (adds --continue)
 __aria2_download()
 {
     [ -n "$CONTINUE" ] && set -- --continue=true "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __aria2 "$@"
 }
 
@@ -21591,19 +25731,10 @@ sget_with_mirrors()
     echo "$tab_urls" | __aria2_download -i-
 }
 
-# use __wget for headers (aria2/axel don't support this natively)
+# use __wget for headers (aria2 doesn't support this natively)
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "axel" ] ; then
@@ -21617,13 +25748,18 @@ __axel()
     [ "$quiet" ] && [ -z "$showprogress" ] && set -- --quiet "$@"
     [ "$FORCEIPV" ] && set -- "$FORCEIPV" "$@"
     # Note: axel doesn't support output directory, only output file (-o)
-    docmd $AXEL $EGET_AXEL_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $AXEL $EGET_AXEL_OPTIONS "$@"
+    else
+        docmd $AXEL $EGET_AXEL_OPTIONS "$@"
+    fi
 }
 
 # axel wrapper for downloads
 # Note: axel auto-continues if state file (.st) exists, no explicit flag needed
 __axel_download()
 {
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __axel "$@"
 }
 
@@ -21704,19 +25840,10 @@ sget_with_mirrors()
     [ -n "$USEOUTPUTDIR" ] && cd "$oldpwd"
 }
 
-# use __wget for headers (aria2/axel don't support this natively)
+# use __wget for headers (axel doesn't support this natively)
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "rsync" ] ; then
@@ -21790,7 +25917,8 @@ fi
 url_speedtest()
 {
     local URL="$1"
-    local timeout="${TIMEOUT_VALUE:-3}"
+    local timeout="${READTIMEOUT_VALUE:-3}"
+    local count="${SPEEDTEST_COUNT:-3}"
     local total_size
     local measurements=""
     local i speed
@@ -21798,8 +25926,10 @@ url_speedtest()
     # Get file size for progress display
     total_size=$(url_get_size "$URL")
 
-    for i in 1 2 3 ; do
-        [ -n "$verbose" ] && echo "Measurement $i/3..." >&2
+    i=0
+    while [ "$i" -lt "$count" ] ; do
+        i=$(($i + 1))
+        [ -n "$verbose" ] && echo "Measurement $i/$count..." >&2
         speed=$(__speedtest_single "$URL" "$timeout" "$total_size")
         measurements="$measurements $speed"
         [ -n "$verbose" ] && echo "  Speed: ${speed} MB/s" >&2
@@ -21823,7 +25953,7 @@ if [ "$EGET_BACKEND" = "wget" ] || [ "$EGET_BACKEND" = "curl" ] || [ "$EGET_BACK
 url_get_headers()
 {
     local URL="$1"
-    url_get_response "$URL" | grep -i "^ *[[:alpha:]].*: " | sed -e 's|^ *||' -e 's|\r$||'
+    url_get_response "$URL" | grep -i "^[[:alpha:]].*: "
 }
 
 url_check_accessible()
@@ -21842,12 +25972,12 @@ url_get_header()
 {
     local URL="$1"
     local HEADER="$2"
-    url_get_headers "$URL" | grep -i "^ *$HEADER: " | sed -e "s|^ *$HEADER: ||i"
+    url_get_headers "$URL" | grep -i "^$HEADER: " | sed -e "s|^$HEADER: ||i"
 }
 
 url_get_size()
 {
-    url_get_header "$1" "Content-Length" | tr -d '\r'
+    url_get_header "$1" "content-length"
 }
 
 url_get_raw_real_url()
@@ -21859,21 +25989,28 @@ url_get_raw_real_url()
     # don't check location if we have made form of the URL
     [ -n "$MADEURL" ] && [ "$MADEURL" = "$URL" ] && echo "$URL" && return
 
-    local loc
-    for loc in $(url_get_header "$URL" "Location" | tac | sed -e 's| .*||') ; do
+    local loc base="$URL"
+    local redirect_count=0
+    local max_redirects=10
+    # follow redirect chain in order, updating base URL at each step
+    for loc in $(url_get_header "$URL" "Location" | sed -e 's| .*||') ; do
+        redirect_count=$(($redirect_count + 1))
+        if [ "$redirect_count" -gt "$max_redirects" ] ; then
+            echo "Warning: too many redirects (>$max_redirects) for $URL" >&2
+            break
+        fi
         # add protocol if missed
         if is_protocol_relative_url "$loc" ; then
-            loc="$(echo "$URL" | sed -e 's|//.*||')$loc"
+            loc="$(echo "$base" | sed -e 's|//.*||')$loc"
         fi
-        # hack for construct full url from related Location
+        # construct full url from relative Location using current base host
         if is_abs_path "$loc" ; then
-            loc="$(concatenate_url_and_filename "$(get_host_only "$URL")" "$loc")" #"
+            loc="$(concatenate_url_and_filename "$(get_host_only "$base")" "$loc")" #"
         fi
-        echo "$loc"
-        return
+        base="$loc"
     done
 
-    echo "$URL"
+    echo "$base"
 }
 
 url_get_real_url()
@@ -21900,28 +26037,33 @@ url_get_filename()
     local filename
 
     # See https://www.cpcwood.com/blog/5-aws-s3-utf-8-content-disposition
-    # https://www.rfc-editor.org/rfc/rfc6266
+    # Per RFC 6266 Section 4.3, strip path components from filename
+    # (servers may send Windows-style paths with backslashes)
     local cd="$(url_get_header "$URL" "Content-Disposition")"
     if echo "$cd" | grep -qi "filename\*= *UTF-8" ; then
         #Content-Disposition: attachment; filename="unityhub-amd64-3.3.0.deb"; filename*=UTF-8''"unityhub-amd64-3.3.0.deb"
         #Content-Disposition: attachment; filename*=UTF-8''t1client-standalone-4.5.28.0-1238402-Release.deb; filename="t1client-standalone-4.5.28.0-1238402-Release.deb"
-        filename="$(echo "$cd" | sed -e "s|.*filename\*= *UTF-8''||i" -e 's|^"||' -e 's|";$||' -e 's|"$||' -e 's|; filename=.*||')"
+        filename="$(echo "$cd" | grep -i "filename\*= *UTF-8" | tail -n1 | sed -e "s|.*filename\*= *UTF-8''||i" -e 's|^"||' -e 's|";$||' -e 's|"$||' -e 's|; filename=.*||')"
+        filename="$(echo "$filename" | sed -e 's|.*[/\\]||' -e 's|.*%5[cC]||' -e 's|.*%2[fF]||')"
         [ "$filename" != "unspecified" ] && echo "$filename" && return
     fi
     if echo "$cd" | grep -qi "filename=" ; then
         #Content-Disposition: attachment; filename=postman-linux-x64.tar.gz
         #content-disposition: attachment; filename="code-1.77.1-1680651749.el7.x86_64.rpm"
-        filename="$(echo "$cd" | sed -e 's|.*filename= *||i' -e 's|^"||' -e 's|";.*||' -e 's|"$||')"
+        filename="$(echo "$cd" | grep -i "filename=" | tail -n1 | sed -e 's|.*filename= *||i' -e 's|^"||' -e 's|";.*||' -e 's|"$||')"
+        filename="$(echo "$filename" | sed -e 's|.*[/\\]||')"
         [ "$filename" != "unspecified" ] && echo "$filename" && return
     fi
 
     local loc="$(url_get_raw_real_url "$URL")"
+    # signed CDN redirects (e.g. GitHub release assets) put a UUID in the path
+    # and the real filename in a query parameter — fall back to original URL
     if is_strange_url "$loc" ; then
-        loc="$(echo "$loc" | sed -e "s|\?.*||")"
+        loc="$URL"
     fi
 
-    # hack for redirect to the main page
-    if is_httpurl "$loc" ; then
+    # hack for redirect to the main page (root URL with no filename)
+    if echo "$loc" | grep -qE '^https?://[^/]+/?$' ; then
         loc=""
     fi
 
@@ -22096,6 +26238,10 @@ sget()
     # download file and add to IPFS
     url_sget "$REALURL" "$TARGET" || return
 
+    if is_html_file "$TARGET" ; then
+        fatal "Downloaded '$TARGET' is an HTML page, not a file (server redirected to a landing/error page?). Not adding to IPFS."
+    fi
+
     # don't do ipfs put when gateway is using
     [ "$ipfs_mode" = "gateway" ] && return
 
@@ -22186,7 +26332,13 @@ sget()
         fi
     fi
 
-    url_sget "$@"
+    # Use normalized filename from Content-Disposition via -O
+    # (wget/curl may save with raw path separators otherwise, see RFC 6266 Section 4.3)
+    if [ -n "$TARGET_FROM_URL" ] ; then
+        url_sget "$URL" "$TARGET"
+    else
+        url_sget "$@"
+    fi
 }
 
 # Filter stdin: strip whitespace, skip empty lines and comments
@@ -22277,6 +26429,10 @@ make_fileurl()
 {
     local url="$1"
     local fn="$2"
+    local abs_path=''
+
+    # detect absolute path before stripping leading slashes
+    is_abs_path "$fn" && abs_path=1
 
     fn="$(echo "$fn" | sed -e 's|^./||' -e 's|^/*||')"
 
@@ -22286,7 +26442,7 @@ make_fileurl()
     elif is_rsyncurl "$url" || is_sshurl "$url" ; then
         # rsync/ssh URLs: just ensure trailing slash
         url="$(echo "$url" | sed 's|/*$|/|')"
-    elif is_abs_path "$fn" ; then
+    elif [ -n "$abs_path" ] ; then
         # if there is file path from the root of the site
         url="$(get_host_only "$url")"
     elif ! have_end_slash_or_php_parametr "$url" ; then
@@ -22317,7 +26473,7 @@ get_urls()
     if echo "$content" | grep -q '<' ; then
         # HTML format (wget FTP, HTTP): parse href attributes
         echo "$content" | sed -e 's|<|<\n|g' -e 's|data-file=|href=|g' -e "s|href=http|href=\"http|g" -e "s|>|\">|g" -e "s|'|\"|g" | \
-             grep -i -o -E 'href="(.+)"' | sed -e 's|&amp;|\&|' | cut -d'"' -f2 | sed -e 's|^ *||g' -e 's| *$||g'
+             grep -i -o -E 'href="(.+)"' | sed -e 's|&amp;|\&|' | cut -d'"' -f2 | sed -e 's|^ *||g' -e 's| *$||g' | grep -v '^\.\.\?/\?$'
     else
         # ls -l format (curl FTP): extract last field (filename)
         echo "$content" | awk '{print $NF}'
@@ -22391,6 +26547,62 @@ if is_github_url "$1" && [ -n "$2" ] ; then
     return
 fi
 
+# separate part for Yandex.Disk downloads
+is_yadisk_url()
+{
+    case "$1" in
+        https://disk.yandex.ru/d/*|https://yadi.sk/d/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Get direct download URL from Yandex.Disk public link
+get_yadisk_download_url()
+{
+    local PUBLIC_URL="$1"
+    local API_URL="https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=$PUBLIC_URL"
+    local RESPONSE
+    RESPONSE="$(scat "$API_URL")" || fatal "Can't get download URL from Yandex.Disk API"
+    # extract href from JSON: {"href": "https://..."}
+    echo "$RESPONSE" | sed -e 's/.*"href" *: *"//;s/".*//'
+}
+
+# Get filename from Yandex.Disk public link metadata
+get_yadisk_filename()
+{
+    local PUBLIC_URL="$1"
+    local API_URL="https://cloud-api.yandex.net/v1/disk/public/resources?public_key=$PUBLIC_URL"
+    local RESPONSE
+    RESPONSE="$(scat "$API_URL")" || return 1
+    # extract name from JSON: {"name": "filename.ext", ...}
+    echo "$RESPONSE" | sed -e 's/.*"name" *: *"//;s/".*//'
+}
+
+if is_yadisk_url "$1" ; then
+    [ -n "$2" ] && fatal "too many args when Yandex.Disk URL used: extra '$2' arg"
+
+    if [ -n "$GETFILENAME" ] ; then
+        get_yadisk_filename "$1"
+        return
+    fi
+
+    DOWNLOAD_URL="$(get_yadisk_download_url "$1")"
+    [ -n "$DOWNLOAD_URL" ] || fatal "Can't get download URL for $1"
+
+    if [ -n "$LISTONLY" ] ; then
+        echo "$DOWNLOAD_URL"
+        return
+    fi
+
+    if [ -z "$TARGETFILE" ] ; then
+        TARGETFILE="$(get_yadisk_filename "$1")"
+    fi
+
+    MADEURL="$DOWNLOAD_URL"
+    sget "$DOWNLOAD_URL" "$TARGETFILE"
+    return
+fi
+
 if is_ipfsurl "$1" ; then
     [ -n "$2" ] && fatal "too many args when ipfs://Qm... used: extra '$2' arg"
     sget "$1" "$TARGETFILE"
@@ -22436,19 +26648,12 @@ fi
 
 is_wildcard()
 {
-    case "$1" in *[*?]*|*\[*|*\]*) return 0 ;; esac
+    case "$1" in *[*]*|*\[*|*\]*) return 0 ;; esac
     return 1
 }
 
-is_query_string()
-{
-    case "$1" in *\?*=*) return 0 ;; esac
-    return 1
-}
-
-# https://www.freeoffice.com/download.php?filename=freeoffice-2021-1062.x86_64.rpm
-if [ -z "$NOGLOB" ] && is_wildcard "$URL" && ! is_query_string "$URL" ; then
-    fatal "Error: there are globbing symbol (*[]) in $URL. It is allowed only for mask part"
+if [ -z "$NOGLOB" ] && is_wildcard "$URL" ; then
+    fatal "Error: there are globbing symbols (*[]) in $URL. It is allowed only for mask part"
 fi
 
 if is_url "$MASK" ; then
@@ -22476,7 +26681,7 @@ if [ -n "$LISTONLY" ] ; then
 fi
 
 # If there is no wildcard symbol like asterisk, just download
-if [ -z "$SEPMASK" ] && ! is_wildcard "$MASK" || is_query_string "$MASK" ; then
+if [ -z "$SEPMASK" ] && ! is_wildcard "$MASK" ; then
     sget "$1" "$TARGETFILE"
     return
 fi
@@ -22514,17 +26719,18 @@ internal_tools_erc()
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-PROGDIR=$(dirname $0)
+PROGDIR=$(dirname "$0")
 [ "$PROGDIR" = "." ] && PROGDIR=$(pwd)
+ERCAT="$PROGDIR/$(basename "$0" | sed 's|erc$|ercat|')"
 
 # will replaced to /usr/share/erc during install
-SHAREDIR=$(dirname $0)
+SHAREDIR=$(dirname "$0")
 
 load_helper()
 {
     local CMD="$SHAREDIR/$1"
     [ -r "$CMD" ] || fatal "Have no $CMD helper file"
-    . $CMD
+    . "$CMD"
 }
 
 load_helper erc-sh-functions
@@ -22535,7 +26741,7 @@ check_tty
 # 1.zip tar:  -> 1.tar
 build_target_name()
 {
-	is_target_format $2 && echo $(get_archive_name "$1").${2/:/} && return
+	is_target_format $2 && echo $(dirname "$1")/$(get_archive_name "$1").${2/:/} && return
 	echo "$1"
         return 1
 }
@@ -22561,22 +26767,37 @@ create_archive()
 			docmd tar cvf "$arc" "$@"
 			;;
 		*)
-			# TODO: fix symlinks support
 			# https://bugzilla.altlinux.org/49852
 			# FIXME: creating .tar.* (.tar.gz) is not supported
-			docmd $HAVE_7Z a -l "$arc" "$@"
+			docmd $HAVE_7Z a -snl "$arc" "$@"
 			#fatal "Not yet supported creating of $type archives"
 			;;
 	esac
 }
 
 # Extract archive with 7z into subdir
+__7z_snld_flag=""
+__7z_snld_checked=""
+
+# Get -snld flag if supported (7z 25.01+ rejects symlinks with ../ by default)
+get_7z_snld()
+{
+	if [ -z "$__7z_snld_checked" ] ; then
+		__7z_snld_checked=1
+		local ver
+		ver=$($HAVE_7Z 2>&1 | sed -n 's/.*[Zz]ip.*[[:space:]]\([0-9]*\)\.\([0-9]*\).*/\1\2/p' | head -1)
+		[ "${ver:-0}" -ge 2501 ] && __7z_snld_flag="-snld"
+	fi
+	echo $__7z_snld_flag
+}
+
 extract_7z_to_subdir()
 {
 	local arc="$1"
 	local subdir="$2"
+	assure_7z
 	mkdir -p "$subdir" && cd "$subdir" || fatal
-	docmd $HAVE_7Z x "$arc"
+	docmd $HAVE_7Z x -y $(get_7z_snld) "$arc"
 }
 
 # Extract squashfs-based archives (squashfs, snap)
@@ -22584,11 +26805,51 @@ extract_squashfs_image()
 {
 	local arc="$1"
 	local subdir="$2"
-	if is_command unsquashfs ; then
-		docmd unsquashfs -d "$subdir" "$arc"
+	if [ -z "$ERC_USE_7Z_SQUASHFS" ] && is_command unsquashfs ; then
+		docmd unsquashfs -no-xattrs -d "$subdir" "$arc"
 	else
 		extract_7z_to_subdir "$arc" "$subdir"
 	fi
+}
+
+# Extract makeself payload as tar stream to stdout
+extract_makeself_tar()
+{
+	local arc="$1"
+
+	# Extract header line count
+	# New makeself (2.4+): skip="715" variable
+	# Old makeself: head -n 588 (literal number)
+	local lines
+	lines=$(sed -n 's/^skip="\{0,1\}\([0-9]\{1,\}\)"\{0,1\}/\1/p' "$arc" | head -1)
+	if [ -z "$lines" ] ; then
+		lines=$(grep -am1 -oP '(?<=head -n )\d+' "$arc")
+	fi
+	[ -n "$lines" ] || fatal "Can't find header line count in makeself archive $arc"
+
+	# Calculate byte offset of payload
+	local offset
+	offset=$(head -n "$lines" "$arc" | wc -c | tr -d " ")
+
+	# Detect compression method for info message
+	local compress
+	compress=$(sed -n 's/^.*Compression: \(.*\)/\1/p' "$arc" | head -1)
+	if [ -z "$compress" ] ; then
+		compress=$(sed -n "s/^COMPRESS=//p" "$arc" | head -1 | tr -d "'\"")
+	fi
+	echo "Extracting makeself archive (compression: ${compress:-gzip}, header: $lines lines, offset: $offset bytes)" >&2
+
+	# Extract payload, auto-detect compression via ercat
+	dd if="$arc" ibs="$offset" skip=1 obs=1024 conv=sync 2>/dev/null | "$ERCAT"
+}
+
+# Extract makeself self-extracting archives (.run)
+extract_makeself()
+{
+	local arc="$1"
+	local subdir="$2"
+	mkdir -p "$subdir" && cd "$subdir" || fatal
+	extract_makeself_tar "$arc" | extract_tar_stdin
 }
 
 # Extract AppImage archives
@@ -22596,21 +26857,41 @@ extract_appimage()
 {
 	local arc="$1"
 	local subdir="$2"
+	local offset
 
-	# Try unsquashfs with offset from --appimage-offset
+	offset=$(LC_ALL=C grep -aboP 'DWARFS(?=[\x00-\x1f]{2})' "$arc" 2>/dev/null \
+		| head -1 | cut -d: -f1)
+	if [ -n "$offset" ] ; then
+		is_command dwarfsextract \
+			|| fatal "dwarfsextract is required to extract DwarFS AppImage files"
+		mkdir -p "$subdir" || fatal "Could not create extraction directory $subdir"
+		docmd dwarfsextract -i "$arc" -o "$subdir" -O "$offset"
+		return
+	fi
+
+	# Try unsquashfs with offset
 	if is_command unsquashfs ; then
-		local offset
 		chmod +x "$arc" 2>/dev/null
 		offset="$("$arc" --appimage-offset 2>/dev/null)"
+		# Fallback: find squashfs magic (for cross-arch AppImages)
+		if [ -z "$offset" ] ; then
+			offset=$(LC_ALL=C grep -aboP 'hsqs' "$arc" 2>/dev/null | head -1 | cut -d: -f1)
+		fi
 		if [ -n "$offset" ] ; then
-			if docmd unsquashfs -o "$offset" -d "$subdir" "$arc" ; then
+			if docmd unsquashfs -no-xattrs -o "$offset" -d "$subdir" "$arc" ; then
 				return 0
 			fi
 		fi
 	fi
 
 	# Fallback to 7z
+	# Note: 7zz 26+ replaces symlinks containing ".." with empty files
+	# and returns exit code 2. Install squashfs-tools for full extraction.
 	extract_7z_to_subdir "$arc" "$subdir"
+	local ret=$?
+	if [ "$ret" -ne 0 ] ; then
+		fatal "7z could not fully extract AppImage (some symlinks are missing). Install squashfs-tools for better results."
+	fi
 
 	# Fallback to --appimage-extract (disabled by default)
 	#if [ -x "$arc" ] || chmod +x "$arc" ; then
@@ -22623,30 +26904,236 @@ extract_appimage()
 	#fi
 }
 
+# Import a flatpak bundle into a temporary OSTree repo.
+# Sets FLATPAK_REPO_DIR (caller must rm -rf it) and FLATPAK_REF.
+flatpak_prepare_repo()
+{
+	local flatpak_file="$1"
+	local operation="$2"
+
+	is_command ostree || fatal "ostree is required to $operation flatpak files"
+
+	FLATPAK_REPO_DIR=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	docmd ostree init --repo="$FLATPAK_REPO_DIR" --mode=archive
+
+	# a flatpak bundle is an ostree static delta, so import it with ostree alone
+	docmd ostree static-delta apply-offline --repo="$FLATPAK_REPO_DIR" "$flatpak_file" \
+		|| { rm -rf "$FLATPAK_REPO_DIR" ; fatal "failed to import flatpak bundle $flatpak_file" ; }
+
+	# apply-offline imports the objects but creates no ref; take the commit checksum
+	FLATPAK_REF=$(find "$FLATPAK_REPO_DIR/objects" -name '*.commit' | head -n1 \
+		| sed 's|.*/objects/||; s|/||; s|\.commit$||')
+	[ -n "$FLATPAK_REF" ] || { rm -rf "$FLATPAK_REPO_DIR" ; fatal "could not get commit from flatpak repository" ; }
+}
+
+# Extract flatpak bundle via a temporary OSTree repo
+extract_flatpak()
+{
+	local arc="$1"
+	local subdir="$2"
+
+	flatpak_prepare_repo "$arc" "extract"
+
+	local checkout_root
+	checkout_root=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	docmd ostree checkout --repo="$FLATPAK_REPO_DIR" --user-mode "$FLATPAK_REF" "$checkout_root/payload"
+
+	mkdir -p "$subdir"
+	# the app payload lives in files/; fall back to the whole tree otherwise
+	if [ -d "$checkout_root/payload/files" ] ; then
+		docmd cp -a "$checkout_root/payload/files/." "$subdir/"
+	else
+		docmd cp -a "$checkout_root/payload/." "$subdir/"
+	fi
+
+	rm -rf "$checkout_root" "$FLATPAK_REPO_DIR"
+}
+
 # TODO: move to patool
 # Extract special archive types that are not supported by patool
 extract_special_archive()
 {
 	local arc="$1"
 	local type="$2"
-	local rarc="$(realpath -s "$arc")"
-	local subdir="$(basename "$(get_archive_name "$arc")")"
+	local orig_dir="$PWD"
+	local subdir
+	local use_tdir=""
+	if [ -n "$here" ] || [ -n "$flat" ] ; then
+		subdir="${extract_dir:-.}"
+	elif [ -n "$extract_dir" ] ; then
+		subdir=$(mktemp -d "$(dirname "$extract_dir")/UXXXXXXXX")
+		use_tdir=1
+	else
+		subdir=$(mktemp -d "$(pwd)/UXXXXXXXX")
+		use_tdir=1
+	fi
+
+	local flat_tdir
+	if [ -n "$flat" ] ; then
+		flat_tdir=$(mktemp -d "$(realpath "$subdir")/UXXXXXXXX")
+		subdir="$flat_tdir"
+	fi
 
 	case "$type" in
 		exe|dll)
-			extract_7z_to_subdir "$rarc" "$subdir"
+			extract_7z_to_subdir "$arc" "$subdir"
+			;;
+		run)
+			extract_makeself "$arc" "$subdir"
 			;;
 		AppImage|appimage)
-			extract_appimage "$rarc" "$subdir"
+			extract_appimage "$arc" "$subdir"
 			;;
 		squashfs|snap)
-			extract_squashfs_image "$rarc" "$subdir"
+			extract_squashfs_image "$arc" "$subdir"
+			;;
+		flatpak)
+			extract_flatpak "$arc" "$subdir"
 			;;
 		*)
+			[ -n "$use_tdir" ] && rmdir "$subdir"
 			return 1
 			;;
 	esac
+	cd "$orig_dir"
+
+	if [ -n "$flat_tdir" ] ; then
+		local target_dir="${extract_dir:-$orig_dir}"
+		find "$flat_tdir" -type f -exec mv -t "$target_dir" -- {} +
+		rm -rf "$flat_tdir"
+	elif [ -n "$use_tdir" ] ; then
+		if [ -n "$extract_dir" ] ; then
+			move_to_target_dir "$subdir" "$extract_dir"
+		else
+			local target_name="$(get_archive_name "$arc")"
+			if [ -d "$target_name" ] ; then
+				move_to_target_dir "$subdir" "$target_name"
+			else
+				move_from_tdir "$subdir" "$target_name"
+			fi
+		fi
+	fi
+
 	exit
+}
+
+extract_by_type()
+{
+	local arc="$1"
+	local type="$2"
+	shift 2
+
+	# TODO: check if there is only one file?
+	# use subdir if there is no subdir in archive
+	case "$type" in
+		tar.gz|tgz)
+			if is_command gzip ; then
+				extract_command "tar -xhzf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find gzip package. Please install gzip package and retry."
+			fi
+			;;
+		tar.xz|txz|tar.lzma)
+			if is_command xz ; then
+				extract_command "tar -xhJf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find xz package. Please install xz package and retry."
+			fi
+			;;
+		tar.zst)
+			if is_command zstd ; then
+				extract_command "tar -I zstd -xhf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find zstd package. Please install zstd package and retry."
+			fi
+			;;
+		tar.bz2|tbz2)
+			if is_command bunzip2 ; then
+				extract_command "tar -xhjf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find bzip2 package. Please install bzip2 package and retry."
+			fi
+			;;
+		tar)
+			extract_command "tar -xhf" "$arc"
+			;;
+		*)
+			docmd $HAVE_7Z x -y "$arc" "$@"
+			#fatal "Not yet supported extracting of $type archives"
+			;;
+	esac
+}
+
+is_system_dir()
+{
+	case "$1" in
+		opt|usr|etc|var|bin|sbin|lib|lib64|home|root|srv|tmp|run|mnt|media|boot|dev|proc|sys)
+			return 0 ;;
+	esac
+	return 1
+}
+
+# Move extracted contents from temp dir to existing target directory (-C)
+# Single non-system directory is unwrapped (contents moved directly into target)
+move_to_target_dir()
+{
+	local tdir="$1"
+	local target="$2"
+
+	shopt -s nullglob dotglob
+	local items=("$tdir"/*)
+	shopt -u nullglob dotglob
+
+	if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ] ; then
+		if is_system_dir "$(basename "${items[0]}")" ; then
+			mv -- "${items[0]}" "$target/"
+		else
+			# single directory: move its contents into target
+			shopt -s dotglob
+			mv -- "${items[0]}"/* "$target/"
+			shopt -u dotglob
+			rmdir -- "${items[0]}"
+		fi
+	else
+		mv -- "${items[@]}" "$target/"
+	fi
+	rmdir "$tdir"
+}
+
+# Move extracted contents from temp dir to current directory (normal extraction)
+# Single directory is renamed to subdir, single file goes to current dir
+move_from_tdir()
+{
+	local tdir="$1"
+	local subdir="$2"
+
+	shopt -s nullglob dotglob
+	local items=("$tdir"/*)
+	shopt -u nullglob dotglob
+
+	if [ ${#items[@]} -eq 1 ] && [ -e "${items[0]}" ] ; then
+		if [ -d "${items[0]}" ] ; then
+			if is_system_dir "$(basename "${items[0]}")" ; then
+				mkdir -p "$subdir"
+				mv -- "${items[0]}" "$subdir/"
+			else
+				mv -- "${items[0]}" "$subdir"
+			fi
+		else
+			mv -- "${items[0]}" .
+		fi
+		rmdir "$tdir"
+	else
+		mv -- "$tdir" "$subdir"
+	fi
 }
 
 extract_archive()
@@ -22657,56 +27144,73 @@ extract_archive()
 	local type="$(get_archive_type "$arc")"
 	[ -n "$type" ] || fatal "Can't recognize type of $arc."
 
+	arc="$(realpath -s "$arc")"
+
 	extract_special_archive "$arc" "$type"
 
-	if have_patool ; then
-		docmd patool $verbose extract "$arc" "$@"
+	# --here: extract directly to target directory without subdir logic
+	local target_dir="${extract_dir}"
+	[ -n "$here" ] && [ -z "$target_dir" ] && target_dir="."
+
+	if [ -n "$here" ] && [ -n "$target_dir" ] && [ -z "$flat" ] ; then
+		if have_patool ; then
+			docmd patool $verbose extract --outdir "$target_dir" "$arc"
+		else
+			cd "$target_dir" || fatal
+			extract_by_type "$arc" "$type" "$@"
+		fi
 		return
 	fi
 
-	arc="$(realpath -s "$arc")"
-	tdir="$(mktemp -d "$(pwd)/UXXXXXXXX")" && cd "$tdir" || fatal
-
-	local TSUBDIR="$(basename "$arc" .$type | sed -e 's|^tar\.||')"
-
-	# TODO: check if there is only one file?
-	# use subdir if there is no subdir in archive
-	case "$type" in
-		tar.gz|tgz)
-			is_command gzip || fatal "Could not find gzip package. Please install gzip package and retry."
-			extract_command "tar -xhzf" "$arc"
-			;;
-		tar.xz|txz|tar.lzma)
-			is_command xz || fatal "Could not find xz package. Please install xz package and retry."
-			extract_command "tar -xhJf" "$arc"
-			;;
-		tar.zst)
-			is_command zstd || fatal "Could not find zstd package. Please install zstd package and retry."
-			extract_command "tar -I zstd -xhf" "$arc"
-			;;
-		tar.bz2|tbz2)
-			is_command bunzip2 || fatal "Could not find bzip2 package. Please install bzip2 package and retry."
-			extract_command "tar -xhjf" "$arc"
-			;;
-		tar)
-			extract_command "tar -xhf" "$arc"
-			;;
-		*)
-			docmd $HAVE_7Z x -y "$arc" "$@"
-			#fatal "Not yet supported extracting of $type archives"
-			;;
-	esac
-
-	local res=$?
-
-	cd - >/dev/null
-	# if only one dir in the subdir
-	if [ -e "$(echo $tdir/*)" ] ; then
-		mv "$tdir"/* .
-		rmdir "$tdir"
-	else
-		mv "$tdir" "$TSUBDIR"
+	# -C: extract to temp dir, apply subdir logic, move to target
+	if [ -n "$extract_dir" ] && [ -z "$here" ] && [ -z "$flat" ] ; then
+		tdir=$(mktemp -d "$(dirname "$extract_dir")/UXXXXXXXX")
+		local res
+		if have_patool ; then
+			docmd patool $verbose extract --outdir "$tdir" "$arc" "$@"
+			res=$?
+		else
+			cd "$tdir" || fatal
+			extract_by_type "$arc" "$type" "$@"
+			res=$?
+			cd - >/dev/null
+		fi
+		if [ "$res" -eq 0 ] ; then
+			move_to_target_dir "$tdir" "$extract_dir"
+		else
+			rm -rf "$tdir"
+		fi
+		return $res
 	fi
+
+	tdir=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	local res
+	if have_patool ; then
+		docmd patool $verbose extract --outdir "$tdir" "$arc" "$@"
+		res=$?
+	else
+		cd "$tdir" || fatal
+		extract_by_type "$arc" "$type" "$@"
+		res=$?
+		cd - >/dev/null
+	fi
+
+	if [ "$res" -eq 0 ] ; then
+		if [ -n "$flat" ] ; then
+			# --flat: move all files to target, stripping directory structure
+			local dest="${target_dir:-.}"
+			find "$tdir" -type f -exec mv -t "$dest" -- {} +
+			rm -rf "$tdir"
+		else
+			local target_name="$(get_archive_name "$arc")"
+			if [ -d "$target_name" ] ; then
+				move_to_target_dir "$tdir" "$target_name"
+			else
+				move_from_tdir "$tdir" "$target_name"
+			fi
+		fi
+	fi
+
 	return $res
 }
 
@@ -22717,7 +27221,15 @@ list_archive()
 
 	# TODO: move to patool
 	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "exe" ] ; then
+		assure_7z
 		docmd $HAVE_7Z l "$arc" || fatal
+		return
+	fi
+
+	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "flatpak" ] ; then
+		flatpak_prepare_repo "$(realpath -s "$arc")" "list"
+		docmd ostree ls --repo="$FLATPAK_REPO_DIR" -R "$FLATPAK_REF"
+		rm -rf "$FLATPAK_REPO_DIR"
 		return
 	fi
 
@@ -22743,7 +27255,15 @@ test_archive()
 
 	# TODO: move to patool
 	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "exe" ] ; then
+		assure_7z
 		docmd $HAVE_7Z t "$arc" || fatal
+		return
+	fi
+
+	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "flatpak" ] ; then
+		flatpak_prepare_repo "$(realpath -s "$arc")" "test"
+		rm -rf "$FLATPAK_REPO_DIR"
+		echo "Flatpak file is valid"
 		return
 	fi
 
@@ -22768,15 +27288,34 @@ __repack_via_tmp()
 	dfile="$(realpath -s "$2")"
 	ddir="$(dirname "$dfile")"
 	tdir="$(mktemp -d "$ddir/UXXXXXXXX")" && cd "$tdir" || fatal
-	trap "rm -fr $tdir" EXIT
+	trap 'rm -fr "$tdir"' EXIT
 	extract_archive "$sfile" || fatal
 	create_archive "$dfile" "."
 	#cd - >/dev/null
 	#rm -fr "$tdir"
 }
 
+# Repack special archive types that are not supported by patool
+repack_special_archive()
+{
+	local ftype="$(get_archive_type "$1")"
+	case "$ftype" in
+		run)
+			# makeself payload is already tar, just decompress
+			extract_makeself_tar "$1" > "$2"
+			exit
+			;;
+		exe|dll|AppImage|appimage|squashfs|snap)
+			__repack_via_tmp "$1" "$2"
+			exit
+			;;
+	esac
+}
+
 repack_archive()
 {
+	repack_special_archive "$1" "$2"
+
 	if have_patool ; then
 		docmd patool $verbose repack "$1" "$2"
 		return
@@ -22814,14 +27353,25 @@ $(get_help HELPCMD)
  Options:
 $(get_help HELPOPT)
 
+ Extraction rules:
+    Single file in archive     -> extracted to current directory
+    Single directory in archive -> renamed to BASENAME/
+    System dir (opt, usr, etc) -> wrapped in BASENAME/ (not renamed)
+    Multiple files or dirs     -> extracted to BASENAME/ subdirectory
+    Use --here to skip creating subdirectory, --flat to strip all paths
+
  Examples:
     # erc dir - pack dir to dirname.zip
     # erc a archive.zip file(s)... - pack files to archive.zip
     # erc [x] archive.zip - unpack
     # unerc archive.zip - unpack
-    # erc [repack] archive1.zip... archive2.rar $HAVE_7Z: - repack all to $HAVE_7Z
-    # erc -f [repack] archive.zip archive.$HAVE_7Z - force repack zip to $HAVE_7Z (override target in anyway)
+    # erc [repack] archive1.zip... archive2.rar 7z: - repack all to 7z
+    # erc -f [repack] archive.zip archive.7z - force repack zip to 7z (override target in anyway)
+    # erc -C dir archive.zip - extract archive directly to dir
+    # erc --here archive.zip - extract as-is without creating subdirectory
+    # erc --flat archive.zip - extract all files stripping directory structure
     # erc file/dir zip: - pack file to zip
+    # erc basename archive.tar.gz - print predicted directory name (archive)
 "
 }
 
@@ -22840,9 +27390,13 @@ Descr="erc - universal archive manager"
 
 force=
 target=
+extract_dir=
 verbose=--verbose
+quiet=
 use_7z=
 use_patool=
+here=
+flat=
 
 if [ -z "$*" ] ; then
     echo "Etersoft archive manager version @VERSION@" >&2
@@ -22862,6 +27416,7 @@ case "$1" in
         ;;
     -q|--quiet)           # HELPOPT: be silent
         verbose=
+        quiet=1
         ;;
     -f|--force)           # HELPOPT: override target
         force=-f
@@ -22871,6 +27426,23 @@ case "$1" in
         ;;
     --use-7z)             # HELPOPT: force use 7z as backend
         use_7z=1
+        ;;
+    --here|--no-subdir)   # HELPOPT: extract to current directory without creating a subdirectory
+        here=1
+        ;;
+    -j|--flat|--junk-paths)  # HELPOPT: extract all files without directory structure
+        flat=1
+        ;;
+    -C)                   # HELPOPT: extract to specified directory
+        shift
+        extract_dir="$1"
+        ;;
+    --directory|--extract-to|--destination|--outdir)
+        shift
+        extract_dir="$1"
+        ;;
+    --directory=*|--extract-to=*|--destination=*|--outdir=*)
+        extract_dir="${1#*=}"
         ;;
     -a|-e|-x|-u|-l|-t|-b)
         # these are commands, not options
@@ -22890,7 +27462,7 @@ set_backend
 
 cmd="$1"
 
-eval lastarg=\${$#}
+lastarg="${@: -1}"
 
 # Just printout help if run without args
 if [ -z "$cmd" ] ; then
@@ -22942,6 +27514,10 @@ case $cmd in
         create_archive "$target" "$@"
         ;;
     e|x|-e|-x|u|-u|extract|unpack)          # HELPCMD: extract files from archive
+        if [ -n "$extract_dir" ] ; then
+            mkdir -p "$extract_dir" || fatal "Can't create directory '$extract_dir'"
+            extract_dir="$(realpath -s "$extract_dir")"
+        fi
         extract_archive "$@"
         ;;
 # TODO: implement deletion
@@ -22958,8 +27534,7 @@ case $cmd in
         get_archive_type "$1" || fatal "Can't recognize $1 as archive"
         ;;
     basename)             # HELPCMD: print the predicted directory name for the archive
-        nm="$(get_archive_name "$1")" || fatal "Can't recognize $1 as archive"
-        basename "$nm"
+        get_archive_name "$1" || fatal "Can't recognize $1 as archive"
         ;;
     diff)                 # HELPCMD: compare two archive
         # check 2 arg
@@ -23198,14 +27773,16 @@ case $cmd in
         ;;
 esac
 
+rc=0
 for f in "$@" ; do
     if [ "$f" = "-" ] ; then
         process_stdin || fatal
         continue
     fi
-    TYPE=$(get_archive_ext "$f") || TYPE=$(detect_by_content "$f") || { warning "Skipping unrecognized $f" ; continue ; }
-    unpack_type "$TYPE" "$f"
+    TYPE=$(get_archive_ext "$f") || TYPE=$(detect_by_content "$f") || { warning "Skipping unrecognized $f" ; rc=1 ; continue ; }
+    ( unpack_type "$TYPE" "$f" ) || { warning "Failed to unpack $f, skipping..." ; rc=1 ; }
 done
+ return $rc
 }
 ################# end of incorporated bin/tools_ercat #################
 
@@ -23890,10 +28467,12 @@ phelp()
 print_version()
 {
         local tg_link=$(make_osc8_link "https://t.me/useepm")
+        local max_link=$(make_osc8_link "https://max.eepm.ru")
+        local matrix_link=$(make_osc8_link "https://matrix.eepm.ru")
         local wiki_link=$(make_osc8_link "https://wiki.etersoft.ru/Epm")
-        message 'EPM package manager version $EPMVERSION  Telegram: $tg_link  $wiki_link
+        message 'EPM package manager version $EPMVERSION  Telegram: $tg_link  MAX: $max_link  Matrix: $matrix_link  $wiki_link
                  Running on $DISTRNAME/$DISTRVERSION ($PMTYPE package manager uses $PKGFORMAT package format)
-                 Copyright (c) Etersoft 2012-2025
+                 Copyright (c) Etersoft 2012-2026
                  This program may be freely redistributed under the terms of the GNU AGPLv3.'
 }
 
@@ -23906,6 +28485,7 @@ verbose=$EPM_VERBOSE
 quiet=
 nodeps=
 noremove=
+allow_remove=
 dryrun=
 force=
 full=
@@ -23942,6 +28522,8 @@ direct_args=
 ipfs=
 exclude=
 force_overwrite=
+norecommends=
+regexp=
 
 epm_vardir=/var/lib/eepm
 epm_cachedir=/var/cache/eepm
@@ -23951,6 +28533,16 @@ eget_ipfs_db=$epm_vardir/eget-ipfs-db.txt
 for i in $CONFIGDIR/eepm.conf $CONFIGDIR/conf.d/*.conf ; do
     [ -f "$i" ] && . "$i"
 done
+
+# backend can be set in config (EPM_BACKEND), use it for nested epm calls too
+if [ -n "$EPM_BACKEND" ] ; then
+    export EPM_BACKEND
+    set_pm_type
+fi
+
+# export eget settings if set in config
+[ -n "$eget_backend" ] && export EGET_BACKEND="$eget_backend"
+[ -n "$eget_options" ] && export EGET_OPTIONS="$eget_options"
 
 # export proxy settings if set in config
 # Note: apt may require /etc/apt/apt.conf.d/ config, see https://bugzilla.altlinux.org/38543
@@ -24134,7 +28726,7 @@ check_command()
         epm_cmd=update
         direct_args=1
         ;;
-    addrepo|ar|--add-repo)    # HELPCMD: add package repo (etersoft, autoimports, archive 2017/01/31); run with param to get list
+    addrepo|ar|--add-repo)    # HELPCMD: add package repo (etersoft, autoimports, --disabled); run with param to get list
         epm_cmd=addrepo
         direct_args=1
         ;;
@@ -24274,6 +28866,10 @@ check_command()
         epm_cmd=moo
         direct_args=1
         ;;
+    hedgehog)
+        epm_cmd=hedgehog
+        direct_args=1
+        ;;
     prescription|recipe)      # HELPCMD: run prescription (a script to achieving the goal), run without args to get list
         epm_cmd=prescription
         direct_args=1
@@ -24358,6 +28954,10 @@ check_option()
     --noremove|--no-remove)  # HELPOPT: exit if any packages are to be removed during upgrade
         noremove="--no-remove"
         ;;
+    --allow-remove|--allow-erasing) # HELPOPT: allow removing conflicting packages during install
+        noremove=""
+        allow_remove="--allow-remove"
+        ;;
     --no-stdin|--inscript)  # HELPOPT: don't read from stdin for epm args
         inscript=1
         ;;
@@ -24366,6 +28966,9 @@ check_option()
         ;;
     --short)              # HELPOPT: short output (just 'package' instead 'package-version-release')
         short="--short"
+        ;;
+    --debian)             # HELPOPT: filter requires to non-library package names (for requires)
+        debian="--debian"
         ;;
     --direct)              # HELPOPT: direct install package file from ftp (not via hilevel repository manager)
         direct="--direct"
@@ -24392,6 +28995,7 @@ check_option()
         put_to_repo="$(echo "$1" | sed -e 's|--put-to-repo=||')"
         ;;
     --update)              # HELPOPT: run update before install/upgrade
+        [ -n "$direct_args" ] && return 1
         update_repo="--update"
         ;;
     --download-only)       # HELPOPT: download only the package/tarball (before any transformation)
@@ -24423,6 +29027,12 @@ check_option()
         ;;
     --force-overwrite)      # HELPOPT: force overwrite one package's file with another's file
         force_overwrite="--force-overwrite"
+        ;;
+    --norecommends|--no-recommends)  # HELPOPT: skip recommended packages during install
+        norecommends="--norecommends"
+        ;;
+    --regex|--regexp)        # HELPOPT: treat search pattern as regular expression (for grep filter only)
+        regexp="--regexp"
         ;;
     --manual-requires)       # HELPOPT: includes all package dependencies in the install/uninstall list
         manual_requires="--manual-requires"
@@ -24502,7 +29112,7 @@ if [ -n "$quiet" ] ; then
 fi
 
 # fill
-export EPM_OPTIONS="$nodeps $force $full $verbose $debug $quiet $interactive $non_interactive $parallel $save_only $download_only $force_overwrite $manual_requires $noscripts $scripts $dryrun"
+export EPM_OPTIONS="$nodeps $force $full $verbose $debug $quiet $interactive $non_interactive $parallel $save_only $download_only $force_overwrite $manual_requires $noscripts $scripts $dryrun $norecommends $noremove $allow_remove"
 
 # if input is not console and run script from file, get pkgs from stdin too
 if [ -z "$direct_args" ] && [ ! -n "$inscript" ] && [ -p /dev/stdin ] && [ "$EPMMODE" != "pipe" ] ; then
@@ -24565,7 +29175,8 @@ esac
 
 case $epm_cmd in
     upgrade|Upgrade|install|reinstall|release_upgrade|release_downgrade)
-        if [ -n "$parallel" ] && [ -z "$eget_backend" ] ; then
+        # only apt-rpm downloads packages to the cache itself (dnf etc. download in parallel already)
+        if [ -n "$parallel" ] && [ "$PMTYPE" = "apt-rpm" ] && [ -z "$eget_backend" ] ; then
             is_command aria2 && eget_backend=aria2 && echo "Use installed aria2 to parallel package downloading."
             [ -z "$eget_backend" ] && is_command axel && eget_backend=axel && echo "Use installed axel to parallel package downloading."
             [ -n "$eget_backend" ] || info "It is better to install aria2 for parallel downloading."

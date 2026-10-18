@@ -100,7 +100,9 @@ __download_pkg_urls()
         __check_if_wildcard_downloading "$url" && latest=''
 
         # download packages
-        if docmd eget $latest "$url" ; then
+        if docmd eget --tries 3 $latest "$url" ; then
+            # drop wget side-effect log files (wget creates wget-log, wget-log.1, ... on SIGHUP)
+            rm -fv wget-log wget-log.* 2>/dev/null
             local i
             for i in * ; do
                 [ "$i" = "*" ] && warning 'Incorrect true status from eget. No saved files from download $url, ignoring' && continue
@@ -207,7 +209,7 @@ __epm_print_url_alt_check()
 __epm_alt_get_package_url()
 {
     #sudocmd apt-get install -y --print-uris --reinstall "$pkg" | cut -f1 -d " " | grep ".rpm'$" | sed -e "s|^'||" -e "s|'$||"
-    sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y --force-yes --print-uris "$@" | grep -E -o -e "(https?|ftp)://[^']+"
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y --print-uris "$@" | grep -E -o -e "(https?|ftp)://[^']+"
 }
 
 
@@ -226,6 +228,34 @@ __epm_alt_download_to_cache()
     sudocmd_eget --output-dir /var/cache/apt/archives --continue $urls
 }
 
+# download packages from ALT task(s)
+__epm_download_alt_tasks()
+{
+    load_helper epm-sh-backend
+    local task_numbers=""
+    local arg
+    for arg in "$@" ; do
+        local tn="$(get_tasknumber_from_arg "$arg")"
+        [ -n "$tn" ] && task_numbers="$task_numbers $tn"
+    done
+
+    local installlist="$(get_task_packages $*)"
+    installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
+    [ -n "$verbose" ] && info 'Packages from task(s): $installlist'
+
+    # task repos have no rpm-md, so download rpm files directly
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        load_helper epm-install-alt
+        __epm_download_alt_task_files "$installlist" "$@"
+        docmd cp $task_files .
+        return
+    fi
+
+    __use_tmp_apt_for_tasks $task_numbers || return 1
+    [ -n "$verbose" ] && cat "$__EPM_APT_TMPDIR/sources.list"
+    epm_download $installlist
+}
+
 __epm_download_alt()
 {
     local pkg
@@ -240,27 +270,6 @@ __epm_download_alt()
 
     load_helper epm-sh-altlinux
     load_helper epm-installed
-
-    # TODO: enable if install --download-only will works
-    if is_taskarg "$@" ; then
-        load_helper epm-sh-backend
-        local task_numbers=""
-        local arg
-        for arg in "$@" ; do
-            local tn="$(get_tasknumber_from_arg "$arg")"
-            [ -n "$tn" ] && task_numbers="$task_numbers $tn"
-        done
-
-        local installlist="$(get_task_packages $*)"
-        installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
-        [ -n "$verbose" ] && info 'Packages from task(s): $installlist'
-
-        __use_tmp_apt_for_tasks $task_numbers || return 1
-        [ -n "$verbose" ] && cat "$__EPM_APT_TMPDIR/sources.list"
-        epm_download $installlist
-
-        return
-    fi
 
     info "Cleaning apt cache for correct result ..."
     epm --quiet clean
@@ -311,6 +320,11 @@ epm_download()
 
     case "$BASEDISTRNAME" in
         "alt")
+            load_helper epm-sh-altlinux
+            if is_taskarg "$@" ; then
+                __epm_download_alt_tasks "$@"
+                return
+            fi
             if [ "$PMTYPE" = "apt-rpm" ] ; then
                 __epm_download_alt $*
                 return
@@ -327,7 +341,7 @@ epm_download()
         docmd apt-get download $*
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf download $print_url $*
+        sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS download $print_url $*
         ;;
     aptcyg)
         sudocmd apt-cyg download $*
@@ -339,9 +353,6 @@ epm_download()
         # TODO: check yum install --downloadonly --downloaddir=/tmp <package-name>
         assure_exists yumdownloader yum-utils
         sudocmd yumdownloader $*
-        ;;
-    dnf-rpm|dnf5-rpm)
-        sudocmd dnf download $*
         ;;
     urpm-rpm)
         sudocmd urpmi --no-install $URPMOPTIONS $@

@@ -11,8 +11,9 @@ epm assure xdg-desktop-menu xdg-utils || fatal
 BASENAME=$(basename $TAR .tar.xz)
 VERSION=$(echo $BASENAME | sed -e 's|^reaper||' | sed -e 's|_linux_.*||')
 
-erc unpack $TAR || fatal
-SUBDIR="$(echo reaper*)"
+erc --here unpack $TAR || fatal
+# match extracted dir reaper_linux_*, not the tar.xz itself sitting in cwd
+SUBDIR="$(echo reaper_linux_*)"
 subst "s|xdg-desktop-menu install \$2 |xdg-desktop-menu install --mode user --noupdate |" $SUBDIR/install-reaper.sh
 subst "s|--size 256|--size 256 --noupdate|" $SUBDIR/install-reaper.sh
 
@@ -34,5 +35,14 @@ subst "s|$(pwd)/opt/REAPER/reaper|reaper|" usr/share/applications/cockos-reaper.
 PKGNAME=$PRODUCT-$VERSION
 
 erc pack $PKGNAME.tar opt usr || fatal
+
+cat <<EOF >$PKGNAME.tar.eepm.yaml
+name: $PRODUCT
+group: Sound
+license: Proprietary
+url: https://www.reaper.fm/
+summary: REAPER digital audio production application
+description: REAPER is a complete digital audio production application for computers, offering a full multitrack audio and MIDI recording, editing, processing, mixing and mastering toolset.
+EOF
 
 return_tar $PKGNAME.tar

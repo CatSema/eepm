@@ -26,13 +26,12 @@ epm_remove_old_kernels()
 
     case $BASEDISTRNAME in
     "alt")
-        load_helper epm-query_package
-        if ! __epm_query_package kernel-image >/dev/null ; then
+        if ! a='' rpm -qa 'kernel-image-*' 2>/dev/null | grep -q . && [ "$1" != "-h" ] && [ "$1" != "--help" ] ; then
             info "No installed kernel packages, skipping cleaning"
             return
         fi
-        assure_exists update-kernel update-kernel 0.9.9
-        sudocmd remove-old-kernels $dryrun $(subst_option non_interactive -y) "$@"
+        load_helper epm-sh-altlinux-kernel
+        epm_alt_remove_old_kernels "$@" || return
 
         [ -n "$dryrun" ] && return
 

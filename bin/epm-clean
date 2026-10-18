@@ -24,12 +24,17 @@ __remove_alt_apt_cache_file()
     sudocmd rm -vf /var/lib/apt/lists/*pkglist*
     sudocmd rm -vf /var/lib/apt/lists/*release*
 
+    # persistent cache of temporary APT indices (branch/task/named-repo installs)
+    load_helper epm-sh-backend
+    sudocmd rm -rf "$(__epm_apt_cache_dir)"
+
     load_helper epm-sh-altlinux-contents-index
     clean_alt_contents_index
 
     sudocmd rm -vf $epm_vardir/available-packages
 
     sudocmd rm -vf $eget_ipfs_db
+    sudocmd rm -vf $epm_vardir/eget-ipfs-db-remote.txt
     return 0
 }
 
@@ -70,7 +75,11 @@ case $PMTYPE in
         #sudocmd yum makecache
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf clean all
+        if [ -n "$dryrun" ] ; then
+            showcmd $DNFCMD clean all
+            return 0
+        fi
+        sudocmd $DNFCMD clean all
         ;;
     urpm-rpm)
         sudocmd urpmi --clean

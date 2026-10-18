@@ -12,12 +12,13 @@ subst "s|^Group:.*|Group: Development/Tools|" $SPEC
 subst "s|^URL:.*|URL: https://openide.ru/|" $SPEC
 subst "s|^Summary:.*|Summary: openIDE - Free IDE based on IntelliJ IDEA Community Edition|" $SPEC
 
-move_to_opt "/$PRODUCTCUR-*"
-
 add_bin_link_command $PRODUCT $PRODUCTDIR/bin/$PRODUCT.sh
 add_bin_link_command $PRODUCTCUR $PRODUCT
 
-wmClass="$(get_json_value $PRODUCTDIR/product-info.json '["launch",0,"startupWmClass"]')"
+# Stable builds may ship an empty product-info.json.
+if [ -s "$BUILDROOT$PRODUCTDIR/product-info.json" ] ; then
+    wmClass="$(get_json_value .$PRODUCTDIR/product-info.json '["launch",0,"startupWmClass"]')"
+fi
 [ -n "$wmClass" ] || wmClass="$PRODUCT"
 
 cat <<EOF | create_file /usr/share/applications/$wmClass.desktop
@@ -46,4 +47,3 @@ pack_dir $PRODUCTDIR/
 pack_dir $PRODUCTDIR/bin/
 pack_dir $PRODUCTDIR/lib/
 pack_dir $PRODUCTDIR/plugins/
-

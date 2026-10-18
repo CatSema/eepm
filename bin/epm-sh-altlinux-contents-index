@@ -86,6 +86,7 @@ eget_alt_contents_index()
     local TD="$2"
     local res
     [ -n "$USER" ] && [ -f $TD ] && sudorun chown -R $USER $TD
+    [ -z "$quiet" ] && info "    $URL -> $TD"
     eget --timestamping --compressed -O $TD $URL
     res=$?
     [ -f "$TD" ] && sudorun chmod a+rw "$TD"
@@ -98,8 +99,29 @@ get_url_to_etersoft_mirror()
     local REPOPATH
     local ETERSOFT_MIRROR="rsync://download.etersoft.ru/pub"
     local ALTREPO=$(get_alt_repo_path "$1")
-    echo "$ALTREPO" | grep -q "^ALTLinux" || echo "$ALTREPO" | grep -q "^altlinux" || return
-    echo "$ETERSOFT_MIRROR/$(echo "$ALTREPO" | sed -E 's@^(ALTLinux|altlinux)/@ALTLinux/contents_index/@')"
+    case "$ALTREPO" in
+        ALTLinux/*|altlinux/*)
+            echo "$ETERSOFT_MIRROR/$(echo "$ALTREPO" | sed -E 's@^(ALTLinux|altlinux)/@ALTLinux/contents_index/@')"
+            ;;
+        Etersoft/Sisyphus/Deferred/*|Etersoft/Sisyphus/Deferred_DEVEL/*|Etersoft/Sisyphus/Deferred_BETA/*)
+            # Deferred repositories already publish contents_index.gz in base/.
+            echo "$ETERSOFT_MIRROR/$ALTREPO"
+            ;;
+    esac
+}
+
+# gz is read via gunzip, so check it with gzip directly
+# (erc test fails if there is no erc backend, it is not a broken file)
+__test_contents_index_file()
+{
+    case "$1" in
+        *.gz)
+            a='' gzip -t "$1" 2>/dev/null
+            ;;
+        *)
+            erc --quiet test "$1" >/dev/null 2>/dev/null
+            ;;
+    esac
 }
 
 # "comment" "file"
@@ -109,7 +131,7 @@ __add_to_contents_index_list()
     local file="$2"
     [ -n "$verbose" ] && info 'Put $comment -> $file'
     [ -s "$file" ] || return
-    if rhas "$file" "\." && ! erc test "$file" 2>/dev/null ; then
+    if rhas "$file" "\." && ! __test_contents_index_file "$file" ; then
         warning "Broken contents_index: $file" ; rm -f "$file" ; return 1
     fi
     echo "$file" >>$ALT_CONTENTS_INDEX_LIST
@@ -130,6 +152,13 @@ __add_better_to_contents_index_list()
 check_alt_contents_index()
 {
     [ -f "$ALT_CONTENTS_INDEX_LIST" ]
+}
+
+# init contents_index cache if it is missed or empty (retry after a failed retrieving)
+assure_alt_contents_index()
+{
+    [ -s "$ALT_CONTENTS_INDEX_LIST" ] && return
+    init_alt_contents_index
 }
 
 clean_alt_contents_index()
@@ -159,14 +188,14 @@ update_alt_contents_index()
 
     info "Retrieving contents_index ..."
 
-    mapfile -t URL_LIST < <(
-        (quiet=1 epm_repolist) | \
+    local URL_LIST_FILE
+    URL_LIST_FILE="$(mktemp)" || return
+    (quiet=1 epm_repolist) | \
         grep -v " task$" | \
         grep -E "rpm.*(ftp://|http://|https://|rsync://|file:/)" | \
-        sed -e "s@.*rpm.*file:/@/@" -e "s@^.*\]@@" -e "s@^rpm *@@"
-    )
+        sed -e "s@.*rpm.*file:/@/@" -e "s@^.*\]@@" -e "s@^rpm *@@" > "$URL_LIST_FILE"
 
-    for line in "${URL_LIST[@]}"; do
+    while read -r line; do
         URL1=$(echo "$line" | awk '{print $1}')
         URL2=$(echo "$line" | awk '{print $2}')
         component=$(echo "$line" | awk '{print $3}')
@@ -240,6 +269,6 @@ update_alt_contents_index()
 
         #warning "Can't download contents_index from $URL/base"
 
-    done
+    done < "$URL_LIST_FILE"
+    rm -f "$URL_LIST_FILE"
 }
-

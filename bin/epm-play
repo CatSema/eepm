@@ -45,10 +45,23 @@ __remove_installed_app()
 }
 
 
+__is_repo_play_app_installed()
+{
+    local app="$1"
+    local list_file="$CONFIGDIR/repo-play-apps.list"
+    [ -s "$list_file" ] || return 1
+    grep -q "^$app$" "$list_file" || return 1
+    # App is in the repo list — check if its package is actually installed
+    local pkg
+    pkg="$(__run_script "$app" --package-name </dev/null 2>/dev/null)"
+    [ -n "$pkg" ] && epm status --installed "$pkg" </dev/null
+}
+
 __is_app_installed()
 {
-    __run_script "$1" --installed "$2"
-    return
+    __run_script "$1" --installed "$2" && return 0
+    # Fallback: check if app is repo-installed (listed in repo-play-apps.list)
+    __is_repo_play_app_installed "$1"
 }
 
 
@@ -134,7 +147,7 @@ __list_app_packages_table()
     [ "$arch" = "x86_64" ] && IGNOREi586='NoNo' || IGNOREi586='i586-'
 
     __get_fast_short_list_app $arch | LC_ALL=C sort -k1,1 >$tmplist
-    grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" $psdir/*.sh | xargs grep -oP "^PKGNAME=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1 |" | grep -v -E "(^$IGNOREi586|^common|#.*$)" | LC_ALL=C sort -k1,1 >$tmplist1
+    find $psdir -maxdepth 1 -name '*.sh' ! -type l | xargs grep -l -E "^SUPPORTEDARCHES=(''|\"\"|.*\<$arch\>)" | xargs grep -oP "^PKGNAME=[\"']*\K[^\"']+"  | sed -e "s|.*/\(.*\).sh:|\1 |" | grep -v -E "(^$IGNOREi586|^common|#.*$)" | LC_ALL=C sort -k1,1 >$tmplist1
     # tmplist - app
     # tmplist1 - app package
     __print_targeted_packages $tmplist1 | LC_ALL=C join -j 1 -a 1 $tmplist - | while read -r app package ; do
@@ -222,10 +235,27 @@ __get_installed_table()
     rm -f $pkglist
 }
 
+__get_repo_installed_apps()
+{
+    local found_apps="$1"
+    local list_file="$CONFIGDIR/repo-play-apps.list"
+    [ -s "$list_file" ] || return
+    local app
+    while read -r app ; do
+        [ -n "$app" ] || continue
+        [ "${app#\#}" != "$app" ] && continue
+        echo "$found_apps" | grep -q "^$app$" && continue
+        __is_repo_play_app_installed "$app" </dev/null 2>/dev/null && echo "$app"
+    done <"$list_file"
+}
+
 __list_installed_app()
 {
     # get all installed packages and convert it to a apps list
-    __get_installed_table | cut -f2 -d" "
+    local apps
+    apps="$(__get_installed_table | cut -f2 -d" ")"
+    [ -n "$apps" ] && echo "$apps"
+    __get_repo_installed_apps "$apps"
 }
 
 __list_installed_packages()
@@ -272,9 +302,10 @@ Options:
     --list                - list all installed apps
     --list-all            - list all available apps
     --search <pattern>    - search available apps by name or description
+    --list-updates        - list installed apps that have available updates
     --list-scripts        - list all available scripts
     --short (with --list) - list names only
-    --installed <app>     - check if the app is installed
+    --installed [<app>]   - check if the app is installed (list all installed apps without <app>)
     --ipfs <app>          - use IPFS for downloading
     --product-alternatives- list alternatives (use like epm play app=beta)
 
@@ -305,7 +336,7 @@ __epm_play_update()
     RES=0
     for i in $* ; do
         echo
-        echo "$i"
+        info 'Updating $i ...'
             if ! __is_app_installed "$i" ; then
                 continue
             fi
@@ -354,55 +385,139 @@ __epm_play_install_one()
         __epm_play_run "$prescription" --run "$@" || fatal "There was some error during run $prescription script."
     fi
 }
-__get_latest_package_version()
+
+__download_versions_list()
 {
-    local pkg="$1"
-    local ver
+    local target="$1"
+    local epmver="$(epm --short --version)"
+    # use baseversion (strip last .N)
+    epmver=$(echo "$epmver" | sed -e 's|\.[0-9]*$||')
 
-    [ -n "$pkg" ] || return 1
+    local URL
+    for URL in "https://eepm.ru/releases/$epmver/app-versions" "https://eepm.ru/app-versions" ; do
+        eget -q --force -O "$target" "$URL/epm-play-list-full.txt" && return
+    done
+    return 1
+}
 
-    ver="$(fetch_url "https://eepm.ru/app-versions/$pkg")"
+# output: pkg app installed_version
+__get_installed_table_with_versions()
+{
+    local tapt
+    tapt="$(mktemp)" || fatal
+    remove_on_exit $tapt
 
-    if [ -n "$ver" ] ; then
-        echo "$ver"
-        return 0
+    local pkglist
+    pkglist="$(mktemp)" || fatal
+    remove_on_exit $pkglist
+
+    if [ "$PKGFORMAT" = "rpm" ] ; then
+        # pkglist: pkg version EPM <support@...>
+        __get_all_rpm_repacked_packages | LC_ALL=C sort -u >$pkglist
+        __list_app_packages_table $pkglist | LC_ALL=C sort -u >$tapt
+        # join gives: pkg app version EPM <support@...>
+        LC_ALL=C join -11 -21 $tapt $pkglist | uniq | awk '{print $1, $2, $3}'
+    else
+        local verlist
+        verlist="$(mktemp)" || fatal
+        remove_on_exit $verlist
+
+        local instpkgs
+        instpkgs="$(mktemp)" || fatal
+        remove_on_exit $instpkgs
+
+        epm --short packages | LC_ALL=C sort -u >$pkglist
+        __list_app_packages_table $pkglist | LC_ALL=C sort -u >$tapt
+        __filter_by_installed_packages $tapt $pkglist | LC_ALL=C sort -k1,1 >$instpkgs
+
+        # get versions for all installed packages
+        dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | LC_ALL=C sort -k1,1 >$verlist
+
+        # join to add versions: pkg app version
+        LC_ALL=C join -11 -21 $instpkgs $verlist | awk '{print $1, $2, $3}'
     fi
 
-    return 1
+    rm -f $tapt $pkglist
+}
+
+__compare_versions()
+{
+    local latest="$1"
+    local installed="$2"
+
+    case "$PKGFORMAT" in
+        rpm)
+            if is_command rpmevrcmp ; then
+                a= rpmevrcmp "$latest" "$installed"
+            else
+                a= rpm --eval "%{lua:print(rpm.vercmp('$latest', '$installed'))}"
+            fi
+            ;;
+        deb)
+            a= dpkg --compare-versions "$latest" gt "$installed" && echo "1" && return
+            echo "0"
+            ;;
+        *)
+            epm print compare version "$latest" "$installed" 2>/dev/null
+            ;;
+    esac
 }
 
 __list_available_updates()
 {
+    local installed_file latest_file joined_file
+    installed_file="$(mktemp)" || fatal
+    remove_on_exit $installed_file
+    latest_file="$(mktemp -u)" || fatal
+    remove_on_exit $latest_file
+    joined_file="$(mktemp)" || fatal
+    remove_on_exit $joined_file
 
-    local installed_table pkg app installed latest cmp header_printed updates_found line
+    # Step 1: get installed packages with versions: pkg app installed_version
+    __get_installed_table_with_versions | LC_ALL=C sort -k1,1 >$installed_file
 
-    installed_table="$(__get_installed_table)"
+    [ -s "$installed_file" ] || return 0
 
-    [ -n "$installed_table" ] || return 0
+    # Step 2: download bulk versions list: pkg latest_version [release]
+    __download_versions_list "$latest_file" || { warning "Can't download versions list" ; return 1 ; }
+    [ -s "$latest_file" ] || { warning "Empty versions list" ; return 1 ; }
 
-    updates_found=0
+    # for deb, lowercase the package name field for case-insensitive join
+    if [ "$PKGFORMAT" = "deb" ] ; then
+        awk '{$1=tolower($1); print}' "$latest_file" | LC_ALL=C sort -k1,1 -o "$latest_file"
+    else
+        LC_ALL=C sort -k1,1 "$latest_file" -o "$latest_file"
+    fi
 
-    while IFS= read -r line ; do
+    # Step 3: join on package name
+    # installed_file: pkg app installed_version
+    # latest_file: pkg latest_version [release]
+    # result: pkg app installed_version latest_version [release]
+    # Keep apps absent from the catalog: their target may come from an
+    # installed driver (hplip-plugin, virtualbox-extpack).
+    LC_ALL=C join -a1 -11 -21 "$installed_file" "$latest_file" >"$joined_file"
 
-        [ -n "$line" ] || continue
-        set -- $line
-        pkg="$1"
-        app="$2"
+    # Step 4: compare versions and output updates
+    local updates_found=0
+    local header_printed
+    local pkg app installed latest
 
+    while read -r pkg app installed latest _ ; do
         [ -n "$pkg" ] || continue
-        [ -n "$app" ] || continue
-
-        installed="$(epm print version for package "$pkg" 2>/dev/null | head -n1)"
-
         [ -n "$installed" ] || continue
-
-        latest="$(__get_latest_package_version "$pkg")"
-
-        [ -n "$latest" ] || continue
-
-        cmp="$(epm print compare package version "$latest" "$installed" 2>/dev/null)"
-
-        [ "$cmp" = "1" ] || continue
+        if grep -q '^get_target_version()' "$psdir/$app.sh" 2>/dev/null ; then
+            latest="$(__run_script "$app" --available-version 2>/dev/null)" || continue
+            [ -n "$latest" ] || continue
+            # Ignore packaging epoch/release; the plugin must match its driver
+            # after both upgrades and downgrades.
+            local installed_target
+            installed_target="$(epm print version for package "$pkg" 2>/dev/null | head -n1)"
+            [ -n "$installed_target" ] || continue
+            [ "$installed_target" != "$latest" ] || continue
+        else
+            [ -n "$latest" ] || continue
+            [ "$(__compare_versions "$latest" "$installed")" = "1" ] || continue
+        fi
 
         updates_found=1
 
@@ -422,13 +537,13 @@ __list_available_updates()
             printf "  %-25s %s -> %s\n" "$app" "$installed" "$latest"
         fi
 
-    done <<EOF
-    $installed_table
-EOF
+    done < "$joined_file"
 
-    if [ "$updates_found" -eq 0 ] && [ -z "$short" ] && [ -z "$quiet" ] ; then
+    if [ "$updates_found" = "0" ] && [ -z "$short" ] && [ -z "$quiet" ] ; then
         echo "All installed applications are up to date."
     fi
+
+    rm -f "$installed_file" "$latest_file" "$joined_file"
 }
 
 
@@ -498,10 +613,9 @@ __epm_play_install()
    return $RES
 }
 
-__epm_play_download_epm_file()
+__epm_play_download_ipfs_db()
 {
     local target="$1"
-    local file="$2"
     # use short version (3.4.5)
     local epmver="$(epm --short --version)"
     # use baseversion
@@ -509,37 +623,57 @@ __epm_play_download_epm_file()
 
     local URL
     for URL in "https://eepm.ru/releases/$epmver/app-versions" "https://eepm.ru/app-versions" ; do
-        info "Updating local IPFS DB in $eget_ipfs_db file from $URL/eget-ipfs-db.txt"
-        docmd eget -q -O "$target" "$URL/$file" && return
+        info "Updating cached IPFS DB in $target from $URL/eget-ipfs-db.txt"
+        docmd eget --timestamping -q -O "$target" "$URL/eget-ipfs-db.txt" && return
     done
 }
 
 
 __epm_play_initialize_ipfs()
 {
-    if [ ! -d "$(dirname "$eget_ipfs_db")" ] ; then
-        warning "ipfs db dir $eget_ipfs_db does not exist, skipping IPFS mode"
+    if [ ! -d "$epm_vardir" ] ; then
+        warning "ipfs db dir $epm_vardir does not exist, skipping IPFS mode"
         return 1
     fi
 
-    if [ ! -r "$eget_ipfs_db" ] ; then
-        sudorun touch "$eget_ipfs_db" >&2
-        sudorun chmod -v a+rw "$eget_ipfs_db" >&2
+    local eget_ipfs_db_local=$eget_ipfs_db
+
+    # ensure local writable db exists
+    if [ ! -r "$eget_ipfs_db_local" ] ; then
+        sudorun touch "$eget_ipfs_db_local" >&2
+        sudorun chmod -v a+rw "$eget_ipfs_db_local" >&2
     fi
 
-    # download and merge with local db
-    local t
-    t=$(mktemp -u) || fatal
-    remove_on_exit $t
-    __epm_play_download_epm_file "$t" "eget-ipfs-db.txt" || warning "Can't update IPFS DB"
-    if [ -s "$t" ] && [ -z "$EPM_IPFS_DB_UPDATE_SKIPPING" ] ; then
-        echo >>$t
-        cat $eget_ipfs_db >>$t
-        sort -u < $t | grep -v "^$" > $eget_ipfs_db
+    if [ -n "$EPM_IPFS_DB_UPDATE_SKIPPING" ] ; then
+        # skip remote db download (for the source server that generates the db)
+        export EGET_IPFS_DB="$eget_ipfs_db_local"
+        return
     fi
 
-    # the only one thing is needed to enable IPFS in eget
-    export EGET_IPFS_DB="$eget_ipfs_db"
+    local eget_ipfs_db_remote=$epm_vardir/eget-ipfs-db-remote.txt
+
+    # ensure remote cached db is writable
+    if [ ! -w "$eget_ipfs_db_remote" ] ; then
+        sudorun touch "$eget_ipfs_db_remote" >&2
+        sudorun chmod -v a+rw "$eget_ipfs_db_remote" >&2
+    fi
+
+    # download remote db with timestamping (skip if not changed)
+    __epm_play_download_ipfs_db "$eget_ipfs_db_remote" || warning "Can't update IPFS DB"
+
+    # one-time migration: remove entries already in remote from the local db
+    if [ -s "$eget_ipfs_db_remote" ] && [ -s "$eget_ipfs_db_local" ] ; then
+        local cleaned
+        cleaned=$(grep -vxFf "$eget_ipfs_db_remote" "$eget_ipfs_db_local")
+        if [ -n "$cleaned" ] ; then
+            echo "$cleaned" > "$eget_ipfs_db_local"
+        else
+            : > "$eget_ipfs_db_local"
+        fi
+    fi
+
+    # eget reads from all files, writes new entries to the last one
+    export EGET_IPFS_DB="$eget_ipfs_db_remote $eget_ipfs_db_local"
 }
 
 epm_play()
@@ -591,6 +725,14 @@ case "$1" in
 
     --update|--upgrade)
         shift
+        # handle --latest/--force after --update
+        while true ; do
+            case "$1" in
+                --latest) shift ; export latest="true" ;;
+                --force)  shift ; force=1 ;;
+                *) break ;;
+            esac
+        done
         local CMDUPDATE="--update"
         # check --force on common.sh side
         #[ -n "$force" ] && CMDUPDATE="--run"
@@ -602,8 +744,13 @@ case "$1" in
         local list
         if [ "$1" = "all" ] ; then
             shift
-            info "Retrieving list of installed apps ..."
-            list="$(__list_installed_app)"
+            info "Checking for available updates ..."
+            list="$(short=1 __list_available_updates)"
+            if [ -z "$list" ] ; then
+                info "All installed applications are up to date."
+                exit
+            fi
+            info "Apps to update: $(echo $list | wc -w)"
         else
             list="$*"
         fi
@@ -614,6 +761,10 @@ case "$1" in
 
     --installed)
         shift
+        if [ -z "$1" ] ; then
+            __epm_play_list_installed | __epm_colorize_search_output
+            exit
+        fi
         __is_app_installed "$1" "$2"
         #[ -n "$quiet" ] && exit
         exit
@@ -666,7 +817,7 @@ case "$1" in
         exit
         ;;
 
-    --list-updates)
+    --list-updates|--list-upgradable)
         __list_available_updates
         exit
         ;;

@@ -338,6 +338,12 @@ sed_escape()
     echo "$*" | sed -e 's|[][()$*.^|/]|\\&|g'
 }
 
+# Like sed_escape but treat / and space as equivalent ([/ ]+)
+sed_escape_relaxed()
+{
+    echo "$*" | sed -e 's|[][()$*.^|]|\\&|g' -e 's|[/ ]\+|[/ ][/ ]*|g'
+}
+
 
 # param true false
 subst_option()
@@ -419,7 +425,9 @@ __promo_message()
     local PROMOMESSAGE="$EPMPROMOMESSAGE"
     if [ -z "$PROMOMESSAGE" ] ; then
         local tg_link=$(make_osc8_link "https://t.me/useepm")
-        PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: $tg_link)"
+        local max_link=$(make_osc8_link "https://max.eepm.ru")
+        local matrix_link=$(make_osc8_link "https://matrix.eepm.ru")
+        PROMOMESSAGE=" (you can discuss this problem (epm $EPMVERSION on $DISTRNAME/$DISTRVERSION) in Telegram: $tg_link, MAX: $max_link, Matrix: $matrix_link)"
     fi
     echo "$PROMOMESSAGE"
 }
@@ -449,7 +457,7 @@ fixme()
 # Print debug message
 debug()
 {
-    [ -n "$debug" ] || return
+    [ -z "$debug" ] && return
 
     set_color $YELLOW >&2
     echog -n "WARNING: " >&2
@@ -585,10 +593,10 @@ withtimeout()
         $TO "$@"
         return
     fi
-    fatal "Possible indefinite wait due timeout command is missed"
-    # fallback: drop time arg and run without timeout
-    #shift
-    #"$@"
+    # fallback: no timeout cmd (e.g. busybox built without applet) — drop time arg and run without timeout
+    warning "timeout command is missed, running without timeout"
+    shift
+    "$@"
 }
 
 set_eatmydata()
@@ -619,9 +627,15 @@ __get_package_for_command()
     esac
 }
 
+# check if /dev/tty can be opened (it exists, but can't be opened without a controlling terminal)
+has_tty()
+{
+    ( : </dev/tty ) 2>/dev/null
+}
+
 # read from /dev/tty if available, otherwise from stdin
 read_tty() {
-    if [ -c /dev/tty ] ; then
+    if has_tty ; then
         read -r "$@" </dev/tty
     else
         read -r "$@"
@@ -673,9 +687,10 @@ confirm_yes() {
 confirm_info()
 {
     info "$*" >&2
-    if [ -z "$non_interactive" ] ; then
-        confirm "Are you sure? [y/N]" || fatal "Exiting"
-    fi
+    [ -n "$non_interactive" ] && return
+    confirm "Are you sure? [y/N]" && return
+    has_tty || [ -t 0 ] || fatal 'There is no terminal to ask for confirmation. Use --auto to confirm automatically.'
+    fatal "Exiting"
 
 }
 
@@ -1016,7 +1031,8 @@ __epm_assure_7zip()
     if is_command 7z || is_command 7za || is_command 7zr || is_command 7zz ; then
         :
     else
-        epm install 7-zip || epm install p7zip
+        # most distros provide 7zip package, including alt p11 and newer, but p10 and older not.
+        epm install 7zip || epm install 7-zip || epm install p7zip
     fi
 }
 
@@ -1100,7 +1116,8 @@ is_package_file()
 get_package_type()
 {
     local i
-    case $1 in
+    local _bn="$(basename "$1")"
+    case $_bn in
         *.deb)
             echo "deb"
             return
@@ -1129,13 +1146,17 @@ get_package_type()
             echo "AppImage"
             return
             ;;
+        *.pkg.tar.*)
+            echo "pkg.tar.$(echo "$_bn" | sed -e 's|.*\.pkg\.tar\.||')"
+            return
+            ;;
         *)
             if [ -r "$1" ] && file -L "$1" | grep -q " ELF " ; then
                 echo "ELF"
                 return
             fi
             # print extension by default
-            basename "$1" | sed -e 's|.*\.||'
+            echo "$_bn" | sed -e 's|.*\.||'
             return 1
             ;;
     esac
@@ -1235,13 +1256,28 @@ set_pm_type()
 # override package manager detection result
 if [ -n "$EPM_BACKEND" ] ; then
     PMTYPE="$EPM_BACKEND"
-    return
 fi
 # obsoleted
 if [ -n "$FORCEPM" ] ; then
     PMTYPE="$FORCEPM"
-    return
 fi
+
+# normalize short backend names
+case "$PMTYPE" in
+    dnf5)
+        PMTYPE="dnf5-rpm"
+        ;;
+esac
+
+# set DNFCMD based on PMTYPE
+case "$PMTYPE" in
+    dnf5-rpm)
+        DNFCMD="dnf5"
+        ;;
+    dnf-rpm)
+        DNFCMD="dnf"
+        ;;
+esac
 
 }
 
@@ -1360,8 +1396,8 @@ filter_glob_list()
 is_url()
 {
     echo "$1" | grep -qE "^(file|ftp|http|https|ipfs|rsync):/" && return 0
-    # SSH/rsync URL: host:/path or user@host:/path (but not scheme://)
-    echo "$1" | grep -qE '^[^:]+:/' && ! echo "$1" | grep -q "://"
+    # SSH/rsync URL: host:/path or user@host:/path (but not scheme://, not 'rpm file:/path ...')
+    echo "$1" | grep -qE '^[^:[:space:]]+:/' && ! echo "$1" | grep -q "://"
 }
 
 # detect bash
@@ -1435,7 +1471,7 @@ __epm_suggest_similar_packages()
     is_command fzf || return 1
 
     local similar
-    similar="$(fzf -f "$pkg" < "$cache" 2>/dev/null | head -$count)"
+    similar="$(fzf -f "$pkg" < "$cache" 2>/dev/null | grep -v "^${pkg}$" | head -$count)"
     [ -z "$similar" ] && return 1
 
     # Interactive selection if enabled (via config or --interactive flag)
@@ -1494,3 +1530,20 @@ else
 		eval "echo -n \"$@\""
 	}
 fi
+
+# Load YAML fields into shell variables safely (prevents command injection)
+# Usage: yaml_load_vars file.yaml field1 field2 field3 ...
+yaml_load_vars()
+{
+    local file="$1"
+    shift
+    local data field value
+    data="$(epm tool yaml "$file" 2>/dev/null)"
+    for field in "$@" ; do
+        value="$(printf '%s\n' "$data" | grep "^${field}=" | head -n1 | sed "s/^[^=]*=\"\(.*\)\"$/\1/")"
+        # skip if key is not present in yaml (preserve existing value)
+        [ -n "$value" ] || continue
+        # Use single quotes to prevent command execution in values
+        eval "$field='$(printf '%s' "$value" | sed "s/'/'\\\\''/g")'"
+    done
+}

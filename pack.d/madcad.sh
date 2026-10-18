@@ -9,7 +9,7 @@ VERSION="$3"
 BASENAME=$(basename $TAR .tar.gz)
 VERSION=$(echo $BASENAME | sed -e 's|^uimadcad_||' | sed -e 's|_x86_64||')
 
-erc unpack $TAR || fatal
+erc --here unpack $TAR || fatal
 
 cd linux*
 
@@ -27,5 +27,14 @@ subst 's|/share/madcad|/madcad|' opt/madcad/madcad
 PKGNAME=$PRODUCT-$VERSION
 
 erc pack $PKGNAME.tar opt usr || fatal
+
+cat <<EOF >$PKGNAME.tar.eepm.yaml
+name: $PRODUCT
+group: Engineering
+license: LGPL-3.0
+url: https://madcad.netlify.app/
+summary: MadCAD 3D CAD modeling tool
+description: MadCAD is a 3D CAD modeling tool.
+EOF
 
 return_tar $PKGNAME.tar

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-PKGNAME=Autodesk_EAGLE
+PKGNAME=eagle
 SUPPORTEDARCHES="x86_64"
 VERSION="$2"
 DESCRIPTION="EAGLE (EDA software) from the official site"
@@ -19,4 +19,4 @@ if ! eget --check-site "$PKGURL" ; then
     PKGURL="$IPFSURL"
 fi
 
-install_pkgurl
+install_pack_pkgurl

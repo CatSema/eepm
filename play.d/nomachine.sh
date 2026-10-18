@@ -8,6 +8,9 @@ URL="https://www.nomachine.com"
 
 . $(dirname $0)/common.sh
 
+DOWNLOADURL="https://download.nomachine.com/download/?id=43&platform=linux"
+
+
 arch="$(epm print info -a)"
 pkgtype="$(epm print info -p)"
 case "$pkgtype" in
@@ -34,21 +37,23 @@ case "$arch-$pkgtype" in
 esac
 
 if [ "$VERSION" = "*" ] ; then
-    #VERSION="$(eget -O- https://downloads.nomachine.com/download/?id=4 | grep -A1 "Version:" | tail -n1 | sed -e 's|.*<p>\([0-9.]*\)_1</p>.*|\1|')"
-    # it is hard to get the page with version
-    VERSION=9.2.18
-    [ -n "$VERSION" ] || fatal "Can't get version"
+    # NoMachine removes old package files, so don't use stale app-versions here.
+    PKGURL="$(eget -q -O- "$DOWNLOADURL" | grep -o "https://web9001\\.nomachine\\.com/download/[0-9.]*/Linux/nomachine-personal-edition_[0-9.]*_[0-9]*_$arch\\.$pkgtype" | head -n1)"
+    [ -n "$PKGURL" ] || fatal "Can't get NoMachine package URL"
+    install_pack_pkgurl
+    exit
 fi
 
-# 9.2.18 -> 9.2
-base=$(echo "$VERSION" | sed -e 's|\.[0-9]*$||')
+# 9.5.7 -> 9.5
+base=$(echo "$VERSION" | sed -e 's|_[0-9]*$||' -e 's|\.[0-9]*$||')
 
-# FIXME: hack for 9.2
-VERSION="${VERSION}_3"
+if ! echo "$VERSION" | grep -q '_[0-9]*$' ; then
+    # NoMachine package release suffix.
+    VERSION="${VERSION}_1"
+fi
 
 #mask="$(epm print constructname $PKGNAME "$VERSION*" $arch $pkgtype)"
-# https://web9001.nomachine.com/download/9.2/Linux/nomachine_9.2.18_3_x86_64.rpm
-PKGURL="https://web9001.nomachine.com/download/$base/Linux/nomachine_${VERSION}_$arch.$pkgtype"
+# https://web9001.nomachine.com/download/10.0/Linux/nomachine-personal-edition_10.0.57_2_x86_64.rpm
+PKGURL="https://web9001.nomachine.com/download/$base/Linux/nomachine-personal-edition_${VERSION}_$arch.$pkgtype"
 
-install_pkgurl
-
+install_pack_pkgurl

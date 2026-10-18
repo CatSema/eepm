@@ -17,17 +17,18 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-PROGDIR=$(dirname $0)
+PROGDIR=$(dirname "$0")
 [ "$PROGDIR" = "." ] && PROGDIR=$(pwd)
+ERCAT="$PROGDIR/$(basename "$0" | sed 's|erc$|ercat|')"
 
 # will replaced to /usr/share/erc during install
-SHAREDIR=$(dirname $0)
+SHAREDIR=$(dirname "$0")
 
 load_helper()
 {
     local CMD="$SHAREDIR/$1"
     [ -r "$CMD" ] || fatal "Have no $CMD helper file"
-    . $CMD
+    . "$CMD"
 }
 
 load_helper erc-sh-functions
@@ -38,7 +39,7 @@ check_tty
 # 1.zip tar:  -> 1.tar
 build_target_name()
 {
-	is_target_format $2 && echo $(get_archive_name "$1").${2/:/} && return
+	is_target_format $2 && echo $(dirname "$1")/$(get_archive_name "$1").${2/:/} && return
 	echo "$1"
         return 1
 }
@@ -64,22 +65,37 @@ create_archive()
 			docmd tar cvf "$arc" "$@"
 			;;
 		*)
-			# TODO: fix symlinks support
 			# https://bugzilla.altlinux.org/49852
 			# FIXME: creating .tar.* (.tar.gz) is not supported
-			docmd $HAVE_7Z a -l "$arc" "$@"
+			docmd $HAVE_7Z a -snl "$arc" "$@"
 			#fatal "Not yet supported creating of $type archives"
 			;;
 	esac
 }
 
 # Extract archive with 7z into subdir
+__7z_snld_flag=""
+__7z_snld_checked=""
+
+# Get -snld flag if supported (7z 25.01+ rejects symlinks with ../ by default)
+get_7z_snld()
+{
+	if [ -z "$__7z_snld_checked" ] ; then
+		__7z_snld_checked=1
+		local ver
+		ver=$($HAVE_7Z 2>&1 | sed -n 's/.*[Zz]ip.*[[:space:]]\([0-9]*\)\.\([0-9]*\).*/\1\2/p' | head -1)
+		[ "${ver:-0}" -ge 2501 ] && __7z_snld_flag="-snld"
+	fi
+	echo $__7z_snld_flag
+}
+
 extract_7z_to_subdir()
 {
 	local arc="$1"
 	local subdir="$2"
+	assure_7z
 	mkdir -p "$subdir" && cd "$subdir" || fatal
-	docmd $HAVE_7Z x "$arc"
+	docmd $HAVE_7Z x -y $(get_7z_snld) "$arc"
 }
 
 # Extract squashfs-based archives (squashfs, snap)
@@ -87,11 +103,51 @@ extract_squashfs_image()
 {
 	local arc="$1"
 	local subdir="$2"
-	if is_command unsquashfs ; then
-		docmd unsquashfs -d "$subdir" "$arc"
+	if [ -z "$ERC_USE_7Z_SQUASHFS" ] && is_command unsquashfs ; then
+		docmd unsquashfs -no-xattrs -d "$subdir" "$arc"
 	else
 		extract_7z_to_subdir "$arc" "$subdir"
 	fi
+}
+
+# Extract makeself payload as tar stream to stdout
+extract_makeself_tar()
+{
+	local arc="$1"
+
+	# Extract header line count
+	# New makeself (2.4+): skip="715" variable
+	# Old makeself: head -n 588 (literal number)
+	local lines
+	lines=$(sed -n 's/^skip="\{0,1\}\([0-9]\{1,\}\)"\{0,1\}/\1/p' "$arc" | head -1)
+	if [ -z "$lines" ] ; then
+		lines=$(grep -am1 -oP '(?<=head -n )\d+' "$arc")
+	fi
+	[ -n "$lines" ] || fatal "Can't find header line count in makeself archive $arc"
+
+	# Calculate byte offset of payload
+	local offset
+	offset=$(head -n "$lines" "$arc" | wc -c | tr -d " ")
+
+	# Detect compression method for info message
+	local compress
+	compress=$(sed -n 's/^.*Compression: \(.*\)/\1/p' "$arc" | head -1)
+	if [ -z "$compress" ] ; then
+		compress=$(sed -n "s/^COMPRESS=//p" "$arc" | head -1 | tr -d "'\"")
+	fi
+	echo "Extracting makeself archive (compression: ${compress:-gzip}, header: $lines lines, offset: $offset bytes)" >&2
+
+	# Extract payload, auto-detect compression via ercat
+	dd if="$arc" ibs="$offset" skip=1 obs=1024 conv=sync 2>/dev/null | "$ERCAT"
+}
+
+# Extract makeself self-extracting archives (.run)
+extract_makeself()
+{
+	local arc="$1"
+	local subdir="$2"
+	mkdir -p "$subdir" && cd "$subdir" || fatal
+	extract_makeself_tar "$arc" | extract_tar_stdin
 }
 
 # Extract AppImage archives
@@ -99,21 +155,41 @@ extract_appimage()
 {
 	local arc="$1"
 	local subdir="$2"
+	local offset
 
-	# Try unsquashfs with offset from --appimage-offset
+	offset=$(LC_ALL=C grep -aboP 'DWARFS(?=[\x00-\x1f]{2})' "$arc" 2>/dev/null \
+		| head -1 | cut -d: -f1)
+	if [ -n "$offset" ] ; then
+		is_command dwarfsextract \
+			|| fatal "dwarfsextract is required to extract DwarFS AppImage files"
+		mkdir -p "$subdir" || fatal "Could not create extraction directory $subdir"
+		docmd dwarfsextract -i "$arc" -o "$subdir" -O "$offset"
+		return
+	fi
+
+	# Try unsquashfs with offset
 	if is_command unsquashfs ; then
-		local offset
 		chmod +x "$arc" 2>/dev/null
 		offset="$("$arc" --appimage-offset 2>/dev/null)"
+		# Fallback: find squashfs magic (for cross-arch AppImages)
+		if [ -z "$offset" ] ; then
+			offset=$(LC_ALL=C grep -aboP 'hsqs' "$arc" 2>/dev/null | head -1 | cut -d: -f1)
+		fi
 		if [ -n "$offset" ] ; then
-			if docmd unsquashfs -o "$offset" -d "$subdir" "$arc" ; then
+			if docmd unsquashfs -no-xattrs -o "$offset" -d "$subdir" "$arc" ; then
 				return 0
 			fi
 		fi
 	fi
 
 	# Fallback to 7z
+	# Note: 7zz 26+ replaces symlinks containing ".." with empty files
+	# and returns exit code 2. Install squashfs-tools for full extraction.
 	extract_7z_to_subdir "$arc" "$subdir"
+	local ret=$?
+	if [ "$ret" -ne 0 ] ; then
+		fatal "7z could not fully extract AppImage (some symlinks are missing). Install squashfs-tools for better results."
+	fi
 
 	# Fallback to --appimage-extract (disabled by default)
 	#if [ -x "$arc" ] || chmod +x "$arc" ; then
@@ -126,30 +202,236 @@ extract_appimage()
 	#fi
 }
 
+# Import a flatpak bundle into a temporary OSTree repo.
+# Sets FLATPAK_REPO_DIR (caller must rm -rf it) and FLATPAK_REF.
+flatpak_prepare_repo()
+{
+	local flatpak_file="$1"
+	local operation="$2"
+
+	is_command ostree || fatal "ostree is required to $operation flatpak files"
+
+	FLATPAK_REPO_DIR=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	docmd ostree init --repo="$FLATPAK_REPO_DIR" --mode=archive
+
+	# a flatpak bundle is an ostree static delta, so import it with ostree alone
+	docmd ostree static-delta apply-offline --repo="$FLATPAK_REPO_DIR" "$flatpak_file" \
+		|| { rm -rf "$FLATPAK_REPO_DIR" ; fatal "failed to import flatpak bundle $flatpak_file" ; }
+
+	# apply-offline imports the objects but creates no ref; take the commit checksum
+	FLATPAK_REF=$(find "$FLATPAK_REPO_DIR/objects" -name '*.commit' | head -n1 \
+		| sed 's|.*/objects/||; s|/||; s|\.commit$||')
+	[ -n "$FLATPAK_REF" ] || { rm -rf "$FLATPAK_REPO_DIR" ; fatal "could not get commit from flatpak repository" ; }
+}
+
+# Extract flatpak bundle via a temporary OSTree repo
+extract_flatpak()
+{
+	local arc="$1"
+	local subdir="$2"
+
+	flatpak_prepare_repo "$arc" "extract"
+
+	local checkout_root
+	checkout_root=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	docmd ostree checkout --repo="$FLATPAK_REPO_DIR" --user-mode "$FLATPAK_REF" "$checkout_root/payload"
+
+	mkdir -p "$subdir"
+	# the app payload lives in files/; fall back to the whole tree otherwise
+	if [ -d "$checkout_root/payload/files" ] ; then
+		docmd cp -a "$checkout_root/payload/files/." "$subdir/"
+	else
+		docmd cp -a "$checkout_root/payload/." "$subdir/"
+	fi
+
+	rm -rf "$checkout_root" "$FLATPAK_REPO_DIR"
+}
+
 # TODO: move to patool
 # Extract special archive types that are not supported by patool
 extract_special_archive()
 {
 	local arc="$1"
 	local type="$2"
-	local rarc="$(realpath -s "$arc")"
-	local subdir="$(basename "$(get_archive_name "$arc")")"
+	local orig_dir="$PWD"
+	local subdir
+	local use_tdir=""
+	if [ -n "$here" ] || [ -n "$flat" ] ; then
+		subdir="${extract_dir:-.}"
+	elif [ -n "$extract_dir" ] ; then
+		subdir=$(mktemp -d "$(dirname "$extract_dir")/UXXXXXXXX")
+		use_tdir=1
+	else
+		subdir=$(mktemp -d "$(pwd)/UXXXXXXXX")
+		use_tdir=1
+	fi
+
+	local flat_tdir
+	if [ -n "$flat" ] ; then
+		flat_tdir=$(mktemp -d "$(realpath "$subdir")/UXXXXXXXX")
+		subdir="$flat_tdir"
+	fi
 
 	case "$type" in
 		exe|dll)
-			extract_7z_to_subdir "$rarc" "$subdir"
+			extract_7z_to_subdir "$arc" "$subdir"
+			;;
+		run)
+			extract_makeself "$arc" "$subdir"
 			;;
 		AppImage|appimage)
-			extract_appimage "$rarc" "$subdir"
+			extract_appimage "$arc" "$subdir"
 			;;
 		squashfs|snap)
-			extract_squashfs_image "$rarc" "$subdir"
+			extract_squashfs_image "$arc" "$subdir"
+			;;
+		flatpak)
+			extract_flatpak "$arc" "$subdir"
 			;;
 		*)
+			[ -n "$use_tdir" ] && rmdir "$subdir"
 			return 1
 			;;
 	esac
+	cd "$orig_dir"
+
+	if [ -n "$flat_tdir" ] ; then
+		local target_dir="${extract_dir:-$orig_dir}"
+		find "$flat_tdir" -type f -exec mv -t "$target_dir" -- {} +
+		rm -rf "$flat_tdir"
+	elif [ -n "$use_tdir" ] ; then
+		if [ -n "$extract_dir" ] ; then
+			move_to_target_dir "$subdir" "$extract_dir"
+		else
+			local target_name="$(get_archive_name "$arc")"
+			if [ -d "$target_name" ] ; then
+				move_to_target_dir "$subdir" "$target_name"
+			else
+				move_from_tdir "$subdir" "$target_name"
+			fi
+		fi
+	fi
+
 	exit
+}
+
+extract_by_type()
+{
+	local arc="$1"
+	local type="$2"
+	shift 2
+
+	# TODO: check if there is only one file?
+	# use subdir if there is no subdir in archive
+	case "$type" in
+		tar.gz|tgz)
+			if is_command gzip ; then
+				extract_command "tar -xhzf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find gzip package. Please install gzip package and retry."
+			fi
+			;;
+		tar.xz|txz|tar.lzma)
+			if is_command xz ; then
+				extract_command "tar -xhJf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find xz package. Please install xz package and retry."
+			fi
+			;;
+		tar.zst)
+			if is_command zstd ; then
+				extract_command "tar -I zstd -xhf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find zstd package. Please install zstd package and retry."
+			fi
+			;;
+		tar.bz2|tbz2)
+			if is_command bunzip2 ; then
+				extract_command "tar -xhjf" "$arc"
+			elif [ -n "$HAVE_7Z" ] ; then
+				extract_7z_stream "$arc"
+			else
+				fatal "Could not find bzip2 package. Please install bzip2 package and retry."
+			fi
+			;;
+		tar)
+			extract_command "tar -xhf" "$arc"
+			;;
+		*)
+			docmd $HAVE_7Z x -y "$arc" "$@"
+			#fatal "Not yet supported extracting of $type archives"
+			;;
+	esac
+}
+
+is_system_dir()
+{
+	case "$1" in
+		opt|usr|etc|var|bin|sbin|lib|lib64|home|root|srv|tmp|run|mnt|media|boot|dev|proc|sys)
+			return 0 ;;
+	esac
+	return 1
+}
+
+# Move extracted contents from temp dir to existing target directory (-C)
+# Single non-system directory is unwrapped (contents moved directly into target)
+move_to_target_dir()
+{
+	local tdir="$1"
+	local target="$2"
+
+	shopt -s nullglob dotglob
+	local items=("$tdir"/*)
+	shopt -u nullglob dotglob
+
+	if [ ${#items[@]} -eq 1 ] && [ -d "${items[0]}" ] ; then
+		if is_system_dir "$(basename "${items[0]}")" ; then
+			mv -- "${items[0]}" "$target/"
+		else
+			# single directory: move its contents into target
+			shopt -s dotglob
+			mv -- "${items[0]}"/* "$target/"
+			shopt -u dotglob
+			rmdir -- "${items[0]}"
+		fi
+	else
+		mv -- "${items[@]}" "$target/"
+	fi
+	rmdir "$tdir"
+}
+
+# Move extracted contents from temp dir to current directory (normal extraction)
+# Single directory is renamed to subdir, single file goes to current dir
+move_from_tdir()
+{
+	local tdir="$1"
+	local subdir="$2"
+
+	shopt -s nullglob dotglob
+	local items=("$tdir"/*)
+	shopt -u nullglob dotglob
+
+	if [ ${#items[@]} -eq 1 ] && [ -e "${items[0]}" ] ; then
+		if [ -d "${items[0]}" ] ; then
+			if is_system_dir "$(basename "${items[0]}")" ; then
+				mkdir -p "$subdir"
+				mv -- "${items[0]}" "$subdir/"
+			else
+				mv -- "${items[0]}" "$subdir"
+			fi
+		else
+			mv -- "${items[0]}" .
+		fi
+		rmdir "$tdir"
+	else
+		mv -- "$tdir" "$subdir"
+	fi
 }
 
 extract_archive()
@@ -160,56 +442,73 @@ extract_archive()
 	local type="$(get_archive_type "$arc")"
 	[ -n "$type" ] || fatal "Can't recognize type of $arc."
 
+	arc="$(realpath -s "$arc")"
+
 	extract_special_archive "$arc" "$type"
 
-	if have_patool ; then
-		docmd patool $verbose extract "$arc" "$@"
+	# --here: extract directly to target directory without subdir logic
+	local target_dir="${extract_dir}"
+	[ -n "$here" ] && [ -z "$target_dir" ] && target_dir="."
+
+	if [ -n "$here" ] && [ -n "$target_dir" ] && [ -z "$flat" ] ; then
+		if have_patool ; then
+			docmd patool $verbose extract --outdir "$target_dir" "$arc"
+		else
+			cd "$target_dir" || fatal
+			extract_by_type "$arc" "$type" "$@"
+		fi
 		return
 	fi
 
-	arc="$(realpath -s "$arc")"
-	tdir="$(mktemp -d "$(pwd)/UXXXXXXXX")" && cd "$tdir" || fatal
-
-	local TSUBDIR="$(basename "$arc" .$type | sed -e 's|^tar\.||')"
-
-	# TODO: check if there is only one file?
-	# use subdir if there is no subdir in archive
-	case "$type" in
-		tar.gz|tgz)
-			is_command gzip || fatal "Could not find gzip package. Please install gzip package and retry."
-			extract_command "tar -xhzf" "$arc"
-			;;
-		tar.xz|txz|tar.lzma)
-			is_command xz || fatal "Could not find xz package. Please install xz package and retry."
-			extract_command "tar -xhJf" "$arc"
-			;;
-		tar.zst)
-			is_command zstd || fatal "Could not find zstd package. Please install zstd package and retry."
-			extract_command "tar -I zstd -xhf" "$arc"
-			;;
-		tar.bz2|tbz2)
-			is_command bunzip2 || fatal "Could not find bzip2 package. Please install bzip2 package and retry."
-			extract_command "tar -xhjf" "$arc"
-			;;
-		tar)
-			extract_command "tar -xhf" "$arc"
-			;;
-		*)
-			docmd $HAVE_7Z x -y "$arc" "$@"
-			#fatal "Not yet supported extracting of $type archives"
-			;;
-	esac
-
-	local res=$?
-
-	cd - >/dev/null
-	# if only one dir in the subdir
-	if [ -e "$(echo $tdir/*)" ] ; then
-		mv "$tdir"/* .
-		rmdir "$tdir"
-	else
-		mv "$tdir" "$TSUBDIR"
+	# -C: extract to temp dir, apply subdir logic, move to target
+	if [ -n "$extract_dir" ] && [ -z "$here" ] && [ -z "$flat" ] ; then
+		tdir=$(mktemp -d "$(dirname "$extract_dir")/UXXXXXXXX")
+		local res
+		if have_patool ; then
+			docmd patool $verbose extract --outdir "$tdir" "$arc" "$@"
+			res=$?
+		else
+			cd "$tdir" || fatal
+			extract_by_type "$arc" "$type" "$@"
+			res=$?
+			cd - >/dev/null
+		fi
+		if [ "$res" -eq 0 ] ; then
+			move_to_target_dir "$tdir" "$extract_dir"
+		else
+			rm -rf "$tdir"
+		fi
+		return $res
 	fi
+
+	tdir=$(mktemp -d "$(pwd)/UXXXXXXXX")
+	local res
+	if have_patool ; then
+		docmd patool $verbose extract --outdir "$tdir" "$arc" "$@"
+		res=$?
+	else
+		cd "$tdir" || fatal
+		extract_by_type "$arc" "$type" "$@"
+		res=$?
+		cd - >/dev/null
+	fi
+
+	if [ "$res" -eq 0 ] ; then
+		if [ -n "$flat" ] ; then
+			# --flat: move all files to target, stripping directory structure
+			local dest="${target_dir:-.}"
+			find "$tdir" -type f -exec mv -t "$dest" -- {} +
+			rm -rf "$tdir"
+		else
+			local target_name="$(get_archive_name "$arc")"
+			if [ -d "$target_name" ] ; then
+				move_to_target_dir "$tdir" "$target_name"
+			else
+				move_from_tdir "$tdir" "$target_name"
+			fi
+		fi
+	fi
+
 	return $res
 }
 
@@ -220,7 +519,15 @@ list_archive()
 
 	# TODO: move to patool
 	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "exe" ] ; then
+		assure_7z
 		docmd $HAVE_7Z l "$arc" || fatal
+		return
+	fi
+
+	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "flatpak" ] ; then
+		flatpak_prepare_repo "$(realpath -s "$arc")" "list"
+		docmd ostree ls --repo="$FLATPAK_REPO_DIR" -R "$FLATPAK_REF"
+		rm -rf "$FLATPAK_REPO_DIR"
 		return
 	fi
 
@@ -246,7 +553,15 @@ test_archive()
 
 	# TODO: move to patool
 	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "exe" ] ; then
+		assure_7z
 		docmd $HAVE_7Z t "$arc" || fatal
+		return
+	fi
+
+	if [ "$(get_archive_type "$arc" 2>/dev/null)" = "flatpak" ] ; then
+		flatpak_prepare_repo "$(realpath -s "$arc")" "test"
+		rm -rf "$FLATPAK_REPO_DIR"
+		echo "Flatpak file is valid"
 		return
 	fi
 
@@ -271,15 +586,34 @@ __repack_via_tmp()
 	dfile="$(realpath -s "$2")"
 	ddir="$(dirname "$dfile")"
 	tdir="$(mktemp -d "$ddir/UXXXXXXXX")" && cd "$tdir" || fatal
-	trap "rm -fr $tdir" EXIT
+	trap 'rm -fr "$tdir"' EXIT
 	extract_archive "$sfile" || fatal
 	create_archive "$dfile" "."
 	#cd - >/dev/null
 	#rm -fr "$tdir"
 }
 
+# Repack special archive types that are not supported by patool
+repack_special_archive()
+{
+	local ftype="$(get_archive_type "$1")"
+	case "$ftype" in
+		run)
+			# makeself payload is already tar, just decompress
+			extract_makeself_tar "$1" > "$2"
+			exit
+			;;
+		exe|dll|AppImage|appimage|squashfs|snap)
+			__repack_via_tmp "$1" "$2"
+			exit
+			;;
+	esac
+}
+
 repack_archive()
 {
+	repack_special_archive "$1" "$2"
+
 	if have_patool ; then
 		docmd patool $verbose repack "$1" "$2"
 		return
@@ -317,14 +651,25 @@ $(get_help HELPCMD)
  Options:
 $(get_help HELPOPT)
 
+ Extraction rules:
+    Single file in archive     -> extracted to current directory
+    Single directory in archive -> renamed to BASENAME/
+    System dir (opt, usr, etc) -> wrapped in BASENAME/ (not renamed)
+    Multiple files or dirs     -> extracted to BASENAME/ subdirectory
+    Use --here to skip creating subdirectory, --flat to strip all paths
+
  Examples:
     # erc dir - pack dir to dirname.zip
     # erc a archive.zip file(s)... - pack files to archive.zip
     # erc [x] archive.zip - unpack
     # unerc archive.zip - unpack
-    # erc [repack] archive1.zip... archive2.rar $HAVE_7Z: - repack all to $HAVE_7Z
-    # erc -f [repack] archive.zip archive.$HAVE_7Z - force repack zip to $HAVE_7Z (override target in anyway)
+    # erc [repack] archive1.zip... archive2.rar 7z: - repack all to 7z
+    # erc -f [repack] archive.zip archive.7z - force repack zip to 7z (override target in anyway)
+    # erc -C dir archive.zip - extract archive directly to dir
+    # erc --here archive.zip - extract as-is without creating subdirectory
+    # erc --flat archive.zip - extract all files stripping directory structure
     # erc file/dir zip: - pack file to zip
+    # erc basename archive.tar.gz - print predicted directory name (archive)
 "
 }
 
@@ -343,9 +688,13 @@ Descr="erc - universal archive manager"
 
 force=
 target=
+extract_dir=
 verbose=--verbose
+quiet=
 use_7z=
 use_patool=
+here=
+flat=
 
 if [ -z "$*" ] ; then
     echo "Etersoft archive manager version @VERSION@" >&2
@@ -365,6 +714,7 @@ case "$1" in
         ;;
     -q|--quiet)           # HELPOPT: be silent
         verbose=
+        quiet=1
         ;;
     -f|--force)           # HELPOPT: override target
         force=-f
@@ -374,6 +724,23 @@ case "$1" in
         ;;
     --use-7z)             # HELPOPT: force use 7z as backend
         use_7z=1
+        ;;
+    --here|--no-subdir)   # HELPOPT: extract to current directory without creating a subdirectory
+        here=1
+        ;;
+    -j|--flat|--junk-paths)  # HELPOPT: extract all files without directory structure
+        flat=1
+        ;;
+    -C)                   # HELPOPT: extract to specified directory
+        shift
+        extract_dir="$1"
+        ;;
+    --directory|--extract-to|--destination|--outdir)
+        shift
+        extract_dir="$1"
+        ;;
+    --directory=*|--extract-to=*|--destination=*|--outdir=*)
+        extract_dir="${1#*=}"
         ;;
     -a|-e|-x|-u|-l|-t|-b)
         # these are commands, not options
@@ -393,7 +760,7 @@ set_backend
 
 cmd="$1"
 
-eval lastarg=\${$#}
+lastarg="${@: -1}"
 
 # Just printout help if run without args
 if [ -z "$cmd" ] ; then
@@ -445,6 +812,10 @@ case $cmd in
         create_archive "$target" "$@"
         ;;
     e|x|-e|-x|u|-u|extract|unpack)          # HELPCMD: extract files from archive
+        if [ -n "$extract_dir" ] ; then
+            mkdir -p "$extract_dir" || fatal "Can't create directory '$extract_dir'"
+            extract_dir="$(realpath -s "$extract_dir")"
+        fi
         extract_archive "$@"
         ;;
 # TODO: implement deletion
@@ -461,8 +832,7 @@ case $cmd in
         get_archive_type "$1" || fatal "Can't recognize $1 as archive"
         ;;
     basename)             # HELPCMD: print the predicted directory name for the archive
-        nm="$(get_archive_name "$1")" || fatal "Can't recognize $1 as archive"
-        basename "$nm"
+        get_archive_name "$1" || fatal "Can't recognize $1 as archive"
         ;;
     diff)                 # HELPCMD: compare two archive
         # check 2 arg

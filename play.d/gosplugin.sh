@@ -10,9 +10,16 @@ URL="https://www.gosuslugi.ru/landing/gosplugin"
 
 warn_version_is_not_supported
 
-PKGURL="https://gu-st.ru/content/Gosplugin/Gosplugin_Linux-Debian_Installer.deb.sh"
+case "$(epm print info -p)" in
+    rpm)
+        PKGURL="https://gu-st.ru/content/Gosplugin/Gosplugin_Alt-RedOS_Installer.rpm.zip"
+        ;;
+    *)
+        PKGURL="https://gu-st.ru/content/Gosplugin/Gosplugin_Linux-Debian_Installer.deb.zip"
+        ;;
+esac
 
-install_pack_pkgurl || fatal 
+install_pack_pkgurl || fatal
 
 echo
 echo "Не забудьте также установить расширение для браузера:"

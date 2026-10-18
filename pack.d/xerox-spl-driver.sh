@@ -8,8 +8,8 @@ RETURNTARNAME="$2"
 # Xerox_B215_Linux_PrintDriver_Utilities.tar.gz
 BASENAME=$(basename $TAR .tar.gz)
 
-erc unpack $TAR || fatal
-cd *
+erc --here unpack $TAR || fatal
+cd uld || fatal
 
 mkdir usr
 mkdir opt
@@ -34,10 +34,7 @@ fi
 
 install -Dm0644 "x86_64/libsane-smfp.so.1.0.1" "$SANELIB/libsane-smfp.so.1.0.1"
 
-pushd "$SANELIB"
-ln -s libsane-smfp.so.1.0.1 libsane-smfp.so.1
-ln -s libsane-smfp.so.1.0.1 libsane-smfp.so
-popd
+( cd "$SANELIB" && ln -s libsane-smfp.so.1.0.1 libsane-smfp.so.1 && ln -s libsane-smfp.so.1.0.1 libsane-smfp.so )
 
 install -Dm0644 "noarch/etc/smfp.conf" "etc/sane.d/smfp.conf"
 install -dm0755 "etc/sane.d/dll.d"
@@ -61,5 +58,14 @@ install -Dm0644 "noarch/oem.conf" "opt/xerox/scanner/share/oem.conf"
 PKGNAME=$PRODUCT-$VERSION
 
 erc pack $PKGNAME.tar usr opt etc || fatal
+
+cat <<EOF >$PKGNAME.tar.eepm.yaml
+name: $PRODUCT
+group: System/Configuration/Printing
+license: Proprietary
+url: https://www.xerox.com/
+summary: Xerox SPL printer and scanner driver
+description: Xerox SPL printer and scanner driver for Linux.
+EOF
 
 return_tar $PKGNAME.tar

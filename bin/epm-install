@@ -27,6 +27,18 @@ load_helper epm-check_updated_repo
 load_helper epm-sh-warmup
 load_helper epm-installed
 
+# Check if at least one package from the list is not found in repos
+# Returns 0 if at least one package is not found (suggest is appropriate)
+# Returns 1 if all packages exist (broken deps, suggest is not appropriate)
+__epm_check_packages_not_found()
+{
+    local pkg
+    for pkg in "$@" ; do
+        epm status --valid "$pkg" </dev/null >/dev/null 2>&1 || return 0
+    done
+    return 1
+}
+
 # for zypper before SUSE/11.0
 __use_zypper_no_gpg_checks()
 {
@@ -65,6 +77,50 @@ __separate_sudocmd()
     return 0
 }
 
+# Shared APT command for installation and simulation.
+__epm_apt_install()
+{
+    local APTOPTIONS="$APTOPTIONS"
+    local noremove="$noremove"
+    local VIRTAPTOPTIONS=''
+    local simulate=''
+
+    [ -n "$dryrun" ] && simulate="--simulate"
+    [ -n "$norecommends" ] && APTOPTIONS="$APTOPTIONS -o APT::Install-Recommends=false"
+    if [ "$PMTYPE" = "apt-dpkg" ] && [ -n "$force_overwrite" ] ; then
+        APTOPTIONS="$APTOPTIONS -o Dpkg::Options::=--force-overwrite"
+    fi
+
+    if [ "$PMTYPE" = "apt-rpm" ] ; then
+        # https://bugzilla.altlinux.org/44670
+        VIRTAPTOPTIONS="-o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true"
+        # not for kernel packages
+        echo "$*" | grep -q "^kernel-" && VIRTAPTOPTIONS=''
+    fi
+
+    if [ -n "$non_interactive" ] ; then
+        [ -z "$noremove" ] && [ -z "$force" ] && [ -z "$allow_remove" ] && noremove="--no-remove"
+        case $PMTYPE in
+            apt-rpm)
+                sudocmd apt-get $__EPM_APT_REPO_OPTIONS $simulate -y $noremove --force-yes $VIRTAPTOPTIONS $APTOPTIONS install "$@"
+                ;;
+            apt-dpkg)
+                sudocmd env ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive apt-get $__EPM_APT_REPO_OPTIONS $simulate -y $noremove --allow-unauthenticated --allow-downgrades --allow-change-held-packages -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install "$@"
+                ;;
+        esac
+        return $?
+    fi
+
+    APTOPTIONS="$APTOPTIONS -o APT::Sandbox::User=root $(subst_option debug "-o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
+    if [ -n "$parallel" ] && [ -z "$simulate" ] ; then
+        load_helper epm-download
+        info "Downloading packages to the cache... "
+        __epm_alt_download_to_cache $VIRTAPTOPTIONS $APTOPTIONS $noremove install "$@"
+    fi
+
+    sudocmd apt-get $__EPM_APT_REPO_OPTIONS $simulate $VIRTAPTOPTIONS $APTOPTIONS $noremove install "$@"
+}
+
 # copied from etersoft-build-utils/share/eterbuild/functions/rpmpkg
 epm_install_names()
 {
@@ -91,7 +147,7 @@ epm_install_names()
 
     if [ -n "$dryrun" ] ; then
         load_helper epm-simulate
-        epm simulate "$@"
+        pkg_filenames="$*" epm_simulate
         return
     fi
 
@@ -100,36 +156,28 @@ epm_install_names()
         return
     fi
 
-    if [ -n "$force_overwrite" ] ; then
-        APTOPTIONS="$APTOPTIONS -o Dpkg::Options::=--force-overwrite"
+    if [ -n "$norecommends" ] ; then
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
     fi
 
     case $PMTYPE in
         apt-rpm|apt-dpkg)
-            APTOPTIONS="$APTOPTIONS -o APT::Sandbox::User=root $(subst_option debug "-o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
-
-            # https://bugzilla.altlinux.org/44670
-            VIRTAPTOPTIONS="-o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true"
-            # not for kernel packages
-            echo "$*" | grep -q "^kernel-"  && VIRTAPTOPTIONS=''
-
-            if [ -n "$parallel" ] ; then
-                load_helper epm-download
-                info "Downloading packages to the cache... "
-                __epm_alt_download_to_cache $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
-            fi
-
-            sudocmd apt-get $__EPM_APT_REPO_OPTIONS $VIRTAPTOPTIONS $APTOPTIONS $noremove install $@
+            __epm_apt_install "$@"
             local res=$?
             if [ "$res" = 0 ] ; then
                 save_installed_packages $@
             elif [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_install_names $selected
-                    return $?
+                # only suggest alternatives if packages are not found (not broken deps)
+                if __epm_check_packages_not_found $@ ; then
+                    local selected
+                    selected="$(__epm_suggest_similar_packages_by_list $@)"
+                    if [ -n "$selected" ] ; then
+                        info "Installing selected: $selected"
+                        epm_install_names $selected
+                        return $?
+                    fi
                 fi
             fi
             return $res ;;
@@ -179,7 +227,7 @@ epm_install_names()
             sudocmd yum $YUMOPTIONS install $(echo "$*" | exp_with_arch_suffix)
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf install $(echo "$*" | exp_with_arch_suffix)
+            sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS install $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
             return ;;
         snappy)
             sudocmd snappy install $@
@@ -259,33 +307,19 @@ epm_ni_install_names()
 {
     [ -z "$1" ] && return
 
+    # forbid package removal by default in non-interactive mode
+    [ -z "$noremove" ] && [ -z "$force" ] && [ -z "$allow_remove" ] && noremove="--no-remove"
+
+    if [ -n "$norecommends" ] ; then
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
+    fi
+
     case $PMTYPE in
-        apt-rpm)
-            sudocmd apt-get $__EPM_APT_REPO_OPTIONS -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            local res=$?
-            if [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_ni_install_names $selected
-                    return $?
-                fi
-            fi
-            return $res ;;
-        apt-dpkg)
-            sudocmd env ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive apt-get -y $noremove --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $APTOPTIONS install $@
-            local res=$?
-            if [ "$res" = 100 ] ; then
-                local selected
-                selected="$(__epm_suggest_similar_packages_by_list $@)"
-                if [ -n "$selected" ] ; then
-                    info "Installing selected: $selected"
-                    epm_ni_install_names $selected
-                    return $?
-                fi
-            fi
-            return $res ;;
+        apt-rpm|apt-dpkg)
+            __epm_apt_install "$@"
+            return ;;
         apm-rpm)
             sudocmd apm system install $@
             return ;;
@@ -296,14 +330,14 @@ epm_ni_install_names()
             sudocmd yum -y $YUMOPTIONS install $(echo "$*" | exp_with_arch_suffix)
             return ;;
         dnf-rpm|dnf5-rpm)
-            sudocmd dnf install -y --allowerasing $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
+            sudocmd $DNFCMD $__EPM_DNF_REPO_OPTIONS install -y $(subst_option noremove '' --allowerasing) $YUMOPTIONS $(echo "$*" | exp_with_arch_suffix)
             return ;;
         urpm-rpm)
             sudocmd urpmi --auto $URPMOPTIONS $@
             return ;;
         zypper-rpm)
             # FIXME: returns true ever no package found, need check for "no found", "Nothing to do."
-            yes | sudocmd zypper --non-interactive $ZYPPEROPTIONS install $@
+            yes | sudocmd zypper --non-interactive $ZYPPEROPTIONS install $(subst_option noremove --no-force-resolution) $@
             return ;;
         packagekit)
             docmd pkcon install --noninteractive $@
@@ -422,7 +456,8 @@ __epm_if_command_path()
 __epm_get_replacepkgs()
 {
     [ -n "$2" ] && echo '--replacepkgs' && return
-    # don't use --replacepkgs when install only one file
+    # always use --replacepkgs with --force to avoid duplicates (rpm bug with same NEVR)
+    [ -n "$force" ] && echo '--replacepkgs' && return
 }
 
 epm_install_files()
@@ -542,9 +577,8 @@ epm_install()
             epm_install_alt_tasks $pkg_names
             return
         fi
-        if echo "$pkg_urls" | grep -q -E "https://packages.altlinux.org/ru/tasks/[0-9]+/*$" || \
-           echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/[0-9]+/*$" || \
-           echo "$pkg_urls" | grep -q -E "https://git.altlinux.org/tasks/archive/done/_[0-9]+/[0-9]+/*$" ; then
+        # only one url really
+        if is_taskurl "$pkg_urls" ; then
             load_helper epm-install-alt
             local task="$(basename "$pkg_urls")"
             local taskurl="$(dirname "$pkg_urls")"
@@ -586,6 +620,11 @@ epm_install()
     fi
 
     if [ -n "$pkg_urls" ] ; then
+        if [ -n "$repack" ] ; then
+            # pass URLs directly to repack (it will download and keep pkg_urls_downloaded)
+            epm repack --install $pkg_urls $pkg_files
+            return
+        fi
         load_helper epm-download
         # it will put downloaded by pkg_urls packages to pkg_files and reconstruct pkg_filenames
         __handle_pkg_urls_to_install

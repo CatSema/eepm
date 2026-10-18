@@ -105,7 +105,10 @@ fi
 for i in $BUILDROOT/usr/bin/* ; do
     [ -L "$i" ] && continue
     [ -f "$i" ] || continue
-    [ -x "$i" ] || fatal "file ${i#$BUILDROOT} is not executable"
+    if ! [ -x "$i" ] ; then
+        warning "file ${i#$BUILDROOT} is not executable, fixing"
+        chmod a+x "$i"
+    fi
     grep -Eq '^#!/usr/bin/python|^#!/usr/bin/env python' $i && flag_python3=1
     subst 's|^#!/usr/bin/python$|#!/usr/bin/python3|' $i
     subst 's|^#!/usr/bin/env python$|#!/usr/bin/env python3|' $i
@@ -114,7 +117,10 @@ done
 # check for .py scripts
 find $BUILDROOT -name "*.py" | grep -q "\.py$" && flag_python3=1
 # can't use subst in find's exec (subst can be as function only)
-find $BUILDROOT -name "*.py" -exec sed -i -e '1{/python3/n};1i#!/usr/bin/python3' {} \;
+# 1s: drop a leading UTF-8 BOM first, otherwise the inserted shebang pushes the BOM
+# to line 2, and Python 3.12+ rejects a non-leading BOM (invalid U+FEFF), breaking
+# bundled library modules that ship with a BOM (e.g. azure-mgmt-rdbms in pgadmin4)
+find $BUILDROOT -name "*.py" -exec sed -i -e '1s/^\xef\xbb\xbf//' -e '1{/python3/n};1i#!/usr/bin/python3' {} \;
 
 if [ -n "$flag_python3" ] ; then
     if [ "$(epm print info -s)" = "alt" ] && [ -z "$EPM_RPMBUILD" ] ; then
@@ -164,23 +170,8 @@ summary="$(grep "^Summary: " $SPEC | sed -e "s|Summary: ||g" | head -n1)"
 [ -n "$summary" ] || set_rpm_field "Summary" "$PRODUCT (fixme: was empty Summary after alien)"
 set_rpm_field "Distribution" "EEPM"
 
-if [ -r "$PKG.eepm.yaml" ] ; then
-    yaml_load_vars "$PKG.eepm.yaml" name summary description upstream_file upstream_url url appname arch group license version
-    # for tarballs fix permissions
-    chmod $verbose -R a+rX *
-    [ -n "$name" ] && [ "$name" != "$PRODUCT" ] && warning "name $name in $PKG.eepm.yaml is not equal to PRODUCT $PRODUCT"
-    [ -n "$version" ] && set_rpm_field "Version" "$version"
-    set_rpm_field "Group" "$group"
-    set_rpm_field "License" "$license"
-    set_rpm_field "URL" "$url"
-    set_rpm_field "Summary" "$summary"
-    [ -n "$upstream_file" ] || upstream_file="binary package $PRODUCT"
-    [ -n "$upstream_url" ] && upstream_file="$upstream_url"
-    [ -n "$description" ] && subst "s|^\((Converted from a\) \(.*\) \(package.*\)|$description\n(Repacked from $upstream_file with EPM $(epm --short --version))\n\1 \2 \3|" $SPEC
-else
-    [ -n "$verbose" ] && warning "$PKG.eepm.yaml is missed"
-    exya="$(echo $(dirname $PKG.eepm.yaml)/*.eepm.yaml)"
-    [ -f "$exya" ] && warning "$PKG.eepm.yaml is missed, but $exya is exists"
+# for deb/rpm (alien path): update description with repack info
+if [ -z "$SUBGENERIC" ] ; then
     subst "s|^\((Converted from a\) \(.*\) \(package.*\)|(Repacked from binary \2 package with EPM $(epm --short --version))\n\1 \2 \3|" $SPEC
 fi
 

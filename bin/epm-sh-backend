@@ -17,18 +17,18 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
+VALID_BACKENDS="apt-rpm apt-dpkg apm-rpm stplr aptitude-dpkg deepsolver-rpm urpm-rpm packagekit pkgsrc pkgng redox-pkg emerge pacman yay aura yum-rpm dnf-rpm dnf5-rpm snappy zypper-rpm mpkg eopkg conary npackd slackpkg homebrew opkg nix apk tce guix termux-pkg aptcyg xbps appget winget"
 
 # Check if args contain backend:package syntax (snap:pkg, nix:pkg)
 __has_backend_syntax()
 {
-    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z]*:'
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-z][a-z][a-z0-9-]*:'
 }
 
 # Check if args contain repo/package syntax (p10/pkg, sisyphus/pkg)
 __has_repo_syntax()
 {
-    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9]*/'
+    [ -z "$PPARGS" ] && echo "$*" | grep -q -E '(^| )[a-zA-Z][a-zA-Z0-9._-]*/'
 }
 
 __get_tpmtype() {
@@ -36,7 +36,7 @@ __get_tpmtype() {
     local tpmtype="$(echo "$arg" | cut -d: -f1)"
 
     # need first three chars
-    echo "$arg" | grep -q "^[a-z][a-z][a-z-]*:" || return
+    echo "$arg" | grep -q "^[a-z][a-z][a-z0-9-]*:" || return
 
     # aliases
     [ "$tpmtype" = "pkcon" ] && tpmtype="packagekit"
@@ -56,7 +56,7 @@ __get_repo_name() {
     # ALT Linux branches
     [ "$trepo" = "sisyphus" ] && trepo="Sisyphus"
     [ "$trepo" = "SS" ] && trepo="Sisyphus"
-    [ "$trepo" = "archive" ] && repo="archive $(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
+    [ "$trepo" = "archive" ] && repo="archive/$(echo "$arg" | cut -d/ -f2)" && name=$(echo "$arg" | cut -d/ -f3) && return
 
     # Fedora Copr: copr/owner/project/package
     if [ "$trepo" = "copr" ] ; then
@@ -71,6 +71,14 @@ __get_repo_name() {
     # Arch Linux AUR
     if [ "$(echo "$arg" | cut -d/ -f1)" = "aur" ] && [ "$PMTYPE" = "pacman" ] ; then
         repo="aur"
+        name=$(echo "$arg" | cut -d/ -f2)
+        return
+    fi
+
+    # Named repo in sources.list.d
+    local orig_repo="$(echo "$arg" | cut -d/ -f1)"
+    if __find_named_repo_file "$orig_repo" >/dev/null 2>&1 ; then
+        repo="named:$orig_repo"
         name=$(echo "$arg" | cut -d/ -f2)
     fi
 }
@@ -103,12 +111,78 @@ __process_backend_arguments() {
         package_groups["$pmtype"]+="$name "
     done
 
+    local dnfcmd res=0
     for pmtype in "${!package_groups[@]}"; do
-        (PMTYPE="$pmtype" PPARGS=1 $func ${package_groups[$pmtype]})
+        dnfcmd="$DNFCMD"
+        case "$pmtype" in
+            dnf5-rpm)
+                dnfcmd="dnf5"
+                ;;
+            dnf-rpm)
+                dnfcmd="dnf"
+                ;;
+        esac
+        (PMTYPE="$pmtype" DNFCMD="$dnfcmd" PPARGS=1 $func ${package_groups[$pmtype]}) || res=$?
     done
+    return $res
+}
+
+# Print the set of known ALT mirror hosts (lowercased domains), one per line,
+# extracted from mirrors-alt.list. Used to whitelist reuse of the user's mirror.
+__get_alt_mirror_hosts()
+{
+    local f="$CONFIGDIR/mirrors-alt.list"
+    [ -r "$f" ] || return 1
+    # second field is the URL; strip the scheme and path, keep the host
+    awk '{print $2}' "$f" | sed -nE 's|^[a-z]+://([^/]+).*|\1|p' | tr "[:upper:]" "[:lower:]"
+}
+
+# Print the canonical mirror URL (from mirrors-alt.list) for a given host.
+# The URL includes the path to the ALTLinux root (e.g. .../pub/ALTLinux).
+__get_alt_mirror_url_by_host()
+{
+    local f="$CONFIGDIR/mirrors-alt.list"
+    local host="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    [ -r "$f" ] || return 1
+    awk -v host="$host" '{
+        url=$2
+        sub(/^[a-z]+:\/\//, "", url)
+        sub(/\/.*/, "", url)
+        if (tolower(url) == host) { print $2; exit }
+    }' "$f"
 }
 
 # Generate sources.list content for a given ALT branch
+# Detect the ALT mirror from the enabled repos in the system sources.list,
+# so branch/task installs reuse the user's configured mirror (e.g. download.etersoft.ru)
+# instead of the default ftp.basealt.ru. The mirror is reused ONLY if its host is one of
+# the known ALT mirrors (listed in mirrors-alt.list); unknown hosts fall back to the
+# default. The returned URL is the mirror root (includes the ALTLinux path segment),
+# so callers append only <branch>/<arch>. Optional $1 = repo (sisyphus, p10, ...)
+# to prefer a line for the same branch. Prints base URL; returns non-zero if no
+# known mirror is configured.
+__get_alt_mirror_baseurl()
+{
+    local repolo src alt_lines url host
+    repolo="$(echo "${1:-}" | tr "[:upper:]" "[:lower:]")"
+    src="$(__get_system_sourceslist)"
+    # enabled rpm lines with http(s) URLs, preferring the ones for the requested branch
+    # the branch is a path component in the DIST field (e.g. .../p10/branch/... or p10/branch/...)
+    if [ -n "$repolo" ] ; then
+        alt_lines="$(echo "$src" | grep -E '^[[:space:]]*rpm.*https?://' | grep -iE "(^|[ /])$repolo(/|$)" || true)"
+    fi
+    [ -n "$alt_lines" ] || alt_lines="$(echo "$src" | grep -E '^[[:space:]]*rpm.*https?://')"
+    [ -n "$alt_lines" ] || return 1
+    # take the first http(s) URL from the selected lines
+    url="$(echo "$alt_lines" | sed -nE 's|.*[[:space:]](https?://[^[:space:]]*).*|\1|p' | head -1)"
+    [ -n "$url" ] || return 1
+    host="$(echo "$url" | sed -nE 's|^https?://([^/]+).*|\1|p' | tr "[:upper:]" "[:lower:]")"
+    [ -n "$host" ] || return 1
+    # reuse the mirror only if its host is one of the known ALT mirrors
+    __get_alt_mirror_hosts 2>/dev/null | grep -Fxq "$host" || return 1
+    __get_alt_mirror_url_by_host "$host"
+}
+
 # Usage:
 #   __generate_alt_sourceslist <branch>                    - for branch (p10, Sisyphus, c10f2, ...)
 #   __generate_alt_sourceslist archive <branch> <datestr>  - for archive repo
@@ -127,9 +201,10 @@ __generate_alt_sourceslist()
     else
         local repo="$1"
         repolo="$(echo "$repo" | tr "[:upper:]" "[:lower:]")"
-        baseurl="http://ftp.basealt.ru/pub/distributions"
+        # reuse the configured known mirror (URL already includes the ALTLinux path)
+        baseurl="$(__get_alt_mirror_baseurl "$repo" 2>/dev/null)"
+        [ -n "$baseurl" ] || baseurl="http://ftp.basealt.ru/pub/distributions/ALTLinux"
         [ "$repolo" = "sisyphus" ] && repopart="Sisyphus" || repopart="$repo/branch"
-        repopart="ALTLinux/$repopart"
     fi
 
     # sign logic from __get_sign in epm-addrepo
@@ -153,11 +228,20 @@ __generate_alt_sourceslist()
     esac
 }
 
-# Create a temporary APT directory for isolated repo operations
+# Persistent cache dir for temporary APT indices (shared across runs).
+# Indices for branch/task/named-repo sources.list are kept between epm runs
+# so they are not re-downloaded each time. Removed by epm clean --direct.
+__epm_apt_cache_dir()
+{
+    echo "${BIGTMPDIR:-/var/tmp}/eepm/apt-cache"
+}
+
+# Create a temporary APT directory for isolated repo operations.
+# The directory is persistent (see __epm_apt_cache_dir): lists/ is reused
+# across runs so package indices are not re-downloaded every time.
 __setup_tmp_apt_dir()
 {
-    __EPM_APT_TMPDIR="$(mktemp -d)" || fatal
-    remove_on_exit "$__EPM_APT_TMPDIR"
+    __EPM_APT_TMPDIR="$(__epm_apt_cache_dir)"
     mkdir -p "$__EPM_APT_TMPDIR/lists/partial" "$__EPM_APT_TMPDIR/sourceparts"
     cat > "$__EPM_APT_TMPDIR/apt.conf" <<EOF
 Dir::Etc::sourcelist "$__EPM_APT_TMPDIR/sources.list";
@@ -167,14 +251,24 @@ Dir::Cache::pkgcache "$__EPM_APT_TMPDIR/pkgcache.bin";
 Dir::Cache::srcpkgcache "$__EPM_APT_TMPDIR/srcpkgcache.bin";
 EOF
     __EPM_APT_REPO_OPTIONS="-c $__EPM_APT_TMPDIR/apt.conf"
+    # symlink existing system apt lists to avoid re-downloading on update
+    # (refresh: drop dangling links from a previous run, then link current files)
+    find "$__EPM_APT_TMPDIR/lists/" -maxdepth 1 -type l ! -exec test -e {} \; -delete 2>/dev/null
+    ln -sf /var/lib/apt/lists/*.* "$__EPM_APT_TMPDIR/lists/" 2>/dev/null
 }
 
 # Output current system sources.list content to stdout
+# Honors EPM_APT_SOURCES_LIST / EPM_APT_SOURCES_ROOT for test isolation
 __get_system_sourceslist()
 {
-    cat /etc/apt/sources.list 2>/dev/null
+    if [ -n "$EPM_APT_SOURCES_LIST" ] ; then
+        cat "$EPM_APT_SOURCES_LIST" 2>/dev/null
+        return
+    fi
+    local root="${EPM_APT_SOURCES_ROOT:-}"
+    cat "$root/etc/apt/sources.list" 2>/dev/null
     local f
-    for f in /etc/apt/sources.list.d/*.list ; do
+    for f in "$root/etc/apt/sources.list.d"/*.list ; do
         [ -s "$f" ] || continue
         cat "$f"
     done
@@ -216,9 +310,129 @@ __use_tmp_apt_for_tasks()
 {
     load_helper epm-update
     __setup_tmp_apt_dir
-    { __get_system_sourceslist ; __generate_task_sourceslist "$@" ; } > "$__EPM_APT_TMPDIR/sources.list"
+    { __get_system_sourceslist ; echo ; __generate_task_sourceslist "$@" ; } > "$__EPM_APT_TMPDIR/sources.list"
     # tolerate partial failures (some system repos may have broken GPG keys etc.)
     __epm_update || warning "Some repos failed to update, but continuing anyway"
+}
+
+# Find sources.list.d file for named repo
+# Returns file path or fails
+__find_named_repo_file()
+{
+    local name="$1"
+
+    case $PMTYPE in
+        dnf-*|dnf5-*|yum-*)
+            local f
+            for f in /etc/yum.repos.d/$name.repo /etc/yum.repos.d/alt-$name.repo ; do
+                [ -s "$f" ] && echo "$f" && return
+            done
+            return 1
+            ;;
+    esac
+
+    load_helper epm-sh-repo
+
+    [ -n "$APT_SOURCES_LIST_D" ] || return 1
+
+    local file="$APT_SOURCES_LIST_D/$name.list"
+    [ -s "$file" ] && echo "$file" && return
+
+    return 1
+}
+
+# Get enabled repo lines from a named repo file
+# Uncomments disabled lines (strips leading "# ")
+__get_named_repo_lines()
+{
+    local file="$1"
+    # output active lines as-is
+    grep "^\(rpm\|deb\)" "$file" 2>/dev/null
+    # uncomment disabled lines
+    grep "^#[[:space:]]*\(rpm\|deb\)" "$file" 2>/dev/null | sed 's/^#[[:space:]]*//'
+}
+
+# Setup temp APT with system repos + named repo and run update
+# arg: repo name
+__use_tmp_apt_with_named_repo()
+{
+    local name="$1"
+    local file
+    file="$(__find_named_repo_file "$name")" || fatal "Can't find repo '$name' in sources.list.d"
+    load_helper epm-update
+    __setup_tmp_apt_dir
+    # skip duplicates: the same source twice makes apt-get update hang (downloads to the same partial file)
+    { __get_system_sourceslist ; __get_named_repo_lines "$file" ; } | awk 'NF { $1=$1 ; if (!seen[$0]++) print }' > "$__EPM_APT_TMPDIR/sources.list"
+    __epm_update || warning "Some repos failed to update, but continuing anyway"
+}
+
+# Use only ALT branch repo (rpm-md) for dnf via temporary repos
+# arg: branch
+__use_tmp_dnf_for_branch()
+{
+    local repo="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    load_helper epm-sh-altlinux
+    local baseurl arch ids='' vendor=''
+    __EPM_DNF_REPO_OPTIONS=''
+    # dnf reads APT-RPM repos: use APT-RPM indexes (available on all mirrors)
+    if __alt_dnf_supports_aptrpm ; then
+        baseurl="$(__alt_dnf_aptrpm_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+        vendor="$(__alt_dnf_aptrpm_vendor "$repo")"
+        # the vendor key of a branch does not sign old packages: check them by all ALT keys
+        local keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-$repo"
+        case "$repo" in
+            sisyphus|deferred*)
+                keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-sisyphus"
+                ;;
+        esac
+        __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+        for arch in $(__alt_dnf_archlist) ; do
+            __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS $(__alt_dnf_aptrpm_repo_options "tmp-$repo-$arch" "$baseurl/$arch" classic "$vendor") --setopt=tmp-$repo-$arch.gpgkey=file://$keyfile"
+            ids="$ids${ids:+,}tmp-$repo-$arch"
+        done
+        __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repo=$ids"
+        return
+    fi
+    baseurl="$(__alt_dnf_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    for arch in $(__alt_dnf_archlist) ; do
+        __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repofrompath=tmp-$repo-$arch,$baseurl/$arch --setopt=tmp-$repo-$arch.gpgcheck=1"
+        ids="$ids${ids:+,}tmp-$repo-$arch"
+    done
+    __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS --repo=$ids"
+}
+
+# Add task repos (APT-RPM) to the system repos for dnf via temporary repos
+# args: task_number [task_number ...]
+__use_tmp_dnf_for_tasks()
+{
+    load_helper epm-sh-altlinux
+    local tn url vendor arch comp
+    __EPM_DNF_REPO_OPTIONS=''
+    for tn in "$@" ; do
+        url="$(eget --get-real-url "https://git.altlinux.org/tasks/$tn/build/repo")" || { warning "Can't access task $tn repo" ; continue ; }
+        url="${url%/}"
+        vendor="$(get_task_sign "$tn" | tr -d '[]')"
+        while read -r arch comp ; do
+            [ -n "$comp" ] || continue
+            __EPM_DNF_REPO_OPTIONS="$__EPM_DNF_REPO_OPTIONS $(__alt_dnf_aptrpm_repo_options "tmp-task-$tn-$arch" "$url/$arch" "$comp" "$vendor")"
+        done <<EOF
+$(__alt_dnf_aptrpm_probe_url "$url")
+EOF
+    done
+    [ -n "$__EPM_DNF_REPO_OPTIONS" ]
+}
+
+# Enable named repo (even if disabled) for dnf
+# arg: repo name
+__use_dnf_with_named_repo()
+{
+    local name="$1"
+    local file
+    file="$(__find_named_repo_file "$name")" || fatal "Can't find repo '$name' in /etc/yum.repos.d"
+    local ids
+    ids="$(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' "$file" | tr '\n' ',' | sed -e 's|,$||')"
+    [ -n "$ids" ] || fatal "There are no repos in $file"
+    __EPM_DNF_REPO_OPTIONS="--enablerepo=$ids"
 }
 
 # call: __process_repo_arguments <function> args...
@@ -241,21 +455,48 @@ __process_repo_arguments() {
         repo_groups["$repo"]+="$name "
     done
 
+    local res=0
     for repo in "${!repo_groups[@]}"; do
         if [ "$repo" = '.' ] ; then
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         elif [ "$repo" = 'aur' ] ; then
             # Arch Linux AUR
-            (PMTYPE=aur-pacman PPARGS=1 $func ${repo_groups[$repo]})
+            (PMTYPE=aur-pacman PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         elif startwith "$repo" "copr/" ; then
             # Fedora Copr: enable repo, then install
             epm repo add "$repo"
             epm update
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+        elif [ "$BASEDISTRNAME" = "alt" ] && [ "$PMTYPE" != "apt-rpm" ] ; then
+            case "$repo" in
+                archive/*)
+                    fatal 'Repo $repo is not supported for $PMTYPE on ALT'
+                    ;;
+                named:*)
+                    __use_dnf_with_named_repo "${repo#named:}"
+                    ;;
+                *)
+                    __use_tmp_dnf_for_branch "$repo"
+                    ;;
+            esac
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+            __EPM_DNF_REPO_OPTIONS=''
+        elif startwith "$repo" "archive/" ; then
+            # ALT Linux archive: archive/DATE/package -> use current branch + date
+            local datestr="${repo#archive/}"
+            datestr="$(echo "$datestr" | sed 's|-|/|g')"
+            __use_tmp_apt_for_branch archive "$DISTRVERSION" "$datestr" || return 1
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
+        elif startwith "$repo" "named:" ; then
+            # Named repo from sources.list.d
+            local reponame="${repo#named:}"
+            __use_tmp_apt_with_named_repo "$reponame" || return 1
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         else
             # ALT Linux: use temporary APT directory instead of modifying system repos
             __use_tmp_apt_for_branch "$repo" || return 1
-            (PPARGS=1 $func ${repo_groups[$repo]})
+            (PPARGS=1 $func ${repo_groups[$repo]}) || res=$?
         fi
     done
+    return $res
 }

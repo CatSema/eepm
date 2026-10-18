@@ -68,6 +68,12 @@ epm_upgrade_alt_tasks()
         [ -n "$tn" ] && task_numbers="$task_numbers $tn"
     done
 
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        load_helper epm-install-alt
+        __epm_install_alt_task_files "$installlist" $task_numbers
+        return
+    fi
+
     local res
     __use_tmp_apt_for_tasks $task_numbers || return 1
     (pkg_names="$installlist" epm_install)
@@ -92,6 +98,38 @@ epm_upgrade()
     return $_ret
 }
 
+# download packages that would be upgraded, without installing them
+__epm_upgrade_download_only()
+{
+    # named packages/files/urls: download to the current dir (as install --download-only does)
+    if [ -n "$pkg_names$pkg_files$pkg_urls" ] ; then
+        load_helper epm-install
+        (pkg_names="$pkg_names" pkg_files="$pkg_files" pkg_urls="$pkg_urls" epm_install)
+        return $?
+    fi
+
+    # bare: download all upgradable packages via the native backend flag (into the package cache)
+    info "Downloading packages for upgrade ..."
+    case $PMTYPE in
+        apt-rpm|apt-dpkg)
+            sudocmd apt-get $__EPM_APT_REPO_OPTIONS $(subst_option non_interactive -y) -d dist-upgrade
+            ;;
+        dnf-rpm|dnf5-rpm)
+            sudocmd $DNFCMD $(subst_option non_interactive -y) upgrade --downloadonly
+            ;;
+        yum-rpm)
+            sudocmd yum $(subst_option non_interactive -y) upgrade --downloadonly
+            ;;
+        pacman)
+            sudocmd pacman -Suw $(subst_option non_interactive --noconfirm) $force
+            ;;
+        *)
+            warning 'Download only for "upgrade all" is not implemented for $PMTYPE, specify package names'
+            return 1
+            ;;
+    esac
+}
+
 __epm_upgrade_do()
 {
     local CMD
@@ -108,7 +146,7 @@ __epm_upgrade_do()
             return
         fi
 
-        if [ -z "$*" ] ; then
+        if [ -z "$*" ] && [ -z "$download_only" ] ; then
             load_helper epm-check
             __epm_check_container_issue_43533
 
@@ -128,6 +166,11 @@ __epm_upgrade_do()
         info "Downloading packages assigned to upgrade ..."
         load_helper epm-download
         __handle_pkg_urls_to_install
+    fi
+
+    if [ -n "$download_only" ] ; then
+        __epm_upgrade_download_only "$@"
+        return
     fi
 
     info "Running command for upgrade packages"
@@ -157,13 +200,16 @@ __epm_upgrade_do()
     case $PMTYPE in
     apt-rpm|apt-dpkg)
         local APTOPTIONS="$dryrun $(subst_option non_interactive -y) $(subst_option debug "-V -o Debug::pkgMarkInstall=1 -o Debug::pkgProblemResolver=1")"
-        if [ -n "$parallel" ] && [ "$BASEDISTRNAME" = "alt" ] ; then
+        if [ -n "$parallel" ] && [ "$PMTYPE" = "apt-rpm" ] ; then
             load_helper epm-download
             info "Downloading packages to the cache... "
             __epm_alt_download_to_cache $APTOPTIONS dist-upgrade
         fi
 
-        CMD="apt-get $__EPM_APT_REPO_OPTIONS $APTOPTIONS $noremove $force_yes dist-upgrade"
+        # --force-yes is deprecated in Debian apt, use --allow-* instead
+        local apt_force_yes="$force_yes"
+        [ "$PMTYPE" = "apt-dpkg" ] && [ "$apt_force_yes" = "--force-yes" ] && apt_force_yes="--allow-unauthenticated --allow-downgrades --allow-change-held-packages"
+        CMD="apt-get $__EPM_APT_REPO_OPTIONS $APTOPTIONS $noremove $apt_force_yes dist-upgrade"
         ;;
     apm-rpm)
         CMD="apm system upgrade"
@@ -181,8 +227,15 @@ __epm_upgrade_do()
         CMD="yum $OPTIONS upgrade $*"
         ;;
     dnf-rpm|dnf5-rpm)
-        local OPTIONS="$(subst_option non_interactive -y)"
-        CMD="dnf $OPTIONS upgrade $*"
+        local OPTIONS="$(subst_option non_interactive -y) $(subst_option dryrun --assumeno) $__EPM_DNF_REPO_OPTIONS"
+        # keep kernel modules for all installed kernels
+        if [ "$BASEDISTRNAME" = "alt" ] ; then
+            load_helper epm-sh-altlinux
+            OPTIONS="$OPTIONS $(__alt_dnf_installonly_opt)"
+        fi
+        CMD="$DNFCMD $OPTIONS upgrade"
+        # dnf returns error on --assumeno
+        local ignore_dryrun_error="$dryrun"
         ;;
     snappy)
         CMD="snappy update"
@@ -273,6 +326,9 @@ __epm_upgrade_do()
         ;;
     esac
 
-    sudocmd $CMD "$@"
+    sudocmd $CMD "$@" && return
+    local RES=$?
+    [ -n "$ignore_dryrun_error" ] && return 0
+    return $RES
 
 }

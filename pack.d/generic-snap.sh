@@ -13,7 +13,7 @@ fi
 alpkg=$(basename $TAR)
 BASEDIR=$(basename $TAR .snap)
 
-erc unpack $TAR || fatal
+erc --here -C $BASEDIR unpack $TAR || fatal
 
 # name: plex-desktop
 # version: 1.69.1
@@ -74,6 +74,10 @@ for f in $desktop_src/*.desktop ; do
     subst "s|^Comment=$|Comment=$summary|" "usr/share/applications/$bn"
 done
 
-erc pack $PKGNAME opt/$name usr/share
+if [ -d usr/share ] ; then
+    erc pack $PKGNAME opt/$name usr/share
+else
+    erc pack $PKGNAME opt/$name
+fi
 
 return_tar $PKGNAME

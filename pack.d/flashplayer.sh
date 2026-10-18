@@ -8,8 +8,7 @@ VERSION="$3"
 
 PKGNAME=$PRODUCT-$VERSION
 
-erc unpack $TAR
-cd * || fatal
+erc --here unpack $TAR || fatal
 
 mkdir -p usr/bin/
 mv flashplayer usr/bin/

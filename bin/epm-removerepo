@@ -26,8 +26,8 @@ __apt_delete_repo_line()
 {
     local repo="$1"
 
-    local sc="sudocmd"
-    [ -z "$quiet" ] || sc="sudorun"
+    local sc="sudorun"
+    [ -n "$verbose" ] && sc="sudocmd"
 
     # touch file only when it is needed
     grep -q -F "$repo" "$APT_SOURCES_LIST" || return
@@ -52,7 +52,9 @@ __epm_removerepo_apt()
     __apt_delete_repo_line "$repo"
 
     # sources.list.d: comment lines instead of deleting
-    epm repo disable "^$repo" 2>/dev/null
+    docmd epm repo disable "^$repo" 2>/dev/null
+
+    return 0
 }
 
 
@@ -62,9 +64,9 @@ __epm_grep_repo_list()
         epm --quiet repo list
         return
     fi
-    # use --regex for raw regex patterns
+    # use --regexp for raw regex patterns
     while [ -n "$1" ] ; do
-        epm --quiet repo list --regex "$1"
+        epm --quiet --regexp repo list "$1"
         shift
     done
 }
@@ -96,6 +98,7 @@ __epm_removerepo_alt()
         for arg in $repo ; do
             is_taskarg "$arg" || continue
             tn=$(get_tasknumber_from_arg "$arg")
+            showcmd epm repo remove $tn
             __epm_removerepo_alt_grepremove " repo/$tn/" "/tasks/$tn " "/$tn[ /]build/repo"
         done
         return
@@ -150,6 +153,81 @@ __epm_removerepo_alt()
 
 }
 
+# remove section [id] from repo file (remove file if there are no sections left)
+__epm_removerepo_dnf_section()
+{
+    local file="$1"
+    local id="$2"
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    awk -v id="$id" '/^\[.*\]/ { skip = ($0 == "[" id "]") } !skip' "$file" >$tmpfile
+    if grep -q "^\[" $tmpfile ; then
+        chmod 644 $tmpfile
+        sudocmd cp $tmpfile "$file"
+    else
+        sudocmd rm -f "$file"
+    fi
+}
+
+# args: all | <name> (/etc/yum.repos.d/<name>.repo, alt-<name>.repo) | <repo id>
+__epm_removerepo_dnf()
+{
+    local repo f found
+    for repo in "$@" ; do
+        if [ "$repo" = "all" ] ; then
+            info "removing all repos"
+            for f in /etc/yum.repos.d/*.repo ; do
+                [ -e "$f" ] || continue
+                sudocmd rm -f "$f"
+            done
+            continue
+        fi
+
+        if [ "$BASEDISTRNAME" = "alt" ] ; then
+            # task repos (APT-RPM) added with epm repo add <task number>
+            case "$repo" in
+                tasks|task)
+                    for f in /etc/yum.repos.d/task-[0-9]*.repo ; do
+                        [ -e "$f" ] || continue
+                        sudocmd rm -f "$f"
+                    done
+                    continue
+                    ;;
+                [0-9]*)
+                    if [ -e "/etc/yum.repos.d/task-$repo.repo" ] ; then
+                        sudocmd rm -f "/etc/yum.repos.d/task-$repo.repo"
+                        continue
+                    fi
+                    ;;
+            esac
+            case "$repo" in
+                archive|cdroms|autoimports|korinf|[0-9]*)
+                    info 'Skipping $repo: it is not supported for $PMTYPE'
+                    continue
+                    ;;
+            esac
+        fi
+
+        found=''
+        for f in /etc/yum.repos.d/$repo.repo /etc/yum.repos.d/alt-$repo.repo ; do
+            [ -e "$f" ] || continue
+            sudocmd rm -f "$f"
+            found=1
+        done
+        [ -n "$found" ] && continue
+
+        for f in /etc/yum.repos.d/*.repo ; do
+            grep -q -F "[$repo]" "$f" 2>/dev/null || continue
+            __epm_removerepo_dnf_section "$f" "$repo"
+            found=1
+        done
+        # not an error - repo may be already removed (idempotency)
+        [ -n "$found" ] || info 'Repo $repo is not found in /etc/yum.repos.d'
+    done
+    return 0
+}
+
 epm_removerepo()
 {
 
@@ -159,7 +237,7 @@ case "$1" in
         local owner_project="$(echo "$1" | sed 's|^copr/||')"
         case $PMTYPE in
             dnf-rpm|dnf5-rpm)
-                sudocmd dnf copr disable "$owner_project"
+                sudocmd $DNFCMD copr disable "$owner_project"
                 ;;
             yum-rpm)
                 sudocmd yum copr disable "$owner_project"
@@ -174,13 +252,32 @@ esac
 
 case $BASEDISTRNAME in
     "alt")
-        __epm_removerepo_alt "$@"
+        if [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_uses_apt_sources ; then
+            __epm_removerepo_alt "$@"
+            return
+        fi
+        ;;
+esac
+
+case "$PMTYPE:$1" in
+    yum-rpm:all)
+        __epm_removerepo_dnf "$@"
         return
         ;;
+esac
+
+case $BASEDISTRNAME in
     "astra")
-        echo "Use workaround for AstraLinux"
-        # aptsources.distro.NoDistroTemplateException: Error: could not find a distribution template for AstraLinuxCE/orel
-        __epm_removerepo_apt "$@"
+        # handle "all" and pattern-based removal
+        case "$1" in
+            all)
+                info "removing all repos"
+                __epm_removerepo_alt_grepremove "all"
+                ;;
+            *)
+                __epm_removerepo_apt "$@"
+                ;;
+        esac
         return
         ;;
 esac;
@@ -208,13 +305,8 @@ case $PMTYPE in
         assure_exists yum-utils
         sudocmd yum-config-manager --disable "$@"
         ;;
-    dnf-rpm)
-        repo_file_name=$(env LC_ALL=C dnf repoinfo "$@" 2>/dev/null | sed -n 's/^Repo-filename\s*:\s*//p')
-        sudocmd rm "$repo_file_name"
-        ;;
-    dnf5-rpm)
-        repo_file_name=$(env LC_ALL=C dnf repoinfo "$@" 2>/dev/null | sed -n 's/^Config file\s*:\s*//p')
-        sudocmd rm "$repo_file_name"
+    dnf-rpm|dnf5-rpm)
+        __epm_removerepo_dnf "$@"
         ;;
     urpm-rpm)
         if [ "$1" = "all" ] ; then

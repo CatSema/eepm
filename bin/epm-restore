@@ -57,6 +57,50 @@ fill_sign()
 }
 
 
+# Whether the current PMTYPE actually enforces version constraints passed to "install".
+# apt-rpm/apt-dpkg/apk parse and respect "name>=version" / "name==version".
+# dnf/yum CLI does NOT honor range operators (ansible/ansible#78295) and rejects the glued
+# "name>=version" form; only exact "name-version" matches, which is a different semantics.
+# For everything that doesn't enforce, restore drops version constraints from the install args.
+__epm_pmtype_enforces_install_version()
+{
+    case $PMTYPE in
+        apt-rpm|apm-rpm|apt-dpkg|aptitude-dpkg|apk) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Convert dry-run rpm-notation "name >= version" lines into epm install args.
+# On version-enforcing PMTYPEs: glue spaces ("name >= version" -> "name>=version") — rpm names
+# and versions never contain whitespace, so this is safe.
+# Elsewhere: drop the constraint and keep only the package name.
+__epm_restore_glue_version()
+{
+    if __epm_pmtype_enforces_install_version ; then
+        sed -e 's| ||g'
+    else
+        cut -d' ' -f 1
+    fi
+}
+
+# Emit one dependency line in the current mode.
+# In dry-run: print "<macro> <name> [<vspec>]" (spec notation, version always shown).
+# In install: print the install arg — "<name><vspec-glued>" when the current PMTYPE
+# enforces range constraints, else just "<name>". (stdout carries the install args;
+# callers capture them with $().)
+# $1 = rpm macro ("Requires:" / "BuildRequires:" / ""), $2 = name, $3 = vspec (">= 1.5") or empty.
+__epm_restore_emit()
+{
+    local macro="$1" name="$2" vspec="$3"
+    if [ -n "$dryrun" ] ; then
+        echo "$macro $name${vspec:+ $vspec}"
+    elif [ -n "$vspec" ] && __epm_pmtype_enforces_install_version ; then
+        echo "$name$(printf '%s' "$vspec" | tr -d ' ')"
+    else
+        echo "$name"
+    fi
+}
+
 # macro pkg caseline
 __epm_pi_sign_to_rpm()
 {
@@ -161,7 +205,7 @@ __epm_restore_pip()
         return
     else
         info 'Install requirements from $req_file ...'
-        ilist="$(cat $req_file | __epm_restore_convert_to_rpm_notation | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+        ilist="$(cat $req_file | __epm_restore_convert_to_rpm_notation | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
     fi
 
     ilist="$(estrlist list $ilist)"
@@ -221,7 +265,7 @@ __epm_restore_pyproject()
         return
     else
         info "Install requirements from $req_file ..."
-        ilist="$(__epm_restore_print_pyproject "$req_file" | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+        ilist="$(__epm_restore_print_pyproject "$req_file" | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
     fi
 
     ilist="$(estrlist list $ilist)"
@@ -280,7 +324,7 @@ $l"
             __epm_restore_print_comment "$req_file" "" " $(__epm_get_array_name "$section")"
             __epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | sed -e "s|^|$reqmacro |"
         else
-            ilist="$ilist $(__epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | cut -d' ' -f 1 | sed -e "s|^|python3-module-|")"
+            ilist="$ilist $(__epm_lineprint_python_array "$ar" | __epm_restore_convert_to_rpm_notation ">=" | __epm_restore_glue_version | sed -e "s|^|python3-module-|")"
         fi
         section=''
         ar=''
@@ -298,39 +342,21 @@ __epm_print_npm_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local l name ver vspec cleanver
     while read l ; do
         # "tap": "^14.10.7"
         echo "$l" | grep -q '"\(.*\)": "\(.*\)"' || continue
-        local name="$(echo "$l" | sed -e 's|.*"\(.*\)": ".*|\1|')"
+        name="$(echo "$l" | sed -e 's|.*"\(.*\)": ".*|\1|')"
         [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's|.*"\(.*\)": "\(.*\)".*|\2|')" #'
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign
-            if echo "$ver" | grep -q "^\^" ; then
-                sign=">="
-            else
-                sign="="
-            fi
-            ll=$(echo "$ver" | sed -e 's|^[^~]||')
-            pi="$pi$reqmacro node-$name $sign $ll"
-#         [ -n "$pi" ] && pi="$pi
-#"
-#           [ -n "$pi" ] || pi="$pi$reqmacro: node-$t"
-            echo "$pi"
-            continue
-        else
-            local pi="node-$name"
-            #echo "    $l -> $name -> $pi"
+        ver="$(echo "$l" | sed -e 's|.*"\(.*\)": "\(.*\)".*|\2|')" #'
+        # npm versions: ^X.Y.Z (caret), ~X.Y.Z (tilde), bare X.Y.Z → lower bound ">= X.Y.Z".
+        vspec=''
+        if echo "$ver" | grep -qE "^[\^~]?[0-9]" ; then
+            cleanver="$(echo "$ver" | sed -e 's|^[\^~]||')"
+            vspec=">= $cleanver"
         fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        __epm_restore_emit "$reqmacro" "node-$name" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 
@@ -338,75 +364,29 @@ __epm_print_perl_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local l name ver vspec
     for l in $(cat) ; do
         # perl(Class::ErrorHandler)>=0
         echo "$l" | grep -q '^perl(' || continue
-        local name="$(echo "$l" | sed -e 's|>=.*||' -e 's|::|/|g' -e 's|)|.pm)|')"
+        name="$(echo "$l" | sed -e 's|>=.*||' -e 's|::|/|g' -e 's|)|.pm)|')"
+        [ -z "$name" ] && continue
         [ "$name" = "perl(perl.pm)" ] && continue
-        [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's|.*>=||')"
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign=''
-            [ "$ver" = "0" ] || sign=" >= $ver"
-            pi="$pi$reqmacro $name$sign"
-            echo "$pi"
-            continue
-        else
-            local pi="$name"
-            #echo "    $l -> $name -> $pi"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        ver="$(echo "$l" | sed -e 's|.*>=||')"
+        vspec=''
+        [ "$ver" = "0" ] || vspec=">= $ver"
+        __epm_restore_emit "$reqmacro" "$name" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
-}
-
-__epm_print_perl_list_shyaml()
-{
-    local reqmacro="$1"
-    local req_file="$2"
-    local l
-    while read l ; do
-        # Convert::ASN1: 0.10
-        echo "$l" | grep -q '^ *\(.*\): \(.*\)' || continue
-        local name="$(echo "$l" | sed -e 's| *\(.*\): \(.*\)|\1|' -e 's|::|/|g')".pm
-        [ "$name" = "perl.pm" ] && continue
-        [ -z "$name" ] && continue
-        local ver="$(echo "$l" | sed -e 's| *\(.*\): \(.*\)|\2|')"
-        [ -z "$name" ] && continue
-
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            local sign=''
-            [ "$ver" = "0" ] || sign=" >= $ver"
-            pi="$pi$reqmacro perl($name)$sign"
-            echo "$pi"
-            continue
-        else
-            local pi="perl($name)"
-            #echo "    $l -> $name -> $pi"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
-    done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 
 __epm_print_nupkg_list()
 {
-    a= dotnet list $1 package | grep "^   > " | while read n name req other; do
-        if [ -n "$dryrun" ] ; then
-            echo "BuildRequires: nupkg($name) >= $req"
-        else
-            echo "nupkg($name)"
-        fi
+    local req_file="$1"
+    local n name req other vspec
+    a= dotnet list "$req_file" package | grep "^   > " | while read n name req other ; do
+        vspec=''
+        [ -n "$req" ] && vspec=">= $req"
+        __epm_restore_emit "BuildRequires:" "nupkg($name)" "$vspec"
     done
 }
 
@@ -429,25 +409,15 @@ __epm_print_meson_list()
 {
     local reqmacro="$1"
     local req_file="$2"
-    local l
+    local name sign ver other vspec
     while read name sign ver other ; do
         # gtk4-wayland
         # gtk4 >= 4.6
         [ -n "$other" ] && continue
-        if [ -n "$dryrun" ] ; then
-            local pi=''
-            pi="$reqmacro pkgconfig($name)"
-            [ -n "$sign" ] && pi="$pi $sign $ver"
-            echo "$pi"
-            continue
-        else
-            local pi="pkgconfig($name)"
-        fi
-        [ -n "$name" ] || continue
-        ilist="$ilist $pi"
+        vspec=''
+        [ -n "$sign" ] && [ -n "$ver" ] && vspec="$sign $ver"
+        __epm_restore_emit "$reqmacro" "pkgconfig($name)" "$vspec"
     done < $req_file
-
-    [ -n "$dryrun" ] || echo "$ilist"
 }
 
 __epm_restore_meson()
@@ -544,40 +514,105 @@ __epm_restore_perl()
     docmd epm install $ilist
 }
 
-# disabled
-__epm_restore_perl_shyaml()
+# Print cpanfile "requires" as "<phase>\t<Module>\t<spec>" lines (tab-separated).
+# recommends/suggests and the perl core requirement are skipped here.
+# cpanfile is a Perl DSL (with ternary version specs and on/feature blocks), so it
+# cannot be parsed with regexps — Module::CPANfile evals it safely.
+__epm_print_cpanfile_specs()
+{
+    # $1 = cpanfile
+    a= /usr/bin/perl -MModule::CPANfile -e '
+        my $f = shift;
+        my $prereqs = Module::CPANfile->load($f)->prereqs;
+        for my $phase (qw(runtime build configure test develop)) {
+            my $req = eval { $prereqs->requirements_for($phase, "requires") };
+            next unless $req;
+            my $h = $req->as_string_hash;          # { Mod => ">= 1.85" | "4.00" | "0" }
+            for my $mod (sort keys %$h) {
+                next if $mod eq "perl";
+                print "$phase\t$mod\t$h->{$mod}\n";
+            }
+        }
+    ' "$1"
+}
+
+# Translate a cpanfile version spec (CPAN::Meta::Requirements string) into an rpm
+# Requires constraint, or print nothing for "any version".
+# Several constraints are joined by ", ". rpm Requires cannot express "!=" and cannot
+# hold more than one operator per line, so drop "!=" and keep the first surviving
+# constraint (the lower bound). Bare versions ("1.85") and "==" mean ">=".
+__epm_cpanfile_spec_to_rpm()
+{
+    local spec="$1"
+    [ -n "$spec" ] || return
+    [ "$spec" = "0" ] && return
+
+    local part saved ver
+    local OLDIFS="$IFS"
+    IFS=','
+    for part in $spec ; do
+        IFS="$OLDIFS"
+        part="${part# }"; part="${part% }"
+        [ -n "$part" ] || continue
+        case "$part" in "!="*) continue ;; esac
+        [ -n "$saved" ] && continue
+        case "$part" in
+            ">="*|">"*|"<="*|"<"*) saved="$part" ;;
+            "=="*) ver="${part#??}"; ver="${ver# }"; saved=">= $ver" ;;
+            "="*)  ver="${part#?}";  ver="${ver# }"; saved=">= $ver" ;;
+            *)     saved=">= $part" ;;
+        esac
+    done
+    IFS="$OLDIFS"
+    [ -n "$saved" ] || return
+    echo "$saved"
+}
+
+# Read "<phase>\t<Module>\t<spec>" lines (already sorted runtime-first).
+# runtime requires -> Requires:, the rest (build/configure/test/develop) -> BuildRequires:.
+# Emits each dependency via __epm_restore_emit (spec line in dry-run, install arg otherwise).
+__epm_print_cpanfile_list()
+{
+    local req_file="$1"
+    local phase mod spec name vspec macro
+    while IFS="$(printf '\t')" read phase mod spec ; do
+        case "$phase" in
+            runtime) macro="Requires:" ;;
+            *)       macro="BuildRequires:" ;;
+        esac
+        name="perl($(printf '%s' "$mod" | sed -e 's|::|/|g').pm)"
+        vspec="$(__epm_cpanfile_spec_to_rpm "$spec")"
+        __epm_restore_emit "$macro" "$name" "$vspec"
+    done < $req_file
+}
+
+__epm_restore_cpanfile()
 {
     local req_file="$1"
 
-    assure_exists shyaml
+    # Module::CPANfile (ALT package perl-Module-CPANfile) is the canonical cpanfile parser
+    if ! a= /usr/bin/perl -MModule::CPANfile -e 'exit 0' 2>/dev/null ; then
+        info "Installing perl-Module-CPANfile to parse cpanfile ..."
+        docmd epm install perl-Module-CPANfile || fatal "Can't install perl-Module-CPANfile"
+    fi
+
+    local lt
+    lt=$(mktemp) || fatal
+    remove_on_exit $lt
+    __epm_print_cpanfile_specs "$req_file" >$lt
 
     if [ -n "$dryrun" ] ; then
-        local lt
-        lt=$(mktemp) || fatal
-        remove_on_exit $lt
-        a= shyaml get-value requires <$req_file >$lt
-        # all requirements will autodetected during packing, put it to the buildreq
         echo
         __epm_restore_print_comment "$req_file"
-        __epm_print_perl_list "BuildRequires:" $lt
-
-        echo
-        __epm_restore_print_comment "$req_file" " build_requires"
-        a= shyaml get-value build_requires <$req_file >$lt
-        __epm_print_perl_list "BuildRequires:" $lt
+        __epm_print_cpanfile_list $lt
         rm -f $lt
         return
     fi
 
     info "Install requirements from $req_file ..."
-    local lt
-    lt=$(mktemp) || fatal
-    remove_on_exit $lt
-    a= shyaml get-value requires <$req_file >$lt
-    ilist="$(__epm_print_perl_list "" $lt)"
-    a= shyaml get-value build_requires <$req_file >$lt
-    ilist="$ilist $(__epm_print_perl_list "" $lt)"
+    ilist="$(__epm_print_cpanfile_list $lt)"
     rm -f $lt
+    ilist="$(estrlist list $ilist)"
     docmd epm install $ilist
 }
 
@@ -625,7 +660,14 @@ __epm_restore_by()
 #            [ -s "$req_file" ] && __epm_restore_perl "$req_file"
 #            ;;
         Makefile.PL)
+            # cpanfile is the canonical modern source (Makefile.PL is often generated
+            # from it); if both are present, prefer cpanfile to avoid a second, less
+            # precise dependency block.
+            [ -s "$(dirname "$req_file")/cpanfile" ] && return
             [ -s "$req_file" ] && __epm_restore_perl "$req_file"
+            ;;
+        cpanfile)
+            [ -s "$req_file" ] && __epm_restore_cpanfile "$req_file"
             ;;
         *.sln|*.csproj)
             local PROJ="$(echo $req_file)"
@@ -639,29 +681,39 @@ __epm_restore_by()
 
 epm_restore()
 {
-    req_file="$pkg_filenames"
-    if [ -n "$pkg_urls" ] && echo "$pkg_urls" | grep -qE "^https?://" ; then
-        req_file="$(basename "$pkg_urls")"
-        #assure eget
-        [ -r "$req_file" ] && fatal "File $req_file is already exists in $(pwd)"
-        info "Downloading '$req_file' from '$pkg_urls' ..."
-        eget "$pkg_urls"
-        [ -s "$req_file" ] || fatal "Can't download $req_file from '$pkg_urls'"
-    fi
-
-    if [ -n "$req_file" ] ; then
-        __epm_restore_by $req_file
+    # Requirement files or URLs given explicitly on the command line.
+    if [ $# -gt 0 ] ; then
+        local arg fn
+        for arg in "$@" ; do
+            if is_url "$arg" ; then
+                fn="$(basename "$arg")"
+                #assure eget
+                [ -r "$fn" ] && fatal "File $fn is already exists in $(pwd)"
+                info "Downloading '$fn' from '$arg' ..."
+                eget "$arg"
+                [ -s "$fn" ] || fatal "Can't download $fn from '$arg'"
+                __epm_restore_by "$fn"
+            elif [ -s "$arg" ] ; then
+                __epm_restore_by "$arg"
+            else
+                fatal "Can't read requirements file '$arg'"
+            fi
+        done
         return
     fi
 
 # TODO: nowhere works: python3 setup.py --requires
 
-    # if run with empty args
+    # if run with empty args — auto-search known requirement files
+    local i
     for i in requirements.txt requirements/default.txt requirements_dev.txt requirements-dev.txt requirements/dev.txt dev-requirements.txt \
              requirements-test.txt requirements_test.txt requirements/test.txt test-requirements.txt requirements/coverage.txt \
-             Gemfile requires.txt package.json setup.py python_dependencies.py Makefile.PL meson.build pyproject.toml \
+             Gemfile requires.txt package.json setup.py python_dependencies.py cpanfile Makefile.PL meson.build pyproject.toml \
              *.sln *.csproj ; do
         __epm_restore_by $i
     done
 
+    # auto-search is best-effort; ignore the status of the last glob probe
+    # (otherwise 'epm restore --dry-run' with no matching *.sln/*.csproj exits 1)
+    return 0
 }

@@ -2,8 +2,10 @@
 
 PKGNAME=mssql-server
 SUPPORTEDARCHES="x86_64"
-DESCRIPTION="MS SQL Server 2019 from the official site"
+VERSION="$2"
+DESCRIPTION="MS SQL Server from the official site"
 URL="https://packages.microsoft.com/"
+TIPS="Run 'epm play mssql-server=2022' to install other year (2017, 2019, 2022, 2025, preview)."
 
 if [ "$1" = "--remove" ] ; then
     epm remove $PKGNAME
@@ -14,6 +16,40 @@ fi
 
 . $(dirname $0)/common.sh
 
+# Default year is 2022 (tracked in app-versions)
+MSSQL_YEAR=2022
+
+case "$VERSION" in
+    2017|2019|2022|2025|preview)
+        MSSQL_YEAR="$VERSION"
+        VERSION="*"
+        ;;
+    ""|"*")
+        ;;
+    *)
+        warn_version_is_not_supported
+        ;;
+esac
+
+# RHEL repo version matrix:
+#          rhel/8  rhel/9
+# 2017      +       -
+# 2019      +       -
+# 2022      +       +
+# 2025      -       +
+# preview   +       +
+#
+# Ubuntu repo version matrix:
+#          16.04  18.04  20.04  22.04  24.04
+# 2017      +      +      -      -      -
+# 2019      +      +      +      -      -
+# 2022      -      -      +      +      -
+# 2025      -      -      -      +      +
+# preview   +      -      +      +      +
+case "$MSSQL_YEAR" in
+    2017|2019) RHEL_VERSION=8 ;;
+    *)         RHEL_VERSION=9 ;;
+esac
 
 serv mssql-server stop
 
@@ -22,21 +58,26 @@ dversion="$(epm print info -v)"
 
 case "$(epm print info -e)" in
   AstraLinuxSE/1.7)
+    # only 2017 and 2019 are available for Ubuntu 18.04
+    [ "$MSSQL_YEAR" = "2022" ] && MSSQL_YEAR=2019
     # libc++1 is available in Astra repos, no need for external Debian repo
     epm install libc++1
-    epm install --repack https://packages.microsoft.com/ubuntu/18.04/mssql-server-2019/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
+    epm install --repack https://packages.microsoft.com/ubuntu/18.04/mssql-server-$MSSQL_YEAR/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
     ;;
   AstraLinuxSE/1.8)
-    epm install https://packages.microsoft.com/debian/12/mssql-server-2019/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
+    # use the 22.04 build: it links liblber-2.5/libldap-2.5 (present in Astra 1.8),
+    # the 20.04 build needs old liblber-2.4/libldap_r-2.4 missing there.
+    # https://bugs.etersoft.ru/show_bug.cgi?id=18917
+    epm install --repack https://packages.microsoft.com/ubuntu/22.04/mssql-server-$MSSQL_YEAR/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
     ;;
   ALTLinux/p10|ALTLinux/c10f2)
-    epm install --repack https://packages.microsoft.com/rhel/8/mssql-server-2019/Packages/m/mssql-server-[0-9]*.x86_64.rpm || fatal
+    epm install --repack https://packages.microsoft.com/rhel/8/mssql-server-$MSSQL_YEAR/Packages/m/mssql-server-[0-9]*.x86_64.rpm || fatal
     ;;
   ALTLinux*)
-    epm install --repack https://packages.microsoft.com/rhel/9/mssql-server-2022/Packages/m/mssql-server-[0-9]*.x86_64.rpm || fatal
+    epm install --repack https://packages.microsoft.com/rhel/$RHEL_VERSION/mssql-server-$MSSQL_YEAR/Packages/m/mssql-server-[0-9]*.x86_64.rpm || fatal
     ;;
   Ubuntu*)
-    epm install https://packages.microsoft.com/$dname/$dversion/mssql-server-2022/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
+    epm install https://packages.microsoft.com/$dname/$dversion/mssql-server-$MSSQL_YEAR/pool/main/m/mssql-server/mssql-server_1*_amd64.deb
     ;;
   *)
     fatal "$(epm print info -d) is not supported yet."

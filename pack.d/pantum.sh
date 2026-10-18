@@ -6,25 +6,33 @@ RETURNTARNAME="$2"
 . $(dirname $0)/common.sh
 
 # epm replaces spaces with - in downloaded files
-if echo "$TAR" | grep -q "Pantum[ -]Ubuntu[ -]Driver[- ]V.*.zip" ; then
-    erc "$TAR" || fatal
+if echo "$TAR" | grep -qi "pantum.*ubuntu.*driver.*\.zip" ; then
+    erc --here "$TAR" || fatal
+elif echo "$TAR" | grep -qi "pantum.*linux.*driver.*\.zip" ; then
+    erc --here "$TAR" || fatal
 elif echo "$TAR" | grep -q "Pantum%20Ubuntu%20Driver%20V.*.zip" ; then
-    erc "$TAR" || fatal
+    erc --here "$TAR" || fatal
+elif echo "$TAR" | grep -q "Pantum%20Linux%20Driver%20V.*.zip" ; then
+    erc --here "$TAR" || fatal
 elif echo "$TAR" | grep -q "linux_pantum.7z" ; then
-    erc "$TAR" || fatal
+    erc --here "$TAR" || fatal
     return_tar linux_pantum.deb
 elif echo "$TAR" | grep -q "pantum.*astra.*_amd64.zip" ; then
-    erc "$TAR" || fatal
+    erc --here "$TAR" || fatal
     return_tar pantum_*_amd64.deb
 # from Astra disk: Pantum_Ubuntu_Driver_V1.1.5.tar.gz
 elif echo "$TAR" | grep -q "Pantum_Ubuntu_Driver_V.*.tar.gz" ; then
-    erc "$TAR" || fatal
+    erc --here "$TAR" || fatal
 else
     fatal "We support only Pantum Ubuntu Driver V.*.zip"
 fi
 
-# drop dirname with spaces
-mv Pantum* PantumDriver || fatal
+# rename driver directory to remove spaces (breaks return_tar paths)
+mv "Pantum "*/"Pantum "*/ PantumDriver 2>/dev/null \
+    || mv Pantum_*/Pantum_*/ PantumDriver 2>/dev/null \
+    || mv "Pantum "*/ PantumDriver 2>/dev/null \
+    || mv Pantum_*/ PantumDriver 2>/dev/null \
+    || fatal "Can't find Pantum driver directory"
 cd PantumDriver/Resources || fatal
 
 case "$(epm print info -a)" in

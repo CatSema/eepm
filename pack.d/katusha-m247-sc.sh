@@ -15,21 +15,21 @@ untar_payload()
 ROOTDIR=$(pwd)
 
 # Linux-драйвер-сканирования-Катюша-M247.zip
-erc unpack $TAR || fatal 
+erc --here unpack $TAR || fatal 
 mv Linux*/Katusha_Scanner_M247_ubuntu64_*.tar.gz .
 rmdir Linux*
 
 # Katusha_Scanner_M247_ubuntu64_V110.tar.gz
-erc unpack Katusha_Scanner_M247_ubuntu64_*.tar.gz || fatal
+erc --here unpack Katusha_Scanner_M247_ubuntu64_*.tar.gz || fatal
 rm Katusha_Scanner_M247_ubuntu64_*.tar.gz
 
-cd * # Katusha_Scanner_M247_ubuntu64_V110
+cd Katusha_Scanner_M247_ubuntu64_*/ || fatal
 
 # needed to extract deb package
 untar_payload LinuxInstaller_x86_64.sh
 
 # sane-1.0-27.x86-64
-cd sane*
+cd "$(ls -d sane*/)" || fatal
 
 # check if sane-1.0-27.x86-64.deb exist
 DEBNAME="$(echo sane*.deb)"
@@ -48,10 +48,10 @@ cd $ROOTDIR
 epm assure patool || fatal
 
 # needed because the control file have issues
-erc unpack $PKGNAME.deb || fatal
+erc --here unpack $PKGNAME.deb || fatal
 # avoid cd to deb
-rm katusha*.deb
-cd katusha*
+rm $PKGNAME.deb
+cd "$(ls -d katusha*/)" || fatal
 
 SANELIB=usr/lib/sane
 if [ "$(epm print info -b)" = "64" ] ; then
@@ -66,11 +66,12 @@ if [ -d usr/lib/x86_64-linux-gnu/sane ] && [ "$SANELIB" != "usr/lib/x86_64-linux
 fi
 rm -r usr/lib/x86_64-linux-gnu
 
-pushd "$SANELIB"
-ln -s libsane-katusham247.so.1.0.27 libsane-katusham247.so
-ln -s libsane-katusham247.so.1.0.27 libsane-katusham247.so.1
-rm libsane-katusham247.la
-popd
+(
+    cd "$SANELIB" || fatal
+    ln -s libsane-katusham247.so.1.0.27 libsane-katusham247.so
+    ln -s libsane-katusham247.so.1.0.27 libsane-katusham247.so.1
+    rm libsane-katusham247.la
+)
 
 mkdir -p etc/sane.d/dll.d
 echo "katusham247" > etc/sane.d/dll.d/katusham247

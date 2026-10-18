@@ -9,9 +9,9 @@ RETURNTARNAME="$2"
 BASENAME=$(basename $TAR .tgz)
 VERSION=$(echo $BASENAME | sed -e 's|^linuxbrowser||' -e 's|-obs.*||')
 
-erc unpack $TAR || fatal
+erc --here unpack $TAR || fatal
 
-cd * || fatal
+cd obs-linuxbrowser || fatal
 
 mkdir -p usr/lib64/obs-plugins/
 mkdir -p usr/share/obs/obs-plugins/obs-linuxbrowser/

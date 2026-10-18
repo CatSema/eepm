@@ -5,11 +5,7 @@ RETURNTARNAME="$2"
 
 . $(dirname $0)/common.sh
 
-erc unpack $TAR || fatal
-
-mkdir -p opt
-mv Phoenix-Firestorm-Releasex64-* $PRODUCT
-mv $PRODUCT opt/
+erc -C opt/$PRODUCT unpack $TAR || fatal
 
 VERSION=$(echo "$TAR" | grep -oP '(?<=Releasex64-)\d+-\d+-\d+-\d+' | tr '-' '.')
 [ -n "$VERSION" ] || fatal "Can't get package version"
@@ -32,5 +28,14 @@ EOF
 PKGNAME=$PRODUCT-$VERSION
 
 erc pack $PKGNAME.tar opt usr || fatal
+
+cat <<EOF >$PKGNAME.tar.eepm.yaml
+name: $PRODUCT
+group: Games/Other
+license: LGPL-2.1
+url: https://www.firestormviewer.org/
+summary: Firestorm Second Life viewer
+description: Firestorm is an alternative viewer for Second Life and OpenSimulator virtual worlds.
+EOF
 
 return_tar $PKGNAME.tar

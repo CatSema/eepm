@@ -1,30 +1,21 @@
 #!/bin/sh -x
-# It will run with two args: buildroot spec
+
+# It will be run with two args: buildroot spec
 BUILDROOT="$1"
-
 SPEC="$2"
-
-PRODUCT=claude-desktop
-PRODUCTDIR=/opt/eepm-wine/$PRODUCT
 
 . $(dirname $0)/common.sh
 
-add_requires '/usr/bin/wine'
+# both native and wine claude-desktop provide /usr/bin/claude-desktop
+add_conflicts claude-desktop-wine
 
-add_bin_link_command $PRODUCT $PRODUCTDIR/run.sh
+move_to_opt /usr/lib/claude-desktop
 
-cat <<EOF | create_file /usr/share/applications/$PRODUCT.desktop
-[Desktop Entry]
-Name=Claude Desktop
-Exec=$PRODUCT %u
-Type=Application
-StartupNotify=true
-Icon=$PRODUCT
-StartupWMClass=claude.exe
-Categories=Wine;Network;InstantMessaging;
-MimeType=x-scheme-handler/claude;
-EOF
+# /usr/bin/claude-desktop is a symlink into the app dir; re-point it at /opt
+# after the move (subst can't rewrite a symlink target)
+rm -f "$BUILDROOT/usr/bin/$PRODUCT"
+add_bin_link_command $PRODUCT "$PRODUCTDIR/$PRODUCT"
 
-# copied from .local/share/icons/hicolor/256x256/apps/84BD_claude.0.png
-i=256
-install_file ipfs://QmbnRtSF3e5dENA6TGKADxpzNXMF5vV1UDaRGrKsQXu4xZ /usr/share/icons/hicolor/${i}x${i}/apps/$PRODUCT.png
+fix_desktop_file /usr/bin/$PRODUCT $PRODUCT
+
+add_electron_deps

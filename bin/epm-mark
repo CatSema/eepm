@@ -76,21 +76,34 @@ __alt_mark_showhold()
     grep -h "RPM::Hold" /etc/apt/apt.conf.d/hold-*.conf 2>/dev/null | sed -e 's|RPM::Hold {"^\(.*\)";};|\1|'
 }
 
+# versionlock is builtin command in dnf5
 __dnf_assure_versionlock()
 {
+    [ "$PMTYPE" = "dnf5-rpm" ] && return
     epm assure /etc/dnf/plugins/versionlock.conf 'dnf-command(versionlock)'
+}
+
+# print package names from versionlock list output
+__dnf_versionlock_names()
+{
+    if [ "$PMTYPE" = "dnf5-rpm" ] ; then
+        sed -n 's|^Package name: ||p'
+        return
+    fi
+    sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short
 }
 
 __dnf_is_supported_versionlock()
 {
+    [ "$PMTYPE" = "dnf5-rpm" ] && return
     [ -f /etc/dnf/plugins/versionlock.conf ]
 }
 
 epm_mark_hold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
 # TODO: use apt-mark if exists
 # https://bugzilla.altlinux.org/show_bug.cgi?id=34036#c54
         __alt_mark_hold "$@"
@@ -109,7 +122,7 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         __dnf_assure_versionlock
-        sudocmd dnf versionlock add "$@"
+        sudocmd $DNFCMD versionlock add "$@"
         ;;
     zypper-rpm)
         sudocmd zypper al "$@"
@@ -131,8 +144,8 @@ esac
 epm_mark_unhold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         __alt_mark_unhold "$@"
         exit
         ;;
@@ -149,7 +162,7 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         __dnf_assure_versionlock
-        sudocmd dnf versionlock delete "$@"
+        sudocmd $DNFCMD versionlock delete "$@"
         ;;
     zypper-rpm)
         sudocmd zypper rl "$@"
@@ -171,8 +184,8 @@ esac
 epm_mark_showhold()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         __alt_mark_showhold "$@"
         exit
         ;;
@@ -188,9 +201,9 @@ case $PMTYPE in
         __dnf_assure_versionlock
         if [ -n "$short" ] ; then
             load_helper epm-query
-            docmd dnf versionlock list "$@" | sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short
+            docmd $DNFCMD versionlock list "$@" | __dnf_versionlock_names
         else
-            docmd dnf versionlock list "$@"
+            docmd $DNFCMD versionlock list "$@"
         fi
         ;;
     zypper-rpm)
@@ -218,7 +231,7 @@ case $PMTYPE in
         __dnf_is_supported_versionlock || return 1
         __dnf_assure_versionlock
         load_helper epm-query
-        docmd dnf versionlock list | grep "^$1" | sed -e 's|\.\*$||' | grep -v " " | filter_pkgnames_to_short | grep -q "^$1$"
+        docmd $DNFCMD versionlock list | __dnf_versionlock_names | grep -q "^$1$"
         return
         ;;
 esac
@@ -236,8 +249,8 @@ resolved="$(__epm_mark_resolve "$@")" || return 1
 [ -n "$resolved" ] || return 1
 set -- $resolved
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark auto "$@"
         exit
         ;;
@@ -248,10 +261,10 @@ case $PMTYPE in
         sudocmd apt-mark auto "$@"
         ;;
     dnf-rpm)
-        sudocmd dnf mark remove "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark remove "$@"
         ;;
     dnf5-rpm)
-        sudocmd dnf mark dependency "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark dependency "$@"
         ;;
     pacman)
             sudocmd pacman -D --asdeps "$@"
@@ -275,8 +288,8 @@ resolved="$(__epm_mark_resolve "$@")" || return 1
 [ -n "$resolved" ] || return 1
 set -- $resolved
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark manual "$@"
         exit
         ;;
@@ -287,10 +300,10 @@ case $PMTYPE in
         sudocmd apt-mark manual "$@"
         ;;
     dnf-rpm)
-        sudocmd dnf mark install "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark install "$@"
         ;;
     dnf5-rpm)
-        sudocmd dnf mark user "$@"
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark user "$@"
         ;;
     pacman)
             sudocmd pacman -D --asexplicit "$@"
@@ -306,11 +319,58 @@ esac
 }
 
 
+# mark as weak dependency (installed as a recommended package)
+epm_mark_weak()
+{
+
+local resolved
+resolved="$(__epm_mark_resolve "$@")" || return 1
+[ -n "$resolved" ] || return 1
+set -- $resolved
+
+case $PMTYPE in
+    dnf5-rpm)
+        sudocmd $DNFCMD $(subst_option non_interactive -y) mark weak "$@"
+        ;;
+    *)
+        # apt considers weak dependency as automatically installed
+        info 'There is no weak dependency mark for $PMTYPE, mark as automatically installed'
+        epm_mark_auto "$@"
+        ;;
+esac
+
+}
+
+# print installed packages with the given dnf reason(s)
+__epm_dnf_installed_by_reason()
+{
+    a='' LC_ALL=C $DNFCMD -q repoquery --installed --qf '%{name}|%{reason}\n' 2>/dev/null | \
+        awk -F'|' -v reasons="$*" 'BEGIN { n = split(reasons, r, ",") } { for (i = 1; i <= n; i++) if ($2 == r[i]) print $1 }' | sort -u
+}
+
+epm_mark_showweak()
+{
+
+case $PMTYPE in
+    dnf-rpm|dnf5-rpm)
+        __epm_dnf_installed_by_reason "Weak Dependency"
+        ;;
+    apt-rpm|apm-rpm)
+        # dnf5 on ALT writes 2 to AUTOINSTALLED rpm tag for weak dependencies
+        a='' rpm -qa --qf '%{NAME} %{AUTOINSTALLED}\n' 2>/dev/null | awk '$2 == 2 { print $1 }' | sort -u
+        ;;
+    *)
+        fatal 'Have no suitable command for $PMTYPE in epm_mark_showweak()'
+        ;;
+esac
+
+}
+
 epm_mark_showauto()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark showauto "$@"
         exit
         ;;
@@ -321,7 +381,8 @@ case $PMTYPE in
         sudocmd apt-mark showauto "$@"
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf repoquery --unneeded
+        # apt considers weak dependency as automatically installed too
+        __epm_dnf_installed_by_reason "Dependency,Weak Dependency"
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_mark_showauto()'
@@ -333,8 +394,8 @@ esac
 epm_mark_showmanual()
 {
 
-case $BASEDISTRNAME in
-    "alt")
+case "$BASEDISTRNAME:$PMTYPE" in
+    "alt:apt-rpm"|"alt:apm-rpm")
         sudocmd apt-mark showmanual "$@"
         exit
         ;;
@@ -345,7 +406,7 @@ case $PMTYPE in
         sudocmd apt-mark showmanual "$@"
         ;;
     dnf-rpm|dnf5-rpm)
-        sudocmd dnf repoquery --userinstalled
+        docmd $DNFCMD -q repoquery --qf '%{name}\n' --userinstalled
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_mark_showmanual'
@@ -431,6 +492,12 @@ epm_mark()
         ;;
     manual|install)                   # HELPCMD: mark the given package(s) as manually installed
         epm_mark_manual "$@"
+        ;;
+    weak)                             # HELPCMD: mark the given package(s) as weak dependency (auto for apt)
+        epm_mark_weak "$@"
+        ;;
+    showweak)                         # HELPCMD: print the list of packages installed as weak dependency
+        epm_mark_showweak "$@"
         ;;
     showauto)                         # HELPCMD: print the list of automatically installed packages
         epm_mark_showauto "$@"

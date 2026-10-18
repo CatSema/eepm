@@ -1,0 +1,4 @@
+# component | changed paths (comma-separated)             | systems (comma-separated)
+play   | play.d/, pack.d/, repack.d/                | debian:bookworm, alt:p11, fedora:43
+smoke  | bin/, etc/, tests/                          | alt:p11
+ci     | .github/ci/, .github/workflows/pr-test.yml  | ubuntu:24.04

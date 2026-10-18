@@ -19,13 +19,17 @@
 
 
 # fills repacked_pkg
+# args: pkg [orig_deb_depends] [orig_pkg_type]
+__need_skip_dh_strip_nondeterminism()
+{
+    [ -f "$(dirname "$1")/.eepm_skip_deb_dh_strip_nondeterminism" ]
+}
+
 __epm_repack_to_deb()
 {
     local pkg="$1"
-
-    assure_exists alien
-    assure_exists fakeroot
-    assure_exists rpm
+    local orig_deb_depends="$2"
+    local orig_pkg_type="$3"
 
     repacked_pkg=''
 
@@ -34,6 +38,11 @@ __epm_repack_to_deb()
     remove_on_exit $TDIR
 
     umask 022
+
+    # alien uses $EMAIL for Maintainer email (not DEBEMAIL)
+    # and always takes the name from system GECOS (can't override without patching alien)
+    # TODO: fix Maintainer name in the generated deb (replace GECOS with "EPM")
+    export EMAIL="support@eepm.ru"
 
     if echo "$pkg" | grep -q "\.deb" ; then
         warning "Repack deb to deb is not supported yet."
@@ -49,17 +58,53 @@ __epm_repack_to_deb()
         cd $TDIR || fatal
         __prepare_source_package "$(pwd)/$alpkg"
 
-        showcmd_store_output fakeroot alien -d -k $verbose $scripts "$alpkg"
-        local DEBCONVERTED=$(grep "deb generated" $RC_STDOUT | sed -e "s| generated||g")
+        # generate debian/ dir without building
+        __run_alien "$alpkg" --single -k $scripts
+
+        # find the generated source directory (must contain debian/)
+        local debsrcdir
+        debsrcdir="$(ls -1d */debian 2>/dev/null | sed 's|/debian$||' | head -n1)"
+        [ -n "$debsrcdir" ] && debsrcdir="$debsrcdir/"
+        if [ -z "$debsrcdir" ] ; then
+            warning 'Can'\''t find alien generated directory for $pkg'
+            cd - >/dev/null
+            return 1
+        fi
+
+        # Some repack scripts need to keep bundled archives byte-identical.
+        # The opt-in marker is written by skip_deb_dh_strip_nondeterminism().
+        if __need_skip_dh_strip_nondeterminism "$abspkg" ; then
+            cat >>"$debsrcdir"debian/rules <<'EOF'
+
+override_dh_strip_nondeterminism:
+	@echo "Skipping dh_strip_nondeterminism for this repack"
+EOF
+        fi
+
+        # inject original depends into debian/control
+        if [ -n "$orig_deb_depends" ] ; then
+            info "Injecting Depends: $orig_deb_depends"
+            if [ "$orig_pkg_type" = "rpm" ] ; then
+                # RPM source: add non-lib requires alongside shlibs
+                sed -i -e "s|\${shlibs:Depends}|\${shlibs:Depends}, $orig_deb_depends|" "$debsrcdir"debian/control
+            else
+                # DEB source: replace shlibs placeholder with original depends
+                sed -i -e "s|\${shlibs:Depends}|$orig_deb_depends|" "$debsrcdir"debian/control
+            fi
+        fi
+
+        # build the deb
+        ( cd "$debsrcdir" && a= fakeroot debian/rules binary )
+
+        local DEBCONVERTED
+        DEBCONVERTED="$(ls -1 *.deb 2>/dev/null | head -n1)"
         if [ -n "$DEBCONVERTED" ] ; then
             repacked_pkg="$repacked_pkg $(realpath $DEBCONVERTED)"
             remove_on_exit "$(realpath $DEBCONVERTED)"
         else
             warning 'Can'\''t find converted deb for source binary package $pkg'
         fi
-        clean_store_output
         cd - >/dev/null
 
     return 0
 }
-

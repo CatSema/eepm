@@ -126,7 +126,7 @@ epm_status_supported() {
     local distro
     distro=$(epm print info -s)
     case "$distro" in
-        alt|redos|rosa*|mos|fedora|debian|ubuntu)
+        alt|redos|rosa*|mos|astra|fedora|debian|ubuntu)
             return 0
             ;;
         *)
@@ -141,6 +141,36 @@ epm_status_validate()
     local pkg="$1"
     local version="$(epm print field Version for "$pkg" 2>/dev/null)"
     [ -n "$version" ]
+}
+
+__epm_status_have_sign()
+{
+    local pkg="$1"
+    local sig="$(epm print field sigpgp for "$pkg" 2>/dev/null)"
+    [ "$sig" != "(none)" ] && return 0
+    # check DSA signature (old packages signed with DSA key)
+    sig="$(epm print field siggpg for "$pkg" 2>/dev/null)"
+    [ "$sig" != "(none)" ]
+}
+
+epm_status_signed()
+{
+    local pkg="$1"
+    case $DISTRNAME in
+        ALTLinux)
+            # use alt-rpmkeys-checksig for cryptographic signature verification
+            assure_exists alt-rpmkeys-checksig alt-rpmkeys-utils || return 1
+            if [ -n "$quiet" ] ; then
+                alt-rpmkeys-checksig "$pkg" >/dev/null 2>&1
+            else
+                docmd alt-rpmkeys-checksig "$pkg"
+            fi
+            ;;
+        *)
+            # TODO: implement for other distros
+            return 1
+            ;;
+    esac
 }
 
 epm_status_original()
@@ -221,6 +251,18 @@ epm_status_original()
             echo "$release" | grep -qi "debian" || return 1
             return 0
             ;;
+        AstraLinux*)
+            epm_status_validate $pkg || return 1
+            epm_status_repacked $pkg && return 1
+
+            local maintainer="$(epm print field Maintainer for "$pkg" 2>/dev/null)"
+            echo "$release" | grep -qi "astra" && return 0
+            echo "$maintainer" | grep -q "astralinux" && return 0
+            echo "$maintainer" | grep -q "rusbitech" && return 0
+            echo "$maintainer" | grep -q "Debian" && return 0
+            echo "$maintainer" | grep -q "@debian.org" && return 0
+            return 1
+            ;;
         *)
             warning 'Status checking is not supported yet for $DISTRNAME'
             return 1
@@ -234,7 +276,7 @@ epm_status_repacked()
     local pkg="$1"
 
     # dpkg package missing packager field
-    local repacked="$(epm print field Description for "$1" 2>/dev/null | grep -i "alien")"
+    local repacked="$(epm print field Description for "$1" 2>/dev/null | grep -i "with EPM")"
     local packager="$(epm print field Packager for "$1" 2>/dev/null)"
 
     #is_installed $pkg || fatal "FIXME: implemented for installed packages as for now"
@@ -315,6 +357,18 @@ epm_status_thirdparty()
             epm_status_repacked $pkg && return 1
             return 0
             ;;
+        astra)
+            epm_status_validate $pkg || return 1
+
+            local release="$(epm print release from package "$pkg" 2>/dev/null)"
+            echo "$release" | grep -qi "astra" && return 1
+            echo "$maintainer" | grep -q "Debian" && return 1
+            echo "$maintainer" | grep -q "@debian.org" && return 1
+            echo "$maintainer" | grep -q "astralinux" && return 1
+            echo "$maintainer" | grep -q "rusbitech" && return 1
+            epm_status_repacked $pkg && return 1
+            return 0
+            ;;
         *)
             fatal "Unsupported $BASEDISTRNAME"
             ;;
@@ -373,7 +427,7 @@ epm_status()
             epm_status_repacked "$@"
             return
             ;;
-        --validate)           # HELPOPT: check if package is accessible (we can get fields from it)
+        --valid)              # HELPOPT: check if package is accessible (we can get fields from it)
             epm_status_validate "$@"
             return
             ;;

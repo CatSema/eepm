@@ -43,13 +43,13 @@ __epm_addrepo_rhel()
         powertools)
             # https://serverfault.com/questions/997896/how-to-enable-powertools-repository-in-centos-8
             assure_exists dnf-plugins-core
-            sudocmd dnf config-manager --set-enabled powertools
+            sudocmd $DNFCMD config-manager --set-enabled powertools
             return 1
             ;;
         crb)
             # https://wiki.rockylinux.org/rocky/repo/
             assure_exists dnf-plugins-core
-            sudocmd dnf config-manager --set-enabled crb
+            sudocmd $DNFCMD config-manager --set-enabled crb
             return 1
             ;;
     esac
@@ -128,22 +128,26 @@ __epm_addrepo_main_alt_repo()
 
 
 # 'rpm protocol:/path/to/repo component'
+# args: rpm <url/arch> <component> [sign]
 __epm_addrepo_altlinux_short()
 {
     [ "$1" = "rpm" ] || fatal "only for rpm repo"
     local url="$2"
     local repo="$3"
+    local sign="$4"
     local arch
 
     arch="$(basename "$url")"
     url="$(dirname "$url")"
-    docmd epm repo add "rpm $url $arch $repo"
+    docmd epm repo add "rpm ${sign:+$sign }$url $arch $repo"
 }
 
 
+# args: <url> [sign]
 __epm_addrepo_altlinux_url()
 {
     local url="$1"
+    local sign="$2"
     local arch
     local base
     local repo
@@ -156,7 +160,7 @@ __epm_addrepo_altlinux_url()
     if echo "$base" | grep -q "^RPMS\." ; then
         repo="$(echo $base | sed -e 's|.*\.||')"
         url="$(dirname $url)"
-        __epm_addrepo_altlinux_short rpm "$url" "$repo"
+        __epm_addrepo_altlinux_short rpm "$url" "$repo" "$sign"
         return
     fi
 
@@ -166,7 +170,7 @@ __epm_addrepo_altlinux_url()
     base="$(basename "$baseurl")"
     if echo "$base" | grep -q "^RPMS\." ; then
         REPO_NAME="$(echo "$base" | sed -e 's|.*\.||')"
-        __epm_addrepo_altlinux_short rpm "$url" "$REPO_NAME"
+        __epm_addrepo_altlinux_short rpm "$url" "$REPO_NAME" "$sign"
         return
     fi
 
@@ -176,7 +180,7 @@ __epm_addrepo_altlinux_url()
     arch=$DISTRARCH
     REPO_NAME="classic"
     if eget --check-url $url/$arch/base/pkglist.$REPO_NAME ; then
-        docmd epm repo add "rpm $url $arch $REPO_NAME"
+        docmd epm repo add "rpm ${sign:+$sign }$url $arch $REPO_NAME"
         return
     fi
 
@@ -188,7 +192,7 @@ __epm_addrepo_altlinux_url()
         [ -n "$rd" ] || continue
         local REPO_NAME="$(echo "$rd" | sed -e 's|/*$||' -e 's|.*\.||')"
         [ "$REPO_NAME" = "*" ] && continue
-        docmd epm repo add "rpm $url $arch $REPO_NAME"
+        docmd epm repo add "rpm ${sign:+$sign }$url $arch $REPO_NAME"
         res='1'
     done
     [ -n "$res" ] || warning "There is no arch repos in $url"
@@ -218,8 +222,9 @@ epm repo add - add branch repo. Use follow params:
 
 Examples:
     # epm repo add yandex
-    # epm repo add "rpm http://somesite/pub/product x86_64 addon
+    # epm repo add "rpm http://somesite/pub/product x86_64 addon"
     # epm repo add /var/ftp/pub/altlinux/p10
+    # epm repo add --name myrepo "rpm https://example.com x86_64 main"
 
 '
     return
@@ -231,9 +236,13 @@ __add_line_to_file()
     local line="$2"
     local sc="sudocmd"
     [ -n "$verbose" ] || sc="sudorun"
-    set_sudo
+    if [ -w "$file" ] || [ ! -e "$file" ] && [ -w "$(dirname "$file")" ] ; then
+        sc="command"
+    else
+        set_sudo
+    fi
     # ensure file ends with newline (check last byte)
-    [ -n "$(tail -c1 "$file")" ] && echo "" | $sc tee -a "$file" >/dev/null
+    [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ] && echo "" | $sc tee -a "$file" >/dev/null
     echo "$line" | $sc tee -a "$file" >/dev/null
 }
 
@@ -247,10 +256,8 @@ __epm_addrepo_to_file()
     shift
     local repo="$*"
 
-    if [ -z "$force" ] ; then
-        # skip if repo is already in the list
-        epm --quiet repo list "$repo" >/dev/null && return
-    fi
+    # always skip if repo is already in the list (even with --force)
+    epm --quiet repo list "$repo" >/dev/null && return
 
     if [ -n "$dryrun" ] ; then
         echo "$repo"
@@ -264,6 +271,370 @@ __epm_addrepo_to_file()
 
     __add_line_to_file "$file" "$repo"
 
+}
+
+# rpm-md metadata on Etersoft mirror is signed by its own key (repomd.xml.asc)
+__epm_addrepo_alt_dnf_mirror_key()
+{
+    [ -s "$ALT_DNF_MIRROR_KEYFILE" ] && return
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    eget -q -O- "$ALT_DNF_MIRROR_KEYURL" >$tmpfile && [ -s $tmpfile ] || fatal 'Can'\''t download $ALT_DNF_MIRROR_KEYURL'
+    assure_exists gpg gnupg2
+    a='' gpg --with-colons --with-fingerprint $tmpfile 2>/dev/null | grep -q "^fpr:.*:$ALT_DNF_MIRROR_KEYFPR:" || fatal 'Wrong key in $ALT_DNF_MIRROR_KEYURL (expected fingerprint $ALT_DNF_MIRROR_KEYFPR)'
+    chmod 644 $tmpfile
+    sudocmd mkdir -p "$(dirname "$ALT_DNF_MIRROR_KEYFILE")"
+    sudocmd cp $tmpfile "$ALT_DNF_MIRROR_KEYFILE"
+}
+
+# copy repo file to /etc/yum.repos.d (just print it with --dry-run)
+# args: <tmpfile> <target>
+__epm_addrepo_dnf_install_file()
+{
+    local tmpfile="$1"
+    local target="$2"
+
+    if [ -n "$dryrun" ] ; then
+        echo "# $target"
+        cat $tmpfile
+        return 1
+    fi
+
+    # warn about the same repo ids in other files
+    local id f
+    for id in $(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' $tmpfile) ; do
+        for f in /etc/yum.repos.d/*.repo ; do
+            [ "$f" = "$target" ] && continue
+            grep -q "^\[$id\]" "$f" 2>/dev/null && warning 'Repo id $id is already used in $f'
+        done
+    done
+
+    chmod 644 $tmpfile
+    sudocmd mkdir -p /etc/yum.repos.d
+    sudocmd cp $tmpfile $target
+}
+
+# create /etc/yum.repos.d/<name>.repo with baseurl for dnf
+# args: <name> <url> <gpgcheck>
+__epm_addrepo_dnf_baseurl()
+{
+    local name="$1"
+    local url="$2"
+    local gpgcheck="$3"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    cat >$tmpfile <<EOF
+[$name]
+name=$name
+baseurl=$url
+enabled=1
+gpgcheck=$gpgcheck
+EOF
+    local target=/etc/yum.repos.d/$name.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    if ! sudocmd $DNFCMD makecache --repo=$name ; then
+        sudocmd rm -f $target
+        fatal 'There is no rpm-md metadata for dnf in $url'
+    fi
+}
+
+# create /etc/yum.repos.d/<name>.repo with APT-RPM repos (type=apt-rpm) for dnf on ALT
+# args: <file name> <title> <vendor> <"id-suffix baseurl component" lines> [gpg key file]
+__epm_addrepo_dnf_aptrpm_file()
+{
+    local name="$1"
+    local title="$2"
+    local vendor="$3"
+    local entries="$4"
+    local keyfile="$5"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    local suffix baseurl comp
+    while read -r suffix baseurl comp ; do
+        [ -n "$comp" ] || continue
+        cat >>$tmpfile <<EOF
+[$name-$suffix]
+name=$title $suffix
+type=apt-rpm
+baseurl=$baseurl
+apt_component=$comp
+${vendor:+apt_vendor=$vendor
+}${keyfile:+gpgkey=file://$keyfile
+}enabled=1
+
+EOF
+    done <<EOF
+$entries
+EOF
+    [ -s $tmpfile ] || fatal 'There are no APT-RPM repos for $name'
+    local repoids
+    repoids="$(sed -n 's|^\[\(.*\)\][[:space:]]*$|\1|p' $tmpfile | tr '\n' ',' | sed -e 's|,$||')"
+
+    local target=/etc/yum.repos.d/$name.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    [ -n "$keyfile" ] && __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+
+    # check APT-RPM indexes (base/release is checked by the vendor keys)
+    if ! sudocmd $DNFCMD makecache -y --repo=$repoids ; then
+        sudocmd rm -f $target
+        fatal 'Can'\''t get APT-RPM indexes for $name'
+    fi
+
+    # dnf5 on ALT does not import gpgkey from repo file itself
+    [ -n "$keyfile" ] && { sudocmd rpm --import "$keyfile" || fatal ; }
+    return 0
+}
+
+# print "arch baseurl component" entries for APT-RPM repo with arch subdirs (f.i. task repo)
+# args: <url>
+__epm_addrepo_dnf_aptrpm_url_entries()
+{
+    local url="$1"
+    local arch comp
+    __alt_dnf_aptrpm_probe_url "$url" | while read -r arch comp ; do
+        echo "$arch $url/$arch $comp"
+    done
+}
+
+# add sources.list line "rpm [vendor] URL DIST component..." as APT-RPM repos for dnf on ALT
+# args: the line (as one or several args)
+__epm_addrepo_dnf_aptrpm_line()
+{
+    # shellcheck disable=SC2048,SC2086
+    set -- $*
+    [ "$1" = "rpm" ] || fatal 'Only rpm lines are supported for $PMTYPE on ALT: $*'
+    shift
+    local vendor=''
+    case "$1" in
+        \[*\])
+            vendor="$(echo "$1" | tr -d '[]')"
+            shift
+            ;;
+    esac
+    local url="$1"
+    local dist="$2"
+    [ -n "$url" ] && [ -n "$dist" ] && [ -n "$3" ] || fatal 'Wrong repo line, use: rpm [vendor] URL DIST component'
+    shift 2
+    local name comp entries=''
+    name="$(echo "$url/$dist" | sed -e 's|^[a-z]*:/*||' -e 's|/*$||' -e 's|[^A-Za-z0-9._-]|_|g')"
+    for comp in "$@" ; do
+        entries="$entries$comp $url/$dist $comp
+"
+    done
+    __epm_addrepo_dnf_aptrpm_file "$name" "$url $dist" "$vendor" "$entries"
+}
+
+# add task repo (APT-RPM) for dnf on ALT
+# args: <task number>
+__epm_addrepo_dnf_aptrpm_task()
+{
+    local tn="$1"
+    local url archcomps
+    url="$(eget --get-real-url "https://git.altlinux.org/tasks/$tn/build/repo")" || fatal 'Can'\''t access task $tn repo'
+    url="${url%/}"
+    archcomps="$(__epm_addrepo_dnf_aptrpm_url_entries "$url")"
+    [ -n "$archcomps" ] || fatal 'There are no arch repos in $url'
+    __epm_addrepo_dnf_aptrpm_file "task-$tn" "ALT task $tn" "$(get_task_sign "$tn" | tr -d '[]')" "$archcomps"
+}
+
+__epm_addrepo_altlinux_dnf_help()
+{
+    message '
+epm repo add - add repo for $PMTYPE on ALT (to /etc/yum.repos.d).
+The type of the added repos is apt-rpm if there are APT-RPM repos (type=apt-rpm) in /etc/yum.repos.d, rpm-md otherwise.
+Supported:
+    sisyphus, p11, ...       - ALT branch (rpm-md metadata from download.etersoft.ru, APT-RPM from any mirror)
+    alt, basealt, etersoft   - current ALT branch
+    deferred                 - Etersoft Sisyphus Deferred repo
+    deferred.org             - Etersoft Sisyphus Deferred repo (at mirror.eterfund.org)
+    deferred-devel           - Etersoft Sisyphus Deferred DEVEL repo
+    deferred-beta            - Etersoft Sisyphus Deferred BETA repo
+    URL/file.repo            - repo file
+    URL or /path/to/repo     - rpm-md repo (f.i. created with epm repo index), or APT-RPM repo URL
+    <task number>            - ALT task repo (APT-RPM only)
+    rpm [vendor] URL DIST component... - sources.list line (APT-RPM only)
+'
+}
+
+# add repo for dnf on ALT
+__epm_addrepo_altlinux_dnf()
+{
+    if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--list" ] || [ "$1" = "--help" ] ; then
+        __epm_addrepo_altlinux_dnf_help
+        return
+    fi
+
+    local repo="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
+    case "$repo" in
+        sisyphus|p[0-9]*|c[0-9]*|deferred|deferred.org|deferred-devel|deferred-beta)
+            __epm_addrepo_alt_dnf "$repo"
+            return
+            ;;
+        alt|basealt|etersoft)
+            __epm_addrepo_alt_dnf "$(echo "$DISTRVERSION" | tr "[:upper:]" "[:lower:]")"
+            return
+            ;;
+    esac
+
+    # sources.list line: rpm [vendor] URL DIST component
+    if [ "$1" = "rpm" ] || startwith "$1" "rpm " ; then
+        __alt_dnf_uses_aptrpm_repos || fatal 'Repo line $* is supported for $PMTYPE on ALT only with APT-RPM repos (type=apt-rpm in /etc/yum.repos.d)'
+        __epm_addrepo_dnf_aptrpm_line "$@"
+        return
+    fi
+
+    if is_taskarg "$@" ; then
+        __alt_dnf_uses_aptrpm_repos || fatal 'Task repos are supported for $PMTYPE on ALT only with APT-RPM repos (type=apt-rpm in /etc/yum.repos.d)'
+        local arg
+        for arg in "$@" ; do
+            is_taskarg "$arg" || continue
+            __epm_addrepo_dnf_aptrpm_task "$(get_tasknumber_from_arg "$arg")"
+        done
+        return
+    fi
+
+    local name
+    case "$1" in
+        *.repo)
+            local tmpfile
+            tmpfile=$(mktemp) || fatal
+            remove_on_exit $tmpfile
+            if is_url "$1" ; then
+                local url="$1"
+                eget -q -O $tmpfile "$url" || fatal 'Can'\''t download $url'
+            else
+                cp "$1" $tmpfile || fatal
+            fi
+            __epm_addrepo_dnf_install_file $tmpfile /etc/yum.repos.d/$(basename "$1") || return 0
+            return
+            ;;
+    esac
+
+    if [ -d "$1" ] ; then
+        local dir="$(realpath "$1")"
+        name="local-$(basename "$dir")"
+        __epm_addrepo_dnf_baseurl "$name" "file://$dir" 0
+        return
+    fi
+
+    if is_url "$1" ; then
+        name="$(echo "$1" | sed -e 's|^[a-z]*://||' -e 's|/*$||' -e 's|[^A-Za-z0-9._-]|_|g')"
+        # URL with APT-RPM repos ({noarch,x86_64,...}/RPMS.component)
+        if __alt_dnf_uses_aptrpm_repos ; then
+            local archcomps
+            archcomps="$(__epm_addrepo_dnf_aptrpm_url_entries "$1")"
+            if [ -n "$archcomps" ] ; then
+                __epm_addrepo_dnf_aptrpm_file "$name" "$name" "" "$archcomps"
+                return
+            fi
+        fi
+        __epm_addrepo_dnf_baseurl "$name" "$1" 1
+        return
+    fi
+
+    name="$1"
+    fatal 'Repo $name is not supported for $PMTYPE on ALT. Use # epm repo add --help'
+}
+
+# create /etc/yum.repos.d/alt-<name>.repo for dnf on ALT
+# args: <name> <title> <baseurl> [keyname]
+__epm_addrepo_alt_dnf_repo()
+{
+    local repo="$1"
+    local name="$2"
+    local baseurl="$3"
+    local keyfile="/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-${4:-$repo}"
+
+    local tmpfile
+    tmpfile=$(mktemp) || fatal
+    remove_on_exit $tmpfile
+    # repomd.xml is signed only on Etersoft mirror
+    local repo_gpgcheck=0 mirror_key=''
+    case "$baseurl" in
+        $ALT_DNF_MIRROR/*)
+            repo_gpgcheck=1
+            mirror_key=" file://$ALT_DNF_MIRROR_KEYFILE"
+            ;;
+    esac
+    local i repoids=''
+    for i in $(__alt_dnf_archlist) ; do
+        repoids="$repoids${repoids:+,}$repo-$i"
+        cat >>$tmpfile <<EOF
+[$repo-$i]
+name=$name $i
+baseurl=$baseurl/$i
+enabled=1
+gpgcheck=1
+repo_gpgcheck=$repo_gpgcheck
+gpgkey=file://$keyfile$mirror_key
+
+EOF
+    done
+    local target=/etc/yum.repos.d/alt-$repo.repo
+    __epm_addrepo_dnf_install_file $tmpfile $target || return 0
+
+    __epm_addrepo_alt_dnf_gpgkey "$keyfile"
+    [ "$repo_gpgcheck" = "1" ] && __epm_addrepo_alt_dnf_mirror_key
+
+    # check rpm-md metadata via dnf itself (it is generated only on download.etersoft.ru mirror)
+    # -y: import the keys (the mirror key fingerprint is checked above)
+    if ! sudocmd $DNFCMD makecache -y --repo=$repoids ; then
+        sudocmd rm -f $target
+        fatal 'There is no rpm-md metadata for dnf in $baseurl'
+    fi
+
+    # dnf5 on ALT does not import gpgkey from repo file itself
+    sudocmd rpm --import "$keyfile" || fatal
+}
+
+# args: sisyphus|p11|...|deferred|deferred-devel|deferred-beta|deferred.org
+__epm_addrepo_alt_dnf()
+{
+    local repo="$1"
+    local baseurl aptrpm=''
+    __alt_dnf_uses_aptrpm_repos && aptrpm=1
+    if [ -n "$aptrpm" ] ; then
+        baseurl="$(__alt_dnf_aptrpm_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    else
+        baseurl="$(__alt_dnf_baseurl "$repo")" || fatal 'Unsupported ALT repo $repo for $PMTYPE'
+    fi
+
+    local name
+    local keyname="sisyphus"
+    case "$repo" in
+        sisyphus)
+            name="ALT Sisyphus"
+            ;;
+        deferred*)
+            [ "$DISTRVERSION" = "Sisyphus" ] || fatal "Etersoft Sisyphus Deferred supported only for ALT Sisyphus based systems."
+            [ "$repo" = "deferred.org" ] && repo="deferred"
+            name="Etersoft Sisyphus $(echo "$repo" | sed -e 's|^deferred|Deferred|' -e 's|-devel$| DEVEL|' -e 's|-beta$| BETA|')"
+            ;;
+        *)
+            name="ALT $repo"
+            keyname="$repo"
+            ;;
+    esac
+
+    if [ -n "$aptrpm" ] ; then
+        local arch archcomps=''
+        for arch in $(__alt_dnf_archlist) ; do
+            archcomps="$archcomps$arch $baseurl/$arch classic
+"
+        done
+        # the vendor key of a branch does not sign old packages: check them by all ALT keys
+        __epm_addrepo_dnf_aptrpm_file "alt-$repo" "$name" "$(__alt_dnf_aptrpm_vendor "$repo")" "$archcomps" "/etc/pki/rpm-gpg/RPM-GPG-KEY-alt-$keyname"
+        return
+    fi
+
+    __epm_addrepo_alt_dnf_repo "$repo" "$name" "$baseurl" "$keyname"
 }
 
 __epm_addrepo_altlinux()
@@ -350,8 +721,7 @@ __epm_addrepo_altlinux()
             return 0
             ;;
         deferred)
-            [ "$DISTRVERSION" = "Sisyphus" ] || fatal "Etersoft Sisyphus Deferred supported only for ALT Sisyphus based systems."
-            __epm_addrepo_add_alt_repo "$branch" "https://download.etersoft.ru/pub Etersoft/Sisyphus/Deferred" "classic"
+            __epm_addrepo_add_alt_repo "sisyphus" "https://download.etersoft.ru/pub Etersoft/Sisyphus/Deferred" "classic"
             return 0
             ;;
         deferred.org)
@@ -386,12 +756,12 @@ __epm_addrepo_altlinux()
             ;;
     esac
 
-    if is_taskarg $repo ; then
+    if is_taskarg "$@" ; then
         local arg tn
-        for arg in $repo ; do
+        for arg in "$@" ; do
             is_taskarg "$arg" || continue
             tn=$(get_tasknumber_from_arg "$arg")
-            epm repo add "https://git.altlinux.org/tasks/$tn/build/repo"
+            __epm_addrepo_altlinux_url "https://git.altlinux.org/tasks/$tn/build/repo" "$(get_task_sign "$tn")"
         done
         return
     fi
@@ -442,6 +812,16 @@ __epm_addrepo_astra()
     fi
 
     local reponame="$(epm print info --repo-name)"
+
+    # allow version shortcuts: epm repo set 1.7 / epm repo set 1.8
+    case "$distrname" in
+        1.7|1.8)
+            reponame="${distrname}_x86-64"
+            distrname="astra"
+            ;;
+        astra)
+            ;;
+    esac
 
     # keywords
     # https://wiki.astralinux.ru/pages/viewpage.action?pageId=3276859
@@ -548,9 +928,125 @@ __epm_addrepo_deb()
 
 }
 
+epm_addrepo_help()
+{
+    message 'epm addrepo - add package repository
+Usage: epm addrepo [options] <repo>
+
+Options:'
+    get_help HELPOPT $SHAREDIR/epm-addrepo
+    message '
+Examples:
+  epm repo add yandex
+  epm repo add "rpm http://somesite/pub/product x86_64 addon"
+  epm repo add --name akvis "rpm https://akvis-alt.sfo2.cdn.digitaloceanspaces.com x86_64 akvis"
+  epm repo add --disabled --name angie "rpm [angie] https://download.angie.software/angie/altlinux/11/ x86_64 main"
+
+With --name, the repo is stored in sources.list.d/<name>.list.
+With --disabled, the repo line is commented out.
+Use repo/package install syntax to install from named repos:
+  epm install akvis/alivecolors
+  epm install angie/angie
+'
+}
+
+# Extract repo name from repo string for use as filename
+# Priority: --name parameter, [name] in repo string, last component
+__get_repo_filename()
+{
+    local repo="$*"
+
+    # Try to extract [name] from repo string: "rpm [name] URL arch comp"
+    local bracket_name="$(echo "$repo" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')"
+    if [ -n "$bracket_name" ] ; then
+        echo "$bracket_name"
+        return
+    fi
+
+    # Use last component: "rpm URL arch component" -> "component"
+    local last="$(echo "$repo" | sed -e 's/[[:space:]]*$//' | awk '{print $NF}')"
+    # For deb repos: "deb URL suite component" -> last word
+    if [ -n "$last" ] && [ "$last" != "rpm" ] && [ "$last" != "deb" ] ; then
+        echo "$last"
+        return
+    fi
+
+    # Fallback: extract domain from URL
+    echo "$repo" | grep -o 'https\?://[^/[:space:]]*' | head -1 | sed -e 's|.*://||' -e 's|\..*||'
+}
+
 epm_addrepo()
 {
+local disabled=
+local repo_name=
+
+# Parse options
+while true ; do
+    case "$1" in
+        -h|--help)           # HELPOPT: print this help
+            epm_addrepo_help
+            return
+            ;;
+        --disabled)          # HELPOPT: add repo as disabled (commented out) in sources.list.d
+            disabled=1
+            shift
+            ;;
+        --name)              # HELPOPT: save repo to sources.list.d/<name>.list (enables repo/package install syntax)
+            shift
+            repo_name="$1"
+            shift
+            ;;
+        --name=*)            # HELPOPT: save repo to sources.list.d/<name>.list (--name=reponame)
+            repo_name="$(echo "$1" | sed -e 's|--name=||')"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 local repo="$*"
+
+# Handle --name: write repo to sources.list.d/<name>.list
+if [ -n "$repo_name" ] ; then
+    if [ -z "$repo" ] ; then
+        fatal '--name requires a repo string'
+    fi
+
+    case $PMTYPE in
+        apt-rpm|apt-dpkg)
+            ;;
+        *)
+            fatal '--name is only supported for apt-based systems'
+            ;;
+    esac
+
+    local file="$APT_SOURCES_LIST_D/$repo_name.list"
+    local line="$repo"
+    [ -n "$disabled" ] && line="# $repo"
+
+    # check for duplicate (both enabled and disabled forms)
+    if [ -s "$file" ] && grep -q -F "$repo" "$file" ; then
+        info "Repo '$repo_name' already contains this source"
+        return
+    fi
+
+    # also check if repo already exists in other sources (including disabled)
+    if epm --quiet repo list --all "$repo" >/dev/null 2>&1 ; then
+        info "Repo is already in the sources list"
+        return
+    fi
+
+    if [ -n "$dryrun" ] ; then
+        echo "$line -> $file"
+        return
+    fi
+
+    __add_line_to_file "$file" "$line"
+    [ -n "$disabled" ] && info "Added disabled repo to $file" || info "Added repo to $file"
+    return
+fi
 
 # Handle copr/owner/project syntax for Fedora/RHEL
 case "$1" in
@@ -559,10 +1055,10 @@ case "$1" in
         case $PMTYPE in
             dnf-rpm)
                 assure_exists dnf-plugins-core
-                sudocmd dnf copr enable -y "$owner_project"
+                sudocmd $DNFCMD copr enable -y "$owner_project"
                 ;;
             dnf5-rpm)
-                sudocmd dnf copr enable -y "$owner_project"
+                sudocmd $DNFCMD copr enable -y "$owner_project"
                 ;;
             yum-rpm)
                 assure_exists yum-plugin-copr
@@ -585,8 +1081,14 @@ esac
 
 case $BASEDISTRNAME in
     "alt")
-        __epm_addrepo_altlinux "$@"
-        return
+        if [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_uses_apt_sources ; then
+            __epm_addrepo_altlinux "$@"
+            return
+        fi
+        if [ "$PMTYPE" = "dnf-rpm" ] || [ "$PMTYPE" = "dnf5-rpm" ] ; then
+            __epm_addrepo_altlinux_dnf "$@"
+            return
+        fi
         ;;
     "astra")
         __epm_addrepo_astra "$@"
@@ -611,11 +1113,11 @@ case $PMTYPE in
         ;;
     dnf-rpm)
         __epm_addrepo_rhel "$repo" || return
-        sudocmd dnf config-manager --add-repo "$repo"
+        sudocmd $DNFCMD config-manager --add-repo "$repo"
         ;;
     dnf5-rpm)
         __epm_addrepo_rhel "$repo" || return
-        sudocmd dnf config-manager addrepo --from-repofile "$repo"
+        sudocmd $DNFCMD config-manager addrepo --from-repofile "$repo"
         ;;
     urpm-rpm)
         sudocmd urpmi.addmedia "$@"

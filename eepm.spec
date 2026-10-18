@@ -2,7 +2,7 @@
 
 %define _unpackaged_files_terminate_build 1
 Name: eepm
-Version: 3.64.51
+Version: 3.64.70
 Release: alt1
 
 Summary: Etersoft EPM package manager
@@ -53,7 +53,12 @@ See detailed description here: http://wiki.etersoft.ru/EPM
 Summary: Etersoft EPM package manager (repack requirements)
 Group: System/Configuration/Packaging
 Requires: %name = %EVR
-Requires: alien cpio dpkg patchelf p7zip
+Requires: alien cpio dpkg patchelf
+%if "%_vendor" == "arch"
+Requires: 7zip
+%else
+Requires: 7-zip
+%endif
 %if "%_vendor" == "alt"
 Requires: eepm-rpm-build
 %else
@@ -135,6 +140,7 @@ EOF
 %dir %_sysconfdir/eepm/repack.d/
 %dir %_sysconfdir/eepm/prescription.d/
 %dir %_sysconfdir/eepm/desktop.d/
+%dir %_sysconfdir/eepm/desktop-manager.d/
 %config(noreplace) %_sysconfdir/eepm/eepm.conf
 %config(noreplace) %_sysconfdir/eepm/serv.conf
 %config(noreplace) %_sysconfdir/eepm/*.list
@@ -142,6 +148,7 @@ EOF
 %config(noreplace) %_sysconfdir/eepm/pack.d/*
 %config(noreplace) %_sysconfdir/eepm/prescription.d/*
 %config(noreplace) %_sysconfdir/eepm/desktop.d/*
+%config(noreplace) %_sysconfdir/eepm/desktop-manager.d/*
 %_bindir/epm*
 %_bindir/eepm
 %_bindir/serv
@@ -181,6 +188,975 @@ EOF
 # metapackage, no files
 
 %changelog
+* Thu Oct 15 2026 Ivan Mazhukin <vanomj@altlinux.org> 3.64.70-alt1
+- epm repo mirrors/change: support dnf on ALT in all repo modes
+- epm: support APT-RPM repos (type=apt-rpm) for dnf on ALT
+- epm query: check dpkg package state for installed check (eterbug #19294)
+- epm play mssql-tools: fix reinstall after removal (eterbug #19294)
+- epm play: added procdump (Sysinternals process dump utility)
+- epm play: added filmcraft (eterbug #19678)
+- epm play: added vectorcraft (eterbug #19678)
+- epm play: added lightcraft (eterbug #19678)
+- epm play: added designcraft (eterbug #19678)
+- epm play: added effectcraft (eterbug #19678)
+- epm play: added photocraft (eterbug #19678)
+- epm play: added pdfcraft (eterbug #19678)
+- epm play: added gridcraft (eterbug #19678)
+- epm play: added cadcraft (eterbug #19678)
+- epm play: added deckcraft (eterbug #19678)
+- epm play: added soundcraft (eterbug #19678)
+- epm play: added wordcraft (eterbug #19678)
+- epm play: added figcraft (eterbug #19678)
+- epm play: added artcraft-launcher (eterbug #19678)
+- epm play stacer: fix requires (eterbug #17865)
+- epm play bitdesk: fix repack (eterbug #17865)
+- github ci: test app editions and dependent plays (eterbug #18828)
+- epm play common.sh: install zstd for rpm repository metadata (eterbug #17865)
+- epm list: honor --short for installed packages
+- epm play: added session-desktop (Session private messenger)
+- epm repack: add shared runtime dependencies for Rust winit applications
+- epm repack designcraft: add runtime dependencies
+- epm repack effectcraft: add runtime dependencies
+- epm repack lightcraft: add runtime dependencies
+- epm repack vectorcraft: add runtime dependencies
+- epm repack filmcraft: add runtime dependencies
+- epm repack photocraft: add runtime dependencies
+- epm play pdfcraft: add runtime dependencies and printcraft alias
+- epm repack wordcraft: add runtime dependencies
+- epm repack gridcraft: add runtime dependencies
+- epm repack deckcraft: add runtime dependencies
+- epm repack cadcraft: add runtime dependencies
+- epm repack soundcraft: add runtime dependencies
+- epm play: add Open CAD Studio
+- epm play: add Penguin Mail
+- epm play: add MultiTool
+- github ci: use Etersoft mirror for ALT jobs (eterbug #18828)
+- epm pack hytale-launcher: support update container format (eterbug #17865)
+- release_commit.sh: automate release workflow (eterbug #17829)
+- epm play: add cisco secure client (anyconnect vpn)
+- epm repo mirrors: show mirror date (Last-Modified of pkglist) in speedtest
+- release_commit.sh: fix gita preflight (eterbug #17829)
+
+* Sat Oct 10 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.69-alt1
+- epm play codex: move glibc voice host to separate codex-voice variant (eterbug #19633)
+- epm play: add amnezia-vpn (AmneziaVPN client for self-hosted VPN)
+- etc/packrules.list: add amnezia-vpn rule for AmneziaVPN .run installer
+- epm reinstall: pass -y to dnf/yum with --auto and keep backend exit code (eterbug #19572)
+- epm addrepo: write /etc/yum.repos.d/alt-<branch>.repo for dnf on ALT (eterbug #19644)
+- epm removerepo: support 'all' for dnf/yum backends
+- epm repo save/restore: support /etc/yum.repos.d for dnf/yum backends
+- epm repo set/change: do not use apt mirrors for dnf on ALT
+- epm addrepo: check ALT dnf repo via dnf makecache and import ALT keys to rpmdb
+- epm addrepo: support deferred repos for dnf on ALT
+- epm: apply EPM_BACKEND from eepm.conf and export it for nested calls
+- epm-sh-backend: recognize backend names with digits (dnf5:pkg) and set DNFCMD for them
+- epm-sh-backend: allow full backend names with dash (apt-rpm:pkg)
+- epm-sh-altlinux: add __alt_dnf_baseurl/__alt_dnf_archlist and use them in addrepo
+- epm-sh-backend: support branch/named repo syntax for dnf on ALT (--repofrompath/--enablerepo)
+- epm-sh-backend: return exit code from repo/backend argument processing
+- epm-sh-backend: allow dash and dot in repo name for repo/package syntax (deferred-beta/pkg)
+- epm assure: hint to add repos when dnf on ALT has no repos
+- epm addrepo: handle all repo kinds for dnf on ALT (any case branch, .repo, dir, URL, help, --dry-run)
+- epm removerepo: remove dnf repos by file name or repo id, skip apt-only ALT repo kinds
+- epm repolist: support --all/--disabled/patterns for dnf, use repoinfo for --verbose
+- epm-sh-backend: do not refuse copr/owner/project/pkg for dnf on ALT
+- epm repo enable/disable: set enabled= in /etc/yum.repos.d for dnf (by name or repo id, fix swapped dnf4 options)
+- epm repo status: support dnf (check metadata age)
+- epm repo switch/fix/clean: support dnf on ALT (rewrite alt-*.repo, nothing to fix/clean)
+- epm repo addkey/importgpg: import keys to rpm db and /etc/pki/rpm-gpg for dnf on ALT
+- epm repo mirrors: refuse for dnf on ALT
+- epm repo index: fix option parsing for dnf, default to current dir, use createrepo_c
+- epm repo pkgadd/pkgupdate/pkgdel: support flat rpm-md repo for dnf (fixes --put-to-repo)
+- epm update: force metadata refresh for dnf (makecache --refresh)
+- epm whatdepends: use apt-cache on ALT only with apt, support --short for dnf
+- epm conflicts: support dnf
+- epm requires: filter base ALT requires and support --short for dnf on ALT
+- epm print srcpkgname: add newline to dnf repoquery format
+- epm download: remove unreachable dnf branch
+- epm history: handle --help/--list for dnf, refuse apt-only options
+- epm changelog: install dnf changelog plugin if missed
+- epm install: install package files on ALT with dnf via requires and rpm (dnf can't resolve rpmlib() for files)
+- epm install: use local repo for package files on ALT with apt only
+- epm install/upgrade: install ALT task packages as files for dnf (task repos have no rpm-md)
+- epm update-kernel: install kernel and modules via dnf on ALT, keep modules for all kernels (installonly)
+- epm install: install kernel modules via dnf on ALT without update-kernel
+- epm remove-old-kernels: use dnf remove --oldinstallonly on ALT with dnf
+- epm autoremove: use dnf autoremove on ALT with dnf
+- epm autoremove: support --auto and --dry-run for dnf
+- epm autoorphans: use dnf repoquery --extras on ALT with dnf
+- epm dedup: use dnf remove --duplicates for dnf
+- epm mark: use apt hold/apt-mark on ALT only with apt
+- epm mark: use builtin dnf5 versionlock and parse its list format
+- epm upgrade: support --dry-run for dnf, drop duplicated args, keep kernel modules on ALT
+- epm downgrade: use dnf downgrade/distro-sync on ALT with dnf, support --auto for dnf
+- epm release-upgrade/downgrade: refuse on ALT with dnf
+- epm remove: support --dry-run for dnf
+- epm remove: fix apt-dpkg name in --dry-run handling
+- epm check: do not pass --verbose to dnf5
+- epm clean: do not clean dnf cache with --dry-run
+- epm update-kernel/remove-old-kernels: fix check for installed kernels on ALT
+- epm update-kernel: do not fail on --dry-run with dnf
+- epm upgrade/autoremove: do not fail on --dry-run with dnf
+- epm contents_index: check gz files with gzip -t, do not remove valid index when erc has no backend
+- epm update-kernel: port update-kernel logic for dnf on ALT (modules from booted flavour, headers, latest flavour, -A/-D/-H/--fw/--debuginfo/-d/--no-kernel/-l)
+- epm remove-old-kernels: port remove-old-kernels logic for dnf on ALT (keep booted, backup and latest kernels)
+- epm update-kernel: escape $ in sed patterns (checkbashisms)
+- epm-sh-altlinux-kernel: add update-kernel/remove-old-kernels logic for ALT with apt and dnf backends
+- epm update-kernel: use own implementation instead of update-kernel tool on ALT (apt and dnf)
+- epm remove-old-kernels: use own implementation instead of remove-old-kernels tool on ALT (apt and dnf)
+- epm install: install kernel images and modules via common update-kernel logic on ALT
+- epm-sh-altlinux-kernel: compare kernel versions like rpmevrdtcmp (rpmevrcmp, then buildtime)
+- epm sf/filelist: retry contents_index retrieving on ALT if the previous one failed
+- epm mark: pass -y to dnf mark with --auto
+- epm mark: add weak and showweak commands (weak dependency, auto for apt)
+- epm mark showauto/showmanual: list package names by install reason for dnf
+- epm play: add goodbear-browser (Firefox based browser with Russian Ministry of Digital Development certificates support)
+- epm play xnview: install Qt5-based 1.11.7 on CPUs without x86-64-v2 (sse4.2, popcnt)
+- epm play xnview: support installing a specific version from old_versions archive
+- epm-sh-backend: __use_tmp_apt_with_named_repo: skip duplicate sources (apt-get update hangs on them)
+- epm addrepo: add task repos with [vendor] of the task branch (girar signs task repos)
+- epm repo addkey: put vendor keys to /etc/pki/apt-gpg/sources (apt-gpgkeys-pki), not to alt-gpgkeys keyring
+- epm repo: use apt sources.list for dnf5 with libdnf5-plugin-apt on ALT
+- epm addrepo: check repomd.xml signature of Etersoft mirror rpm-md for dnf on ALT
+- epm download: support ALT tasks for dnf backends (download rpm files directly, task repos have no rpm-md)
+- epm install: install package files via dnf on ALT too (dnf5 can install local rpm now)
+- epm: --parallel: select eget backend only for apt-rpm (dnf downloads in parallel itself)
+- epm play open-pdf-studio: get URL via get_github_url (file version 2026.39.0 differs from tag v2026.39)
+- epm repack open-pdf-studio: replace libtesseract.so.4 with libtesseract.so.5 if there is no tesseract 4 (only C API is used)
+- epm play libicu78: install the distro package if available (ALT Sisyphus has libicu78)
+- epm play thinlinc-client: use direct URL with build number (there is no directory listing on the site anymore)
+- epm play codex: add system config /etc/codex/config.toml (disable app-server daemon auto start and update check)
+- epm release-upgrade: allow removing packages when installing release packages (apt-conf-branch- failed with --auto)
+- epm-sh-functions: is_url: do not treat repo line "rpm file:/path ..." as ssh URL
+- epm-sh-functions: confirm_info: fail with a hint to use --auto if there is no terminal (check /dev/tty can be opened)
+- epm repack spravki-bk: remove bundled libgdiplus (alt11 one requires libtiff.so.6 missed on c10f2), use the system one
+- epm repack wazuh-agent: move to /opt/wazuh-agent (logs to /var/log, state to /var/lib), create wazuh user via sysusers.d, set group and vendor modes via tmpfiles.d (eterbug #19660)
+- erc: add DwarFS AppImage extraction support (eterbug #19242)
+- epm play: drop orion browser
+- epm play: added photosuite (eterbug #19655)
+- epm play: added BedrockOnLinux (eterbug #19651)
+- epm play: added blanc web browser (eterbug #19650)
+- epm play zed-i18n: fix version
+- epm pack codex: use rm -rf for bundled resources (voice libs are read-only, rm asks on a terminal)
+- epm play assistant: use YaOrder field to resolve package id from catalog
+- epm repack libreoffice-tdf: ignore bundled Qt library requires
+- epm-sh-backend: use persistent apt cache dir and fix mirror baseurl detection
+- epm play common: support zstd rpm repo metadata
+- epm play: added trivalent (eterbug #19641)
+- epm play: added trivalent-qt6-ui (eterbug #19641)
+- epm play cli-proxy-api: replace cli-proxy-api-plus due upstream repo deletion (eterbug #17865)
+- epm play kompas3d: add v25
+
+* Wed Sep 30 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.68-alt1
+- epm play: add gswitch support
+- epm play: add open-pdf-studio
+- epm play: add komet
+- fish completions epm: preserve Fish package descriptions as metadata
+- epm play portmaster2: ensure patool dependency before unpacking deb
+- epm repack waywallen: add forced Qt6 QML requires
+- epm play unityhub: fix install (eterbug #17865)
+- epm play happ: add service setup instructions after installation
+- epm play: add codexbar-cli
+- epm play vintasoft-web-twain-service: fix download url (eterbug #17865)
+- epm play betaflight: rename betaflight-configurator to betaflight
+- epm play mts-link: migrate to new debian package distribution
+- epm play: add quickadb
+- epm play: add QtScrcpy
+- epm play: add Sharp UD PCL6 package scripts
+- epm play telegram: update upstream url (eterbug #17865)
+- epm play: unify adbmanager asset URL resolution
+- epm play mailspring: fix package architecture (eterbug #17865)
+- epm play: add Figma Linux Next
+- epm play pantum-r: fix install (eterbug #17865)
+- epm pack davinci-resolve: fix packaging (eterbug #18117)
+- epm play codex: update repack to musl (eterbug #19633)
+- epm repack: support chrome_sandbox in fix_chrome_sandbox
+- epm play: added cromite (eterbug #19567)
+- epm repack: fix Chromium crashpad permissions
+- epm play: added helium (eterbug #19565)
+- epm play: add zed-i18n
+- epm play trueconf: add Qt5 requires
+- epm play: add yandex-document
+- epm play spravki-bk: update
+- epm play: add Bettbox
+- epm play: add amethyst-mod-manager
+- epm repack: add check_binary
+- epm play rustdesk: fix /opt installation check (eterbug #19568)
+- epm play wps-office-cn: add qt5 req (eterbug #19551)
+- epm play onlyoffice: add Qt5 QML and Quick requirements
+- epm install: remove dpkg options from apt-rpm command
+- epm simulate: share APT options with install
+- epm play: add libxml2_16 from GNOME 49 runtime
+- epm play orion: fix native installation and startup on p11
+- epm play: track driver-bound app versions in updates
+- epm play: match HPLIP plugin to installed driver
+- epm play: add Koda Desktop
+- epm play: add Entropy keyboard configurator
+- epm contents-index: use rsync for Deferred repos
+- epm repo pkgupdate: keep newest package version
+- epm play: --installed without app lists installed apps
+- eget: fixes for aria2c and wget2
+- epm update: check PMTYPE for ALT-specific apt-get update path
+
+* Tue Sep 08 2026 Ivan Mazhukin <vanomj@altlinux.org> 3.64.67-alt1
+- commit packed 3.64.66
+- epm play freeoffice: fix scraping URL, remove hardcoded YEAR
+- epm play freeoffice: restore YEAR variable
+- play.d/common.sh: fix PKGNAME lowercasing breaking pack.d lookup on deb systems
+- epm status: change --validate to --valid
+- epm play: use disabled repos with repo/package install syntax
+- serv edit: use --full for /etc/systemd/system units, preserve EDITOR over sudo, restart if running
+- epm repack.d/generic.sh: strip leading BOM before inserting python3 shebang
+- epm repack pgadmin4-server: require 64-bit libpq/libkrb5 via add_unirequires
+- epm repack pgadmin4-server: disable system-site-packages in bundled venv
+- epm play sunshine: match any fc* build (fc41 no longer built)
+- epm play: add libicu78 (ICU 78.3 runtime libs for Fedora 45 apps)
+- epm play sunshine: install libicu78 for libicuuc.so.78 dependency
+- epm play: add aeroadmin (remote desktop over Wine)
+- epm play: add veeam-agent (Veeam Agent for Linux with ALT repack)
+- epm play: add brave-origin (streamlined Brave browser, free on Linux)
+- epm play: added NVIDIA GeForce NOW from oficial flatpak repo (eterbug #19180)
+- epm play: add libicu77 (ICU 77.1 runtime libraries from Fedora 43)
+- epm play: add orion (Orion Browser by Kagi from Flatpak bundle)
+- epm play geforce-now: move flatpak extraction to pack.d, hide ostree from shell AutoReq
+- epm play: add brother-dcp-t420w (DCP-T420W printer driver, 64-bit)
+- epm repack claude-code: create ~/.local/bin/claude symlink if absent
+- epm play: add brother-dcp-t510w (DCP-T510W printer driver)
+- epm play: add brother-dcp-t720dw (DCP-T720DW printer driver)
+- epm desktop: add display manager management and auto-install preferred_dm
+- epm repack.d/claude-code.sh: include only readable env.conf files
+- epm repack.d/common.sh: skip *.musl.node files in dependency scan
+- epm repack: forbid bare libc.so require and fix reqstoplist matching
+- epm play assistant: resolve build id dynamically from vendor catalog
+- epm play: add lemonade-server (AMD local AI server)
+- epm play: add cc-switch (Claude Code/Codex/Gemini CLI assistant)
+- epm pack.d: add generic-flatpak for self-contained flatpak bundles
+- epm-sh-create-rpm: support conflicts and obsoletes in yaml
+- epm pack.d pi: conflict with pi-coding-agent
+- epm play pi: switch to earendil-works/pi repo
+- epm play: add zcode-desktop (z.ai GLM-5.2 desktop harness)
+- epm repack.d: hide duplicate yandex browser desktop launcher
+- epm play: add coddy (Coddy Agent - coding agent harness)
+- epm-sh-functions: fix get_package_type to use basename for extension detection
+- epm repack ayugram-desktop: add forced requires for dynamically linked libraries
+- epm play ayugram: use exact RELEASE in download URL pattern
+- epm play codex: switch to codex-package tarball, install to /opt/codex
+- epm pack.d coddy: fix license to MIT
+- epm play.d/common.sh: reinstall if any package from multi-name PKGNAME is missing (eterbug #19203)
+- epm-check_updated_repo: skip pkglist entries that cannot be stat'ed
+- epm-sh-backend: __generate_alt_sourceslist: reuse configured mirror only if it is a known ALT mirror
+- epm reinstall: support repo/package and backend:package syntax
+- epm restore: add cpanfile support via Module::CPANfile
+- epm restore: extract __epm_restore_emit, drop dead perl_shyaml code
+- epm restore: respect explicit file/URL args, fix --dry-run exit code
+- epm play.d/common.sh: check_for_product_update: honor get_target_version hook
+- epm play virtualbox-extpack: skip redundant reinstall when extpack matches virtualbox
+- epm hedgehog: add a hedgehog easter egg by analogy with epm moo
+- epm play claude-desktop: switch to official Anthropic apt repository
+- epm repack claude-desktop: fix /usr/bin launcher symlink after move_to_opt
+- epm upgrade: add --download-only support
+- epm downgrade: add --download-only support
+- epm play: drop closed app (telega)
+- epm play: add pinokio (eterbug #19233)
+- epm play torrserver: use gstreamer builds (eterbug #19241)
+- epm play: add bruno (eterbug #19232)
+- epm play: added grok (eterbug #19210)
+- epm play: added Lolka (eterbug #19228)
+- epm play: add appflowy (eterbug #19229)
+- epm play: add osu-lazer (eterbug #19231)
+- epm play: added b4 (eterbug #19208)
+- serv: avoid sudo for read-only systemctl commands (eterbug #19199)
+- serv completion: handle user services (eterbug #19199)
+- ci: fix debian build wrong exit status detection (#eterbug 18828)
+- epm play: added muse-code (eterbug #19295)
+- epm play ocenaudio: fix Qt6 requires (eterbug #17865)
+- epm play: added FlClash (eterbug #19292)
+- epm play blender: fix repack for 5.2 (eterbug #17865)
+- epm install: preserve temporary APT config during simulation
+- epm removerepo: parse regexp option globally
+- epm repo disable: propagate regexp option
+- epm play: add Legcord
+- distr_info: detect Ximper as Sisyphus
+- distr_info: prefer ALT_BRANCH_ID for ALT branch detection
+- epm repo switch: fix mirror and URL handling for Deferred
+- epm release-upgrade: preserve Deferred repositories across package updates
+- epm release-upgrade: skip source preparation when repositories already match target
+- epm release-upgrade: avoid apt-conf-branch for rolling targets
+- distr_info: detect ARM CPU frequencies per CPUFreq domain (eterbug #19452)
+- epm install: preserve explicit task devel packages
+- fix: suppress suggestions for broken dependencies
+- epm prescription: fix switching to nouveau
+- epm play: add yaak (eterbug #19413)
+- epm play: add crosspaste (eterbug #19412)
+- epm play shikiwatch: fix AppImage repack
+- epm play kodik: use clean download endpoint (eterbug #17865)
+- epm play rstudio: fix repack requires
+- epm repack fluffychat: fix requires (eterbug #17865) epm pack fluffychat: fix icon
+- epm play librewolf: use Codeberg releases (eterbug #17865)
+- epm play: add cherry-studio (eterbug #19247)
+- epm play: add kopia (eterbug #19249)
+- epm play: add beekeeper-studio (eterbug #19250)
+- epm play ayugram: move to flatpak (eterbug #17865)
+- epm play rats-search: fix upstream url (eterbug #17865)
+- ci: ignore shlibdeps errors in successful debian repacks (#eterbug 18828)
+- epm play flclashx: fix repack package name (eterbug #17865)
+- epm play git-butler: use upstream download urls (eterbug #17865)
+- epm play nomachine: fix upstream package install (eterbug #17865)
+- epm play onescript-engine: fix latest package lookup (eterbug #17865)
+- epm play openide: fix stable repack and eap download url (eterbug #17865)
+- epm play weasis: fix install (eterbug #17865)
+- epm play kulibin: fix upstream url (eterbug #17865)
+- epm play: add yandex-smart-home-control (eterbug #19325)
+- epm play cnrdrvcups-ufr2: fix Canon archive install (eterbug #17865)
+- epm repack tsukimi: fix icon url (eterbug #17865)
+- epm play lycheeslicer: fix latest install (eterbug #17865)
+- epm play jetbrains: fix official download urls (eterbug #17865)
+- epm play remotedesktopmanager: fix latest version detection (eterbug #17865)
+- epm play pi: fix packed binary permissions (eterbug #17865)
+- epm play localsend: fix install on p11 (eterbug #17865)
+- epm play portmaster: fix launcher wrapper (eterbug #17865)
+- epm play realvnc-viewer: fix upstream url (eterbug #17865)
+- epm play deltachat: move downloads to GitHub (eterbug #17865)
+- epm play cursor-agent: fix latest version detection (eterbug #17865)
+- epm play devin-desktop: use update API for download URL (eterbug #17865)
+- epm play aimp: fix install on deb systems (eterbug #17865)
+- epm play mssql-tools: add Fedora, ROSA and RedOS support (eterbug #17865)
+- epm play xod-ide: fix download url (eterbug #17865)
+- ci: test app editions in separate jobs
+- epm play samsung-printer: fix installation (eterbug #17865)
+- epm play: added plezy (eterbug #19245)
+- epm play: added reach (eterbug #19244)
+- epm play codex-app: replace it with oficial chatgpt (eterbug #19322)
+- epm play sunshine: bundle fedora libs (eterbug #19183)
+
+* Wed Jul 01 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.66-alt1
+- epm repack.d: warn about UPX-packed binaries that hide their library deps
+- epm play: add voicekey (voice typing by hotkey)
+- epm play: add apple-emoji-linux (Apple Color Emoji font)
+- epm play: add brscan4 (Brother SANE scanner driver)
+- epm play: add brother-dcp-t310 (Brother DCP-T310 printer driver)
+- epm prescription: add flatpak-fix-openh264 (OpenH264 codec for Flatpak)
+- epm play.d/common.sh: add get_deb_repo_latest_filename helper
+- epm play max: install EL9 rpm with build number kept in version (eterbug #18860)
+- epm repolist: support backend syntax (epm repolist stplr:)
+- epm prescription: add stplr (install Stapler and add aides repo if none)
+- epm play: add aseprite (build locally via stplr from the aides recipe)
+- epm prescription stplr: run unprivileged, elevate stplr commands with sudo when not root
+- epm play opencode-desktop: drop leftover open-code PKGNAME lines
+- epm repack opencode-desktop: fix bin_exec (eterbug #17865)
+- epm play r7-office-organizer: fix download (eterbug #17865)
+- release_commit.sh: disable publication to the Additives repo
+- eget: reject downloaded HTML page before adding to IPFS
+- epm play.d/common.sh: add get_rpm_repo_latest_file helper, use fetch_url/ercat
+- epm play tailscale: use get_rpm_repo_latest_file helper
+- epm play: add wazuh-agent (host security monitoring from the official repo)
+- epm repack atom: drop deps already added by add_electron_deps
+- epm play aksusbd: add 10.32 as latest default, keep 10.21/10.14
+- epm play: add Sigil (multi-platform EPUB ebook editor)
+- epm play zerotier-one: use el9 build on openssl3 systems (p11+/Sisyphus)
+- epm play google-earth: fix deb package URL (underscores/amd64)
+- epm play: add wiimplay (WiiM Play UPnP control point)
+- epm-sh-altlinux-contents-index: avoid bashisms (mapfile, process substitution) for bash3/POSIX
+- epm play: add Gitea helpers and use them (eterbug #19169)
+- epm play portprotonqt: pin fc42 dist and use RELEASE for a glob-free IPFS-able URL
+- epm prescription switch-to-pipewire: install and enable wireplumber session manager (no sound without it)
+- epm play docker-desktop: update to latest (versionless URL), fix repack for 4.79 layout, drop docker-compose file conflict, require qemu-system-x86
+- epm play: add trae (Trae AI IDE)
+- fish completion: drop stray URL from repo change/add candidates
+- epm play: add libreoffice (official TDF build packed as a single rpm)
+- epm play pgadmin4: fix install (match build to system python, repack venv site-packages)
+- epm repack ipera-client: add libatomic.so.1 require (bundled libopenal needs it)
+- epm play far2l-portable: require glibc >= 2.34, suggest native far2l otherwise
+- epm play dbeaver: resolve release asset name via get_github_url (handle old -stable vs new -linux naming)
+- epm play yandex-browser: install gstreamer codecs via new prescription (ALT #57450)
+- epm play mssql-server: use ubuntu 22.04 build on Astra 1.8 (liblber/libldap 2.5)
+- epm release-upgrade: drop vendor signs and retry on any update failure (not only Unknown vendor ID, ALT #51240)
+- epm play: add brother-mfc-l2700dn (Brother MFC-L2700DN printer driver)
+- epm play: add samsung-printer (Samsung Unified Linux Driver from SULDR)
+- epm play yandex-telemost: look in localappdata and disable winemenubuilder
+- epm play spo-anketa: read current download URL from the site, update to 1.3.3
+- epm play qsp-classic: drop eepm RELEASE from the download URL (fixes 404 on 5.9.5)
+- erc: add flatpak bundle support (extract, list, test)
+- epm play: add vostok-browser (C01-03 Vostok, Firefox-based, repacked from flatpak via ostree)
+
+* Thu Jun 25 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.65-alt1
+- epm play.d/common.sh: add get_gitlab_url and get_gitlab_tag helpers
+- epm play: add lilypond (music engraving program)
+- epm play rustdesk: use get_github_url to avoid nightly prerelease
+- epm play: add mimo-code (MiMo Code AI coding agent by Xiaomi)
+- epm play spo-anketa: update to 1.3.2
+- epm play rustdesk: require libxdo.so.3 explicitly
+- epm play: add kimi-code (Kimi Code CLI by Moonshot AI)
+- epm play: add cups-pdf (virtual PDF printer for CUPS from EPEL)
+- epm play anydesk: switch to rpm.anydesk.com repo (anydesk.com blocks wget via Cloudflare)
+- epm play: rename windsurf to devin-desktop (eterbug #17865)
+- epm play teams-for-linux: add repack due libc issue (eterbug #17865)
+- epm play: mention JetBrains in IDE descriptions
+- epm play xppen: fix download (eterbug #17865)
+- epm play cursor-agent: fix download (eterbug #17865)
+- epm play realvnc-viewer: fix download & install (eterbug #17865)
+- epm play: add opentabletdrive (eterbug #19165)
+- epm play dmde: add package scripts
+- epm play: add waywallen
+- epm play nextcloud-talk: add package scripts
+- epm prescription i586-fix: added freetype
+- epm play: replace ElyPrismLauncher with PineconeMC
+- epm play t1client: fix install (eterbug #17865)
+- epm play hansoft-client: rename for p4-plan-client & fix download(eterbug #17865)
+- epm play: added faugus-launcher (eterbug #19097)
+- epm play: added PortProtonQt (eterbug #19097)
+- epm repack: added python packages support (eterbug #19097)
+- epm play: added minigalaxy (eterbug #19097)
+- epm play remotedesktopmanager: fix download && fedora install (eterbug #17865)
+- epm play tailscale: fix download (eterbug #17865)
+- epm play wps-office: rename scripts for consistent sorting
+- epm play teamspeak3: fix install (eterbug #17865)
+
+* Sat Jun 06 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.64-alt1
+- epm play opencode-desktop: use distinct package name to prevent confusion (eterbug #17865)
+- epm play xppen: scrape vendor page for the latest .deb instead of hardcoded id
+- epm play: add operagx (Opera GX gaming browser)
+- epm play spo-anketa: switch to native rpm/deb 1.3.1
+- epm repack: add opera-gx-stable (mirror of opera-stable)
+- epm play: added flclashx (eterbug #19089)
+- epm play discord: keep bootstrap (eterbug #19092)
+- epm play.d/common.sh: --remove: pass multi-package PKGNAME as separate args
+- epm play.d/common.sh: check_for_product_update: pass action context, handle missing app-versions
+- epm play saby: install nss-utils, force --repack, ship SabyCenter.service systemd unit
+- epm pack Telegram: fix Exec= to telegram-desktop, add StartupWMClass
+- erc: check for 7z backend availability before using it for unsupported types
+- epm play: add minimax-agent (unofficial native Linux client)
+- epm repo mirrors: add Deferred mirror list
+- epm pack gosplugin: don't require unzip (eterbug #17865)
+- epm play forticlient-vpn: update version (eterbug #17865)
+- epm pack fluffychat: get version from URL (etetbug #17865)
+- epm pack generic-appimage: strip -x86-64 arch suffix from product name
+- epm play: add kulibin (digital educational environment AppImage)
+- epm play: add github-store (open-source app store for GitHub releases)
+- epm repack github-store: add /usr/bin launcher and install desktop file
+- epm repack yandexmusic: add AudioVideo main category so the launcher shows in menu
+- epm repack kyocera-sane: replace insecure 40-scanner-permissions.rules
+- epm pack generic-appimage: strip _Linux suffix and recognize V-prefixed version
+- epm repack ElegooSlicer: provide libbz2.so.1.0 compat for ALT
+- epm play: add elegooslicer (OrcaSlicer fork for Elegoo printers)
+- epm play orca-slicer: switch to install_pkgurl, drop redundant pack.d script
+- epm play: added floorp (eterbug #19131)
+- erc: fall back to 7z for tar.* when native (de)compressor is missing
+- epm play codex-app: fix work on Wayland
+- epm play: drop EOL gemini-cli (eterbug #19128)
+- epm play: added antigravity-cli (eterbug #19128)
+- epm play guardant: fix PGKURL (eterbug #17865)
+- epm repack tsukimi: update icon URL (eterbug #17865)
+- epm play manuskript: fix install (eterbug #17865)
+- epm play pantum: update universal driver archive
+- epm repack clion: fix requires (eterbug #17865)
+- epm repack cloudflare-warp: fix install (eterbug #17865)
+- epm repack netbeans: fix requires (eterbug #17865)
+
+* Thu May 14 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.63-alt1
+- epm pack torrserver: dereference symlink and quote heredoc to fix install
+- epm play: disable obsoleted sbis-plugin
+- epm play: add pantum-r (drivers for new Pantum series)
+- epm play pantum: drop obsolete AstraLinuxSE/1.7 branch (V1.1.5 from 2019)
+- epm play.d/common.sh: detect GitHub API errors instead of silently failing
+- epm play warp-terminal: don't use deb to get version on ALT (eterbug #17865)
+- epm pack cnijfilter2: fix PKG path (eterbug #17865)
+- epm play gemini-cli: fix download & install (eterbug #17865)
+- epm play resilio-sync: fix PKGURL (eterbug #17865)
+- epm play.d/common.sh: add get_deb_repo_latest_version helper
+- epm play unityhub: scrape latest version, fix new URL pattern
+- epm play.d/common.sh: add is_version_older helper
+- epm play unityhub: pick URL pattern by version for stale app-versions compatibility
+- epm play: add ifcplugin (Gosuslugi browser plugin) (eterbug #18752)
+- epm play ifcplugin: support deb-based distros too
+- epm repack ifcplugin: add Chromium native messaging host symlink
+- eget: fall back to original URL for signed CDN redirects with UUID paths
+- epm play: add syncthing (continuous file sync from official tarball)
+- epm play opencode-desktop: drop aarch64 (upstream has no aarch64 desktop builds)
+- epm play --update: use eget --force to overwrite partial download on retry
+- epm play: add kimi-cli (Kimi AI coding agent from Moonshot AI)
+- epm repack discord: bake real binary into package via updater_bootstrap (no first-launch download)
+- epm play saby: install without --scripts, replace postinstall via repack
+- epm play sbis-plugin: fix DESRIPTION typo (was not filtered from --list-all)
+- distr_info: add OpenWrt to pkgvendor (returns openwrt for ipk pkgtype)
+- epm-sh-functions: withtimeout: fall back to running without timeout when missing (e.g. busybox without applet)
+- epm simulate: opkg: add missing opkg command prefix
+- epm policy: add opkg support via opkg info
+- epm repo list: add opkg support (read distfeeds.conf and customfeeds.conf)
+- eget: detect busybox wget and skip unsupported --tries option
+- epm restore: preserve version constraints when installing
+- epm play: added jdownloader2 (eterbug #19064)
+- epm play: added equibop (eterbug #19081)
+- epm play: added terax (eterbug #19082)
+- epm play pureref: don't force curl anymore (eterbug #17865)
+- epm play rstudio: fix PKGURL (eterbug #17865)
+- epm play codex: fix download (eterbug #17865)
+- epm repack edge: ignore libmip without interpreter (eterbug #17865)
+- epm play pycharm, idea: use unified pgkname (eterbug #17865)
+- epm play v2rayn: use new PKGNAME & fix install (eterbug #17865)
+- epm play nomachine: fix download (eterbug #17865)
+- epm play pfusp: always repack upstream package (eterbug #17865)
+- epm play: added megatools (eterbug #19069)
+
+* Wed Apr 29 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.62-alt1
+- epm pack zen-browser: fix version parsing for multi-segment versions like 1.19.9b
+- epm play chromium-gost: use get_github_url to avoid GitHub API call when version is known
+- epm play.d: use get_github_url to avoid GitHub API call when version is known
+- epm desktop: add niri (scrollable-tiling Wayland compositor)
+- epm play/repack portmaster: warn about v1 deprecation and fix data dir creation
+- eget: only clear filename for root URL redirects, not all http URLs
+- epm play codex/codex-app: check OpenSSL 3 availability before install
+- epm repack.d: add Conflicts for teamspeak vs teamspeak5 and kilo vs kilocode
+- epm play lenza: fix pkgurl (eterbug #17865)
+- epm repack: prefer 7zip package name (eterbug #18828)
+- epm play: added pi (eterbug #19040)
+- epm play anydesk: fix PKGURL; use browser user agent (eterbug #17865)
+- epm play master-pdf-editor: fix package name (eterbug #17865)
+
+* Fri Apr 24 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.61-alt1
+- epm play claude-code: hardcode DOWNLOAD_BASE_URL instead of scraping install.sh
+- epm-download: drop wget-log side-effect files before scanning
+- epm play common.sh: --force skips app-versions check like --latest
+- epm repack karing: fix crashpad permissions and jvm requires
+- epm repack.d: add Conflicts between renamed package variants
+- epm repack claude-desktop-wine: fix PRODUCTDIR path mismatch with pack.d
+- epm repack claude-desktop/claude-desktop-wine: mutual Conflicts
+
+* Mon Apr 20 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.60-alt1
+- epm play: fix PKGNAME to match repacked package names (remove -linux suffix, etc.)
+- epm play: fix name differs for fplus-upd-ppd, lexmark-upd-ppd, notepad-next
+- epm play: add direct URLs for rocketchat, pstube, powershell to avoid API calls
+- epm play eagle: rename pack.d to match new PKGNAME
+- epm play mssql-server: switch default from 2019 to 2022 (fix OpenLDAP soname on ALT p11+)
+- epm release-upgrade: add dedicated p11 -> Deferred upgrade path
+- epm play logseq: fix PKGNAME to match repacked package name
+- epm repo change: fix URL pattern matching for all mirror formats
+- epm play: sort --list output alphabetically
+- epm play radicle: fix cd in pack.d script
+- epm play radicle-httpd: fix cd in pack.d script
+- epm play sane-panakvs: fix cd in pack.d script
+- epm play xerox-spl-driver: fix cd in pack.d script, replace pushd/popd with subshell
+- epm play yandex-disk-indicator: fix cd in pack.d script
+- epm play cups-drivers-katusham247: fix cd in pack.d script
+- epm play cnijfilter2: fix cd in pack.d script
+- epm play cnrdrvcups-ufr2: fix cd in pack.d script
+- epm play epsonscan2-non-free-plugin: fix cd in pack.d script
+- epm play jetbrains-toolbox: fix cd in pack.d script
+- epm play levenhuklite: fix cd in pack.d script
+- epm play obs-linuxbrowser: fix cd in pack.d script
+- epm play jetbrains-toolbox: fix tar name and yaml in pack.d script
+- epm play sane-katusham247: fix cd globs and bashisms in pack.d script
+- epm play aimp: add repack.d with Conflicts between wine and native versions
+- epm repack epson-printer-utility: add add_libs_requires for system Qt5
+- epm repack whatsie: switch from hardcoded Qt5 to add_libs_requires (snap moved to Qt6)
+- epm repack bellsoft-java11-full: ignore unavailable ffmpeg library versions
+- epm repack plex-desktop: ignore bundled libedit, libwrap and libapparmor
+- epm play sunshine: fix double fc41 in rpm URL pattern
+- epm play telegram=beta: fix double .beta suffix in URL when version from app-versions already ends with .beta
+- epm play firefox-nightly: always scrape latest URL instead of using stale app-versions version
+- epm play android-studio: fix URL for new codename-based filename (panda3 style)
+- epm play android-studio: fall back to latest version when requested version is no longer available
+- epm play telegram=beta: fix release tag URL - beta releases use v1.2.3 tag not v1.2.3.beta
+- epm play: add openshot (video editor)
+- epm play gosplugin: update to 1.3.42, switch to zip installer
+- epm desktop hyprland: add hyprland-guiutils to dependencies
+- epm repack claude-code: load user env.conf from ~/.claude/
+- epm play kyodialog-phase5: fix download URL (download-center -> dam/download-center-cf)
+- epm play kyodialog-phase5: fix download URL, pack.d and rename package in repack
+- epm play: add kyocera-fs-gdi (FS-1020/1025/1040/1060/1120/1125 GDI driver)
+- epm repack kyodialog: remove unnecessary symlink to /usr/share/cups/model
+- epm pack.d/common.sh: use realpath -s in return_tar to not resolve symlinks
+- epm play warp-terminal: restore original AppImage script (realpath -s fix makes it work)
+- epm play: add via (QMK/VIA keyboard configurator)
+- epm play gosplugin: use native RPM for ALT/RedOS instead of deb repack
+- epm remove: drop unnecessary --force-yes from apt-get remove
+- epm download: drop unnecessary --force-yes from apt-get --print-uris
+- epm install: replace deprecated --force-yes with --allow-* for apt-dpkg
+- epm upgrade/downgrade: replace deprecated --force-yes with --allow-* for apt-dpkg
+- epm pack.d/generic-tar.sh: fix PRODUCT extraction for names with dashes (e.g. claude-code)
+- epm repack: skip generic-tar for tar files already prepared by pack.d
+- epm play sane-katusham247: fix cd after erc --here unpack in pack.d
+- epm play pantum: rename driver directory to remove spaces
+- epm repack kyodialog: add Conflicts between Phase 5 and Phase 9
+- epm repack fplus-upd-ppd/lexmark-upd-ppd: add mutual Conflicts
+- epm play common.sh: warn_version_is_not_supported always resets VERSION (fixes --ipfs with vendors that remove old versions)
+- epm: add --allow-remove/--allow-erasing option to allow removing conflicting packages
+- tests: use --allow-remove in update_versions.sh to handle conflicting packages
+- epm repack: extend yaml tar skip to .tar.gz/.tar.bz2/.tar.xz/.tgz, set SUBGENERIC
+- epm repack servo: fix binary name (servoshell, not servo)
+- epm play git-butler: use VERSION~BUILD format for download URL and repack version
+- epm play common.sh: restore ipfs branch in warn_version_is_not_supported
+- epm play yandex-browser: use RELEASE for exact URL (fixes IPFS cache lookup)
+- epm play git-butler: use VERSION~BUILD format, fallback to AUR if build number missing
+- epm play powershell: fix double .rh suffix when RELEASE from app-versions already contains it
+- epm play pstube: fix filename pattern (added -linux- component)
+- epm play synology-chat: use major version for directory search (fix ~ in version)
+- epm play everdo: use direct download URL (getting-started page is gone)
+- epm play: fix version format issues in pstube, rocketchat, cuda-z
+- epm play alt-sendme: use RELEASE in download URL
+- epm play cli-proxy-api-plus: add warn_version_is_not_supported
+- epm repack kyodialog: move add_conflicts after common.sh sourcing
+- epm play yandex-browser-corporate: use RELEASE for exact URL (fixes IPFS cache lookup)
+- epm repack servo: handle both servo and servoshell binary names
+- epm repack tabby: rename binary to tabby-ml to avoid conflict with tabby-terminal
+- epm play manuskript: fix $version typo to $VERSION
+- epm play bcompare: use RELEASE for build number in URL
+- epm play freeplane: strip ~upstream from VERSION before URL construction
+- epm play smartgit: convert dots to underscores for download URL
+- epm play tailscale: use warn_version_is_not_supported, old versions not kept
+- epm pack reaper: fix glob to match extracted dir, not tar.xz in cwd
+- epm play pcsx2, protonup-qt, wasistlos: use direct GitHub URL when VERSION is known
+- epm play kubo: store rc suffix in RELEASE, direct URL with fallback to scraping
+- epm play schildichat-desktop: convert _ to - in version for URL, add direct GitHub URL
+- epm play ridoclnx: fix URL mask to include build number between VERSION and distro suffix
+- epm play metasploit-framework: build direct URL from VERSION+RELEASE, fallback to scraping
+- epm repack.d: add add_unirequires for system Qt deps (reqstoplist bypass)
+- epm repack.d: ignore specific leaked Qt sonames for bundled Qt packages
+- epm play: add adbmanager (GUI tool for managing Android devices via ADB)
+- epm play logseq: revert PKGNAME back to lowercase (matches RPM name from pack.d)
+- epm play: add ttf-wps-fonts (symbol fonts required by wps-office)
+- epm play lenza: fix version check and desktop file (eterbug #18977)
+- epm play: added native claude-code-desktop (eterbug #18971)
+- epm: is_openssl_enough: check libssl3.so instead of package openssl (eterbug #17865)
+- epm play: added kilo (eterbug #19023)
+- epm play: added abacus cli (eterbug #19029)
+- epm play: added codex-app (eterbug #19031)
+- epm play cli-proxy-api-plus: fix mv files & version (eterbug #17865)
+- epm play bcompare: add qt6 unirequires (eterbug #17865)
+
+* Mon Apr 06 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.59-alt1
+- epm play: add keyray (keyboard layout auto-switcher)
+- epm play.d/common.sh: fix installing explicit version (epm play app=X.Y.Z)
+- epm repack.d/common.sh: redirect assure_exists output to stderr to prevent apt output leaking into requires
+- epm play: rename aimp to aimp-wine, add native aimp v6 beta
+- epm play zen-browser: fix package name (zen -> zen-browser) via repack.d
+- epm repack freedownloadmanager: ignore non-critical libtiff.so.5 dependency
+- epm repack aksusbd: remove original arch-specific service files on aarch64/armhf
+- epm install: use --replacepkgs with --force to prevent rpm duplicates
+- epm repack zoom: ignore unbundled Qt6 QML plugins and libQt6Sql dependency
+- epm pack.d: remove broken cd after erc --here (flashplayer, kodak, renamemytvseries)
+- epm repack.d: rename generic icon.png to product name to avoid conflicts
+- epm play gitlab-runner: use versioned S3 URL instead of geo-blocked /latest/
+- epm play: add FreeCAD repack (ignore Qt6Graphs), fix scanner-driver-avision pack.d
+- epm play rider: fix PKGNAME to match actual package name JetBrains.Rider
+- epm repack: fix Rider (ignore musl deps, add JetBrains.Rider symlink), FreeCAD (ignore all Qt6)
+- epm repack FreeCAD: fix gtk3 icon path and use broader glob
+- epm repack: fix deepseek-desktop icon, limit generic-post icon rename to pixmaps only
+- epm repack: fix pdfsam-basic (ignore bundled ffmpeg), lidarr (remap chromaprint dep)
+- epm repack lidarr: use subst instead of filter_from_requires for chromaprint
+- epm play epsonscan2: use download3.ebz.epson.net, fix pack.d cd after erc --here
+- epm play netbeans: switch to GitHub releases (old site is dead)
+- epm play vk: mark as legacy to distinguish from vk-messenger
+- epm play librewolf: use RELEASE from app-versions instead of probing
+- epm play.d/common.sh: get_github_url: try direct URL before API call when no globs
+- epm: add Matrix link, update copyright to 2026
+- epm play: add yandex-messenger (Wine, Windows exe from official site)
+- epm play: add saby (Saby/SBIS desktop application)
+- epm repack.d: fix desktop Categories for firefox, firefox-esr, waterfox (Networking;WWW -> Network;WebBrowser)
+- epm downgrade: skip redundant update_repo_if_needed when tmp apt config is active
+- epm play min: add direct URL for specific version to avoid GitHub API
+- epm play telemt: switch to musl, fix binary extraction, add upstreams and systemd unit
+- epm play telemt: simplify binary extraction with --here
+- eget: strip path components from Content-Disposition filename (RFC 6266)
+- eget: fix curl url_get_response mixing headers with binary body
+- eget: fix wget2 url_get_response to use --save-headers instead of -S
+- eget: add redirect depth limit to url_get_raw_real_url
+- epm release_upgrade: lowercase $TO for altlinux-release package name
+- epm play: add portmaster2 (Portmaster v2 with predownloaded components)
+- epm repack: add mark_config_noreplace(), use for claude-code env.conf
+- epm play: add ntfy (push notification service)
+- epm play ayugram: switch to rsg245 Arch binary builds (v6.3.10)
+- epm play telega: add interception warning to description
+- epm-download: use *.* glob to skip extensionless side-effect files like wget-log
+- epm repack portmaster: move data/logs from /opt to /var/lib/portmaster
+- epm play qwen-code: added vendor directory for fix tree-sitter.wasm (eterbug #18998)
+- epm play: added VK Play (eterbug #19004)
+
+* Fri Mar 27 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.58-alt1
+- epm: exclude exact match from package suggestions
+- epm play.d/common.sh: fix --latest and --force flags in version check
+- epm play.d/common.sh: suppress 'not installed' messages in status checks
+- epm play.d/common.sh: suggest --ipfs on download failure
+- eget: fix is_sshurl falsely matching file:/path URLs
+- eget: fix --check-url for file: directories
+- epm play occt: exclude beta versions from version scraping
+- erc: add -no-xattrs to unsquashfs to avoid exit code 2 on xattr failures
+- epm repack.d/furmark.sh: remove broken empty add_bin_exec_command call
+- epm pack.d/lexmark-upd-ppd.sh: remove empty opt/ dir from package
+- epm pack.d/ventoy.sh: use rm -f to ignore missing arch-specific files
+- epm play bitwig-studio: fix version scraping for two-component versions
+- epm repack bitwig-studio: ignore 32-bit deps from BitwigPluginHost-X86-SSE41
+- epm play kyodialog: fix pack.d for archive without top-level directory
+- epm play: add telega (Telega messenger)
+- epm play: add nextcloud-client (Nextcloud desktop sync client)
+- epm play: add cursor-agent (Cursor Agent CLI)
+- epm play tailscale: switch to official tailscale RPM repo epm repack tailscale: skip tailscaled wrapper if binary not present
+- epm play assistant: switch to vendor API for download URLs
+- epm play spo-anketa: update to version 1.0.2
+- epm play: add freefilesync (folder comparison and synchronization)
+- epm play: add kilocode (AI-powered coding CLI tool)
+- epm play freeoffice: fix scraping URL
+- epm play flameshot: use get_github_url for dynamic RPM asset detection
+- epm play bitwig-studio: add version check after scraping epm play refind: default RELEASE to 1 when not specified
+- eget: fix cross-domain redirect host in url_get_raw_real_url
+- epm info: fix exit code for non-existent packages in apt-rpm
+- epm install: skip package suggestions on broken deps (only suggest when package not found)
+- epm play: remove openvpn from repo-play-apps.list
+- epm repo mirrors: use download.basealt.ru as main basealt mirror, move ftp.basealt.ru to legacy
+- epm repo mirrors: show IP address in mirror list
+- epm upgrade: use PMTYPE check for apt-specific parallel download
+- epm: export eget_backend and eget_options from config to EGET_BACKEND/EGET_OPTIONS
+- eget: rework timeout options, add --max-size and --measurements
+- eget: remove -n short alias for --measurements
+- eget: use timeout(1) for --read-timeout with wget/aria2/axel
+- epm removerepo: show command when removing task repo
+- epm removerepo: show sed command only with --verbose
+- epm packages: fix dpkg output truncated to single line
+- epm pack.d: add lowercase symlinks for deb systems where PKGNAME is lowercased
+- epm-sh-functions: add DNFCMD variable for correct dnf5 command invocation
+- epm repoindex: use dnf5 repo create for dnf5 backend with createrepo_c fallback
+- epm-sh-functions: normalize dnf5 backend name to dnf5-rpm
+- epm repoindex: always use createrepo_c for dnf5 backend
+- epm addrepo/removerepo: check PMTYPE instead of BASEDISTRNAME for ALT dnf5 support
+- epm repoindex: handle --init flag for dnf-rpm/dnf5-rpm backends
+- epm ipfs: add command to manage IPFS node (start, stop, status)
+- epm install: use --name for local-repo to save in sources.list.d
+- epm release-upgrade: add Deferred branch support
+- epm-sh-backend: use symlinks for apt lists cache in tmp apt dir
+- epm: add max fallback contact links
+- epm repack.d: ignore false libwebkit2gtk-4.1 dependency from bundled libmsalruntime.so
+- epm play: add freecad (3D parametric modeler via AppImage)
+- epm play pantum: add new download URL, support Linux Driver naming in pack.d
+- epm play hplip-plugin: fix extraction of makeself archive (no subdirectory with --here)
+- epm.spec: Require 7-zip instead p7zip for eepm-repack
+
+* Thu Mar 12 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.57-alt1
+- pack.d/yandex-browser-*-codecs-ffmpeg-extra: fix path after erc --here migration
+- epm repack: fatal on empty buildroot and missing working directory
+- tests/update_versions.sh: use flexible option parsing loop
+- make-press-release.sh: read changelog from release tag instead of working tree
+- pack.d/*arr: add launcher script, systemd service and user configs
+- epm play: add bitdesk
+- epm play: add virtualbox to repo-play-apps list
+- epm play: add more repo-installed apps to repo-play-apps list
+- epm play: add alivecolors to repo-play-apps list
+- epm addrepo: always check for duplicate repos even with --force
+- epm addrepo: add --disabled and --name options
+- epm install: support repo/package syntax for named repos in sources.list.d
+- epm update: use $__EPM_APT_REPO_OPTIONS for apt-dpkg
+
+* Wed Mar 11 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.56-alt1
+- epm play karing: fix download URL (replace + with . in version)
+- epm play qwen code: upstream fixes releases
+- epm-sh-backend: hardlink system apt lists to speed up task install
+- epm play: add stl-thumb (3D model thumbnail generator)
+- epm repack.d/generic.sh: fix non-executable files in /usr/bin/ instead of fatal
+- epm-sh-backend: fix archive/DATE/package install (use current branch)
+- epm pack: strip version from PRODUCT when VERSION is already known
+- epm play: add f3d (fast and minimalist 3D viewer with raytracing)
+- epm: yaml_load_vars: don't overwrite variables when key is missing in yaml
+- epm pack.d: add eepm.yaml metadata for tarball-based packages
+- epm pack.d/generic-tar.sh: don't overwrite existing eepm.yaml
+- epm play reaper: fix RPM group to valid value
+- epm install: use BIGTMPDIR for temporary apt indices
+- epm play cloudflare-warp: use DEB package on ALT Linux
+- epm play: show 'Updating <app> ...' instead of bare app name
+- epm play: check for product update during install, not just --update
+- epm repack: fix cpio wrapper for systems where cpio is in /bin
+- epm play telemt: fix PKGURL for new release format
+- epm play cstcadnavigator: fix doubled /download/ in URL
+- epm play: skip symlink aliases in app listings
+- epm play: add google-chrome alias for chrome
+- epm-sh-altlinux-contents-index: show URL when downloading via eget
+- epm play rstudio: fix version format and add direct URL for specific versions
+- epm play: add ytdownloader (video/audio downloader)
+- epm play rstudio: simplify distro detection to deb/rpm package type
+- epm play: add lidarr (music library manager)
+- epm play: add sonarr (TV series manager)
+- epm play: add radarr (movie library manager)
+- epm play: add prowlarr (indexer manager)
+- epm play: add bazarr (subtitle manager)
+- epm-sh-altlinux: add task state diagnostics when packages are unavailable
+- pack.d/generic-appimage.sh: extract metadata from .desktop and appdata/metainfo into eepm.yaml
+- pack.d/generic-appimage.sh, repack.d: strip -Linux suffix from AppImage product names
+- repack.d: add Obsoletes for renamed *-Linux packages, remove obsolete move_file for svg
+- epm install: pass URLs directly to repack to preserve download URL for pack scripts
+- epm play neovide: use get_github_url, add direct download URL branch
+- epm repack metasploit-framework, trueconf: fix missing library dependencies
+- epm play readest: add RELEASE support and direct download URL
+- epm play realvnc-viewer, realvnc-server: add fallback version for scraping-free install
+- epm play chitubox-basic: fix version
+- epm play raindrop: remove, Linux is no longer supported by vendor
+- pack.d/android-studio: use erc repack instead of extract+pack
+- epm play vagrant: switch from broken yandexcloud mirror to releases.hashicorp.com
+- epm play freeoffice: fix scraping URL, use installation page with direct links
+- eget: add Yandex.Disk public link download support
+- epm play satvision: switch to Yandex Disk, split into client and server
+- epm play Throne: fix unescaped variables in heredoc and add /usr/bin/Throne symlink
+- epm play occt: use www.ocbase.com URL to avoid cross-domain redirect issue
+- epm play svp4: use unshare -rn to block network during install, drop xvfb-run dependency
+- epm play LevenhukLite: extract archive to /opt, add missing libimagepro.so
+- epm repack nsgclient: ignore bundled libappindicator and add libs requires
+- epm repack webdavmailrucloud: switch to dotnet-8.0 with --roll-forward Major
+- epm repack rlinux: fix unquoted variable checks for xhost and gsettings
+- epm repack synology-drive: fix broken env syntax in launch script
+- epm play wing: add -r to xargs and error check for version detection
+- epm play everdo: add direct download URL for specific version
+- repack.d/unigine-*: fix spec path substitution pattern
+- epm repack zed: check for zed.desktop before renaming (already fixed upstream)
+- epm play eagle: move /opt layout to pack.d script
+- epm play liteide: move /opt layout to pack.d script
+- epm play openide: move /opt layout to pack.d script
+- epm repack: read eepm.yaml metadata directly in spec generator instead of generic.sh
+
+* Mon Mar 02 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.55-alt1
+- epm repack: preserve BuildArch noarch in alien-generated spec
+- epm repo mirrors: switch from --options to subcommands CLI style
+- epm repo pkgdel: fix glob removing unrelated packages with similar name prefix
+- play.d/common.sh: fix PKGNAME lowercasing breaking pack.d lookup on deb systems
+- epm play.d/common.sh: is_glibc_enough: add libc6 fallback for Debian-based systems
+- epm play: recognize repo-installed apps in --installed and --list-installed
+- epm install: forbid package removal in non-interactive mode by default
+- epm: pass --no-remove option via EPM_OPTIONS
+- epm install: respect --no-remove for dnf and zypper in non-interactive mode
+- epm repack: add requires field support from .eepm.yaml
+- epm status: check for EPM marker instead of alien in --repacked
+- play.d/common.sh: fix get_github_url returning raw JSON on single-line API responses
+- epm play qwen-code: use __get_github_download_urls instead of fragile grep
+- epm play firefox: strip trailing .0 from version (FTP uses 148.0, not 148.0.0)
+- epm play ramus: use gradle wrapper instead of system Gradle 9
+- epm play rustdesk: add aarch64 support
+- epm repo switch: add assure_root before modifying sources lists
+- epm play: add bambustudio (3D slicer by Bambu Lab)
+- epm-sh-altlinux-contents-index: use erc --quiet for archive test
+- erc: make --quiet suppress 7z output
+- erc: fix symlink support in 7z create (-l -> -snl)
+- erc: fix duplicate -y flag with 7zz
+- epm release-upgrade: add Astra Linux SE support via astra-console-upgrade
+- epm repolist: fix for apt-dpkg systems (use $PKGFORMAT instead of hardcoded rpm)
+- epm addrepo: support version shortcuts (1.7, 1.8) for Astra Linux
+- epm repolist: return non-zero exit code when no repos match filter in verbose mode
+- epm repo reset: add Astra Linux support
+- epm removerepo: fix 'repo rm all' on Astra Linux
+- epm query_file: fix query for broken symlinks
+- epm play: add packer (HashiCorp machine image tool)
+- epm play: add vagrant (virtualized development environments)
+- epm play: add fvm (Flutter Version Management)
+- epm play: add chitubox-basic (SLA/DLP/LCD slicer for 3D printing)
+- epm play chitubox-basic: add pack script, fix version handling
+- epm repack aksusbd: add aarch64, armhf, x86 support
+- epm repack.d/common.sh: fix remove_dir failing on dirs with mode 600
+- epm repack-deb: fix debian dir detection after alien
+- epm repack: workaround cpio < 2.15 bug breaking alien unpack of symlink-only dirs
+- epm play mssql-server: select rhel repo version based on mssql year
+- epm addrepo: fix glob expansion of [branch] in apt source lines breaking task detection
+- erc: fail on incomplete AppImage extraction via 7z, suggest squashfs-tools
+- epm play cloudflare-warp: rewrite with multi-distro and aarch64 support
+- epm play: added Kodik (eterbug #18914)
+- epm play: added blockbench (eterbug #18921)
+- epm play: added marktext (eterbug #18922)
+
+* Tue Feb 24 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.54-alt1
+- erc-sh-archive: prefer 7zz (official 7-Zip) over deprecated p7zip
+- eget: use nanosecond integer timing in speedtest
+- epm repack.d/common.sh: add set_release_suffix() function
+- epm play spotify: switch to repository-origin.spotify.com and use direct URL when version is known
+- epm repack hiddify: fix CURL_OPENSSL_4 version mismatch with libcurl4-openssl wrapper
+- epm full-upgrade: skip flatpak update when no flatpak packages installed
+- epm play kyocera-sane: fix download URL (de -> eu domain)
+- epm ei: include eepm-full and eepm-command-not-found in self-update
+- epm requires: add --debian option to filter non-library package-name deps
+- epm repack: pass non-library RPM Requires to DEB when repacking rpm to deb
+- epm play mssql-server: fix Astra 1.7 (use ubuntu/18.04, add --repack for Astra)
+- pack.d/generic-appimage.sh: fix ELF executables permissions after 7z extraction
+- epm repo remove: fix false error when repo is only in sources.list
+- eget: support multiple files in EGET_IPFS_DB
+- eget: fix missing $CID argument in put_cid_and_url
+- eget: fix -N/--timestamping with -O for wget backend
+- epm play: restore EPM_IPFS_DB_UPDATE_SKIPPING support
+- eget: skip timestamping for empty (0-byte) files in __timestamping_download
+- eget: skip timestamping for empty files in curl backend
+
+* Mon Feb 23 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.53-alt1
+- epm repack.d/claude-code*: move env variables to /etc/opt/ config
+- epm repack discord: move config path to /etc/opt/discord/
+- epm play --list-updates: use bulk version file instead of per-package HTTP requests
+- epm play --update all: pre-filter apps using bulk version check
+- epm play: split IPFS DB into remote (cached) + local (writable)
+- epm repo add: fix tail error and skip sudo for user-writable files
+- epm repo list: remove 'task NUMBER' subcommand (use epm repo add --dry-run)
+- epm ei: skip unavailable packages in Korinf instead of fatal error
+- epm installed: add --help support
+- epm-query: is_installed: revert virtual package resolution
+- epm play: add shikiwatch launcher script
+
+* Sun Feb 22 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.52-alt1
+- epm play: show message instead of silent exit on unsupported distro
+- repack.d/portproton.sh: dropped libd3d from requires
+- epm-status: add Astra Linux support
+- epm-repack-deb: preserve original deb dependencies during deb -> rpm -> deb repackaging
+- epm play.d/refind.sh: set RELEASE=1 when resolving VERSION to fix globbing error
+- epm repack.d/webdavmailrucloud.sh: fix create_bin_exec_command renamed to create_exec_file
+- epm repack.d/pulsar.sh: fix apm renamed to ppm in new version
+- epm pack.d/generic-snap.sh: make usr/share optional for CLI-only snaps
+- epm pack.d/teamspeak3-server.sh: add missing pack script for server
+- epm play.d/flameshot.sh: set RELEASE=1 when resolving VERSION to fix glob in URL
+- epm play.d/sublime-merge.sh: set RELEASE=1 when resolving VERSION to fix glob in URL
+- epm play.d/wpsoffice.sh: set RELEASE=1 when resolving VERSION to fix glob in URL
+- epm play ungoogled-chromium: update to new release filename format, add aarch64 support
+- epm install: add --norecommends option to skip recommended packages
+- epm play --update all: fix --update being consumed by the main option parser
+- epm repack: fix deb maintainer by setting EMAIL for alien
+- epm play mssql-server: fix URL for AstraLinuxSE/1.8
+- epm-status: check DSA signature (siggpg) in addition to RSA (sigpgp)
+- epm-sh-functions: get_package_type(): add pkg.tar.* support
+- epm-sh-install: __epm_repack_if_needed(): don't exec external epm
+- epm play.d/common.sh: use /releases/latest API in get_github_url
+- epm play mattermost-desktop: use direct URL for known version
+- epm play mssql-server: support year selection (2017, 2019, 2022, 2025, preview)
+- pack.d/generic-appimage.sh: strip -linux, -stable, -x64 suffixes and fix version regex
+- epm play github-desktop: fix PKGNAME to match actual package name
+- epm play.d/common.sh: get_github_tag(): fatal on empty version instead of silent return
+- epm play hplip-plugin: add openprinting.org fallback when HP site is not accessible
+- epm play dbeaver: fix download URLs for new naming scheme
+- erc: add -C/--directory/--extract-to/--destination/--outdir to extract to specified directory
+- ercat: skip broken files instead of aborting when processing multiple files
+- erc: add makeself (.run) archive extraction support
+- epm repo list: support extended patterns (|) [abc] \[\]
+- epm: add --regexp option for raw regex patterns
+- epm-sh-repo: fix __filter_repos_list to preserve spaces in patterns
+- epm: is_installed: check virtual packages via whatprovides
+- epm: filter_out_installed: treat virtual packages as installed in rpm check
+- epm remove: don't escalate to apt if package is truly not installed
+- epm installed: add --virtual and --real options, add is_installed_real helper
+- epm remove: resolve virtual packages before low level remove
+- eget: get_urls: filter out ../ and ./ entries from HTML directory listings
+- epm play: added vidbee (eterbug #18908)
+- epm play: added readest (eterbug #18910)
+- epm play: added alt-sendme (eterbug #18909)
+- epm play: added opencode-desktop (eterbug #18907)
+- epm play: added cli-proxy-api-plus (eterbug #18903)
+- epm play fresh-editor: use constructname, add RELEASE, remove duplicate fresh.sh (fix #569)
+- epm play openide: add EAP edition support via epm play openide=eap (fix #458)
+- erc: add makeself repack support via extract_makeself_tar
+- ercat: return error code on failed files like cat does
+- epm pack.d/hplip-plugin.sh: use erc unpack instead of sh --noexec
+- epm pack.d/teamspeak3.sh: use erc unpack instead of sh --tar
+- epm pack.d/zwcad-viewer.sh: use erc unpack for .run extraction
+- epm pack.d/unigine-*: use erc convert instead of convert_makeself_to_tar()
+- epm pack.d/unigine-*: fix erc command name (repack, not convert)
+- tools_erc: fix ercat path (tools_ercat in eepm context)
+- epm play: add cloak-client (censorship circumvention tool)
+- epm play: add cloak-server (censorship circumvention tool)
+- epm repo list: add "task NUMBER" to show sources.list for girar tasks
+- epm repo: add EPM_APT_SOURCES_LIST variable support
+- epm repo pkgadd/pkgupdate: add girar task support
+- epm play grdcontrol, guardant: quote basename argument to prevent crash on empty input
+- epm play bitwig-studio: download with proper .deb filename
+- epm repack.d/common.sh: persist ignore_library_path to file across script invocations
+- epm play android-studio: use pack script for correct package naming and version detection
+- epm-download: use 3 download tries by default
+
 * Thu Feb 19 2026 Vitaly Lipatov <lav@altlinux.ru> 3.64.51-alt1
 - epsonscan2: fix JSON item index after API response changed
 - epm checkpkg: fallback to digest-only check for packages from other distros

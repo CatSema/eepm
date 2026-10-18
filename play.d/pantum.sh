@@ -18,7 +18,14 @@ warn_version_is_not_supported
 # PKGURL="https://www.pantum.ru/wp-content/uploads/2024/06/pantum-ubuntu-driver-v1_1_106.zip"
 
 # 1.1.123
-PKGURL="https://www.pantum.ru/wp-content/uploads/2024/06/Pantum-Ubuntu-Driver-V1_1_123.zip"
+#PKGURL="https://www.pantum.ru/wp-content/uploads/2024/06/Pantum-Ubuntu-Driver-V1_1_123.zip"
+
+# 1.1.167 (requires User-Agent, doesn't work with wget directly)
+#PKGURL="https://drivers.pantum.com/userfiles/files/download/drive/2013/Pantum%20Linux%20Driver%20V1_1_167.zip"
+
+# 1.1.175
+# Despite the file name, the archive contains drivers for 300+ printer models.
+PKGURL="https://www.pantum.ru/wp-content/uploads/2026/02/pantum-cm2800-series-ubuntu-driver-v1_1_175-1.zip"
 
 #case $(epm print info -p) in
 #    *)
@@ -28,16 +35,6 @@ PKGURL="https://www.pantum.ru/wp-content/uploads/2024/06/Pantum-Ubuntu-Driver-V1
 #        #PKGURL="https://drivers.pantum.ru/userfiles/files/download/drive/4020/linux%E5%85%B6%E4%BB%96%E7%B3%BB%E7%BB%9F%EF%BC%88ru%EF%BC%89/pantum_1_1_101-1_amd64.zip"
 #        ;;
 #esac
-
-case $(epm print info -e) in
-    AstraLinuxSE/1.7*)
-        PKGURL="https://disk.astralinux.ru/s/EdEx4wNdtDpZaww/download/Pantum_Ubuntu_Driver_V1.1.5.tar.gz"
-        ;;
-#    Ubuntu/*)
-#        # 1.1.106
-#        PKGURL="https://drivers.pantum.ru/userfiles/files/download/drive/2013/0619/Pantum%20Ubuntu%20Driver%20V1_1_106(1).zip"
-#        ;;
-esac
 
 install_pack_pkgurl
 

@@ -19,6 +19,7 @@
 
 load_helper epm-packages
 load_helper epm-print
+load_helper epm-whatprovides
 
 # pkg suffix
 __print_with_arch_suffix()
@@ -202,11 +203,13 @@ __epm_query_file()
 }
 
 # hack: dpkg -W will print names for removed packages too (until newest Ubuntu)
+# dpkg -s succeeds for removed packages with config files and for a package
+# left in "not-installed" state after a failed install (eterbug #19294), so check the package state
 __epm_query_dpkg_check()
 {
     local i
     for i in $@ ; do
-        a='' dpkg -s $i >/dev/null 2>/dev/null || return
+        a='' dpkg-query -W -f='${Status}\n' -- $i 2>/dev/null | grep -qE " (installed|half-configured|unpacked|triggers-awaited|triggers-pending)$" || return
     done
     return 0
 }
@@ -348,10 +351,43 @@ __epm_query_shortname()
 # keep here, all modules and epm-query use is_installed from epm-query
 # see epm-installed
 
-# check if pkg is installed
-is_installed()
+# check if real (non-virtual) package is installed
+is_installed_real()
 {
     (quiet=1 __epm_query_name "$@") >/dev/null 2>/dev/null
+}
+
+is_installed()
+{
+    is_installed_real "$@"
+}
+
+# check if a virtual package has an installed provider (but not a real package itself)
+is_installed_virtual()
+{
+    is_installed_real "$@" && return 1
+    (quiet=1 __epm_whatprovides_installed "$@") >/dev/null 2>/dev/null
+}
+
+
+# resolve virtual package names to real installed package names (single provider only)
+resolve_virtual_packages()
+{
+    local i
+    for i in "$@" ; do
+        if ! is_installed_virtual "$i" ; then
+            echo "$i"
+            continue
+        fi
+        local providers
+        providers="$(short=1 __epm_whatprovides_installed "$i" 2>/dev/null)"
+        if [ "$(echo "$providers" | wc -l)" = "1" ] ; then
+            info 'Resolved virtual package $i to $providers'
+            echo "$providers"
+        else
+            echo "$i"
+        fi
+    done
 }
 
 filter_pkgnames_to_short()

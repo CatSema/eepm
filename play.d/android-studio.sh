@@ -8,11 +8,12 @@ URL="https://developer.android.com/studio"
 
 . $(dirname $0)/common.sh
 
-if [ "$VERSION" = "*" ] ; then
-    PKGURL="$(eget --list --latest "https://developer.android.com/studio" "$PKGNAME-$VERSION-linux.tar.gz")"
-else
-    PKGURL="https://redirector.gvt1.com/edgedl/android/studio/ide-zips/$VERSION/$PKGNAME-$VERSION-linux.tar.gz"
+PKGURL="$(eget --list --latest "https://developer.android.com/studio" "android-studio-*-linux.tar.gz")"
+[ -n "$PKGURL" ] || fatal "Can't get android-studio download URL from developer.android.com"
+
+# check that the scraped URL matches requested version; old versions are removed from the page
+if [ "$VERSION" != "*" ] && ! echo "$PKGURL" | grep -q "/ide-zips/$VERSION/" ; then
+    info "Note: requested android-studio version $VERSION is no longer available, using latest"
 fi
 
-install_pkgurl
-
+install_pack_pkgurl

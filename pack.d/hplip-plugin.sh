@@ -12,13 +12,14 @@ fi
 VERSION="$(echo "$TAR" | sed -e "s|.*hplip-\(.*\)-plugin.*|\1|")" #"
 
 if echo "$TAR" | grep -q "plugin_run\.zip$" ; then
-    erc $TAR || fatal
+    erc --here $TAR || fatal
     #TAR="hplip-$VERSION-plugin.run"
     TAR="$(echo "hplip*.run")"
 fi
 
 # https://aur.archlinux.org/cgit/aur.git/tree/PKGBUILD?h=hplip-plugin
-sh $TAR --target . --noexec --nox11 || exit
+# makeself archive extracts files into current directory (no subdirectory)
+erc --here unpack $TAR || exit
 
 case "$(epm print info -a)" in
     x86_64)

@@ -85,17 +85,19 @@ esac
 
     case $BASEDISTRNAME in
     "alt")
-        load_helper epm-query_package
-        if ! __epm_query_package kernel-image >/dev/null ; then
-            info "No installed kernel packages, skipping update"
-            return
-        fi
-        assure_exists update-kernel update-kernel 0.9.9
-        local update_kernel_cmd
-        update_kernel_cmd="update-kernel"
-        # pass temporary APT config to update-kernel (e.g. when installing from another branch)
-        [ -n "$__EPM_APT_TMPDIR" ] && update_kernel_cmd="env APT_CONFIG=$__EPM_APT_TMPDIR/apt.conf update-kernel"
-        sudocmd $update_kernel_cmd $dryrun $(subst_option non_interactive -y) $force $interactive $reinstall $verbose "$@" || return
+        # list kernels even without installed ones
+        case " $* " in
+            *" -l "*|*" --list "*|*" -h "*|*" --help "*)
+                ;;
+            *)
+                if ! a='' rpm -qa 'kernel-image-*' 2>/dev/null | grep -q . ; then
+                    info "No installed kernel packages, skipping update"
+                    return
+                fi
+                ;;
+        esac
+        load_helper epm-sh-altlinux-kernel
+        epm_alt_update_kernel "$@"
         return ;;
     esac
 

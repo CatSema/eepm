@@ -7,11 +7,19 @@ TPRODUCT="Telegram"
 
 . $(dirname $0)/common.sh
 
-erc $TAR || fatal
+erc --here $TAR || fatal
 
 # use version from tarball
 # (TODO: get basename via erc
-PKGNAME="$(basename $TAR .tar.xz | sed -e "s|^tsetup|$PRODUCT|" -e "s|\.\([0-9]\)|-\1|")"
+tarname="$(basename $TAR .tar.xz)"
+case "$tarname" in
+    tsetup.*)
+        PKGNAME="$(echo "$tarname" | sed -e "s|^tsetup|$PRODUCT|" -e "s|\.\([0-9]\)|-\1|")"
+        ;;
+    td-setup-linux-x64-*)
+        PKGNAME="$(echo "$tarname" | sed "s|^td-setup-linux-x64-|$PRODUCT-|")"
+        ;;
+esac
 #PKGNAME="$(basename $PKGNAME .zip | )"
 
 f=$FPRODUCT
@@ -50,13 +58,14 @@ cat <<EOF | create_file /usr/share/applications/$desktopname.desktop
 Version=1.0
 Name=Telegram Desktop
 Comment=Official desktop version of Telegram messaging app
-Exec=$PRODUCT -- %u
+Exec=telegram-desktop -- %u
 Icon=$iconname
 Type=Application
 Categories=Chat;Network;InstantMessaging;Qt;
 MimeType=x-scheme-handler/tg;
 Keywords=tg;chat;im;messaging;messenger;sms;tdesktop;
 X-GNOME-UsesNotifications=true
+StartupWMClass=TelegramDesktop
 EOF
 
 erc pack $PKGNAME.tar opt/$TPRODUCT usr

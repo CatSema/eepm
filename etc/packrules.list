@@ -1,5 +1,6 @@
 1c-connect 1C-Connect-Linux-x64.tar.gz
 davinci-resolve DaVinci_Resolve_*_Linux.run
+amnezia-vpn AmneziaVPN_*_linux_x64.run
 cascadeur cascadeur-linux.tgz
 # there are two package
 epsonscan2-non-free-plugin epsonscan2-bundle-*.tar.gz
@@ -20,3 +21,5 @@ kyodialog Linux_Universal_Driver.zip
 kodak-i11xx LinuxSoftware_i11xx_*.x86_64.deb.tar.gz
 kodak-i2000 LinuxSoftware_i2000_v*.x86_64.deb.tar.gz
 scanner-driver-avision scanner-driver-avision_rpm64_*.tar.gz
+cisco-secure-client-vpn cisco-secure-client-linux64-*-predeploy-deb-k9.tgz
+cisco-secure-client-vpn cisco-secure-client-linux64-*-predeploy-deb-k9.tar.gz

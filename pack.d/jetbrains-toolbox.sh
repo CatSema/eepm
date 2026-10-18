@@ -9,8 +9,8 @@ RETURNTARNAME="$2"
 PKGNAME="$(basename $TAR .tar.gz)"
 VERSION="$(echo $PKGNAME | sed -e 's/jetbrains-toolbox-//')"
 
-erc $TAR || fatal
-cd $PKGNAME* || fatal
+erc --here unpack $TAR || fatal
+cd "$PKGNAME" || fatal
 
 # create svg icon
 cat <<EOF > jetbrains-toolbox.svg
@@ -23,8 +23,9 @@ mv bin/* opt/jetbrains-toolbox/
 install -Dm644 opt/jetbrains-toolbox/jetbrains-toolbox.desktop usr/share/applications/jetbrains-toolbox.desktop
 install -Dm644 jetbrains-toolbox.svg usr/share/icons/hicolor/scalable/apps/jetbrains-toolbox.svg
 
-cat <<EOF >$PKGNAME.tar.eepm.yaml
+cat <<EOF >$PRODUCT-$VERSION.tar.eepm.yaml
 name: $PRODUCT
+version: $VERSION
 group: Development/C
 license: Proprietary
 url: https://www.jetbrains.com/ru-ru/toolbox-app/
@@ -32,6 +33,6 @@ summary: JetBrains Toolbox App
 description: JetBrains Toolbox App.
 EOF
 
-erc pack $PKGNAME-$VERSION.tar opt usr || fatal 
+erc pack $PRODUCT-$VERSION.tar opt usr || fatal
 
-return_tar $PKGNAME-$VERSION.tar
+return_tar $PRODUCT-$VERSION.tar

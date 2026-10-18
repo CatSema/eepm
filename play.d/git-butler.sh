@@ -8,19 +8,19 @@ URL="https://gitbutler.com/"
 
 . $(dirname $0)/common.sh
 
-if [ "$VERSION" = "*" ] ; then
-    # Get version and build number from AUR PKGBUILD
-    pkgbuild=$(eget -q -O- "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=gitbutler-bin")
-    VERSION=$(echo "$pkgbuild" | grep -oP '^pkgver=\K.*')
-    BUILD=$(echo "$pkgbuild" | grep -oP '^_pkgvernum=\K.*')
-    [ -n "$VERSION" ] && [ -n "$BUILD" ] || fatal "Can't get version"
-    VERSION="$VERSION-$BUILD"
+if [ "$VERSION" != "*" ] && echo "$VERSION" | grep -q '~' ; then
+    ver="${VERSION%~*}"
+    build="${VERSION#*~}"
+    build_version="$ver-$build"
+
+    PKGURL="https://releases.gitbutler.com/releases/release/$build_version/linux/x86_64/GitButler_${ver}_amd64.deb"
+
+    export EPM_REPACK_VERSION="$VERSION"
+    install_pkgurl
+    exit
 fi
 
-# VERSION format: 0.18.3-2698
-ver=$(echo "$VERSION" | cut -d- -f1)
-build=$(echo "$VERSION" | cut -d- -f2)
-
-PKGURL="https://releases.gitbutler.com/releases/release/$VERSION/linux/x86_64/GitButler_${ver}_amd64.deb"
+# Upstream rpm has an empty License tag and fails rpmbuild during repack.
+PKGURL="https://app.gitbutler.com/downloads/release/linux/x86_64/deb"
 
 install_pkgurl

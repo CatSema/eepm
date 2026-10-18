@@ -9,12 +9,11 @@ RETURNTARNAME="$2"
 BASENAME=$(basename $TAR .rpm)
 VERSION=$(echo $BASENAME | sed -e 's|Lexmark-UPD-PPD-Files-||' | sed -e 's|.x86_64||')
 
-erc unpack $TAR || fatal
+erc --here unpack $TAR || fatal
 
 # Install PPDs
 # PPD_ROOT="usr/share/ppd"
 PPD_ROOT="usr/share/cups/model"
-mkdir opt
 install -Dm644 -t "$PPD_ROOT/Lexmark_PPD/" usr/local/Lexmark/ppd/Lexmark-UPD-PPD-Files/GlobalPPD_1.4/*.ppd
 
 # Install filter scripts
@@ -32,6 +31,11 @@ rm -fr usr/local
 
 PKGNAME=$PRODUCT-$VERSION
 
-erc pack $PKGNAME.tar usr opt || fatal
+erc pack $PKGNAME.tar usr || fatal
+
+cat <<EOF >$PKGNAME.tar.eepm.yaml
+name: $PRODUCT
+version: $VERSION
+EOF
 
 return_tar $PKGNAME.tar

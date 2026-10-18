@@ -92,13 +92,21 @@ epm_print_install_names_command()
     # check for pkg_files to support print out command without pkg names in args
     #[ -z "$1" ] && [ -n "$pkg_files" ] && return
     [ -z "$1" ] && return
+
+    if [ -n "$norecommends" ] ; then
+        APTOPTIONS="$APTOPTIONS -o APT::Install-Recommends=false"
+        YUMOPTIONS="$YUMOPTIONS --setopt=install_weak_deps=0"
+        URPMOPTIONS="$URPMOPTIONS --no-suggests"
+        ZYPPEROPTIONS="$ZYPPEROPTIONS --no-recommends"
+    fi
+
     case $PMTYPE in
         apt-rpm)
             echo "apt-get -y --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true $APTOPTIONS install $*"
             return ;;
         apt-dpkg)
             # this command  not for complex use. ACCEPT_EULA=y DEBIAN_FRONTEND=noninteractive
-            echo "apt-get -y --force-yes -o APT::Install::VirtualVersion=true -o APT::Install::Virtual=true $APTOPTIONS install $*"
+            echo "apt-get -y --allow-unauthenticated --allow-downgrades --allow-change-held-packages $APTOPTIONS install $*"
             return ;;
         apm-rpm)
             echo "apm system install $*"
@@ -110,7 +118,7 @@ epm_print_install_names_command()
             echo "yum -y $YUMOPTIONS install $*"
             return ;;
         dnf-rpm|dnf5-rpm)
-            echo "dnf install -y $YUMOPTIONS --allowerasing  $*"
+            echo "$DNFCMD install -y $YUMOPTIONS --allowerasing $*"
             return ;;
         urpm-rpm)
             echo "urpmi --auto $URPMOPTIONS $*"

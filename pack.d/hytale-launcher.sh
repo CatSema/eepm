@@ -7,12 +7,16 @@ VERSION="$3"
 
 . $(dirname $0)/common.sh
 
-mkdir -p opt/$PRODUCT
 mkdir -p usr/
 
-erc unpack $TAR || fatal
-
-mv $PRODUCT opt/$PRODUCT
+if [ "$(head -c 13 "$TAR")" = "HYTALE-UPDATE" ] ; then
+    payload_size="$(od -An -tx1 -j24 -N8 "$TAR" | tr -d ' \n')"
+    [ -n "$payload_size" ] || fatal "Can't get payload size from $TAR"
+    tail -c "$((0x$payload_size))" "$TAR" > payload.zip || fatal
+    erc -C opt/$PRODUCT unpack payload.zip || fatal
+else
+    erc -C opt/$PRODUCT unpack "$TAR" || fatal
+fi
 
 install_file https://aur.archlinux.org/cgit/aur.git/plain/com.hypixel.HytaleLauncher.png?h=hytale-launcher-bin /usr/share/pixmaps/$PRODUCT.png
 

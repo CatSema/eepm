@@ -10,12 +10,18 @@ PKG="$4"
 
 . $(dirname $0)/common.sh
 
+# warn early if any binary is UPX-packed (defeats the soname autodetection below)
+warn_upx_binaries
+
 # add libs requires (after all ignore_lib_requires calls)
 add_libs_requires
 
 # remove temp files
 rm -f "$BUILDROOT/.eepm_ignore_lib_requires"
+rm -f "$BUILDROOT/.eepm_ignore_lib_path"
 rm -f "$BUILDROOT/.eepm_stop_libs_requires"
+rm -f "$BUILDROOT/.eepm_filter_python_requires"
+rm -f "$BUILDROOT/.eepm_stop_python_requires"
 
 # remove forbidden paths owned by the filesystem package to avoid conflicts
 # https://bugzilla.altlinux.org/show_bug.cgi?id=38842
@@ -72,6 +78,18 @@ for DESKTOPFILE in $BUILDROOT/usr/share/applications/*.desktop ; do
 
     desktopfile="$(basename "$DESKTOPFILE" .desktop)"
     ICON="$(get_desktop_value "$DESKTOPFILE" "Icon")"
+
+    # rename generic icon.png to product name to avoid conflicts between packages
+    if [ -f "$BUILDROOT/usr/share/pixmaps/icon.png" ] ; then
+        if [ -z "$ICON" ] || [ "$ICON" = "icon" ] || [ "$ICON" = "icon.png" ] ; then
+            newicon="$PRODUCT"
+            mv "$BUILDROOT/usr/share/pixmaps/icon.png" "$BUILDROOT/usr/share/pixmaps/$newicon.png"
+            subst "s|/usr/share/pixmaps/icon\.png|/usr/share/pixmaps/$newicon.png|" $SPEC
+            subst "s|^Icon=.*|Icon=$newicon|" "$DESKTOPFILE"
+            ICON="$newicon"
+        fi
+    fi
+
     if [ "$ICON" != "$desktopfile" ] ; then
         warning "Icon '$ICON' from desktop file $DESKTOPFILE is not the same as desktop file name."
     fi

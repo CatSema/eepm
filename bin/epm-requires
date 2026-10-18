@@ -25,6 +25,12 @@ __epm_filter_out_base_alt_reqs()
     grep -E -v "(^rpmlib\(|^/bin/sh|^/bin/bash|^rtld\(GNU_HASH\)|ld-linux)" | grep -E -v " or " | sed -e 's/\(\.so[.0-9]*\)([^)]\+)/\1()/g' | sort -u
 }
 
+# filter to get only package-name requires suitable for Debian Depends
+__epm_filter_debian_reqs()
+{
+    grep -v '^lib' | grep -v '^rpmlib(' | grep -v '^/' | sed -e 's| .*||' | sort -u | tr '\n' ', ' | sed -e 's/,$//' -e 's/^,//'
+}
+
 __epm_alt_rpm_requires()
 {
     if [ -n "$short" ] ; then
@@ -37,7 +43,7 @@ __epm_alt_rpm_requires()
 
 get_linked_shared_libs()
 {
-    assure_exists readelf binutils
+    assure_exists readelf binutils >&2
     #is_command readelf || fatal "Can't get required shared library: readelf is missed. Try install binutils package."
     #ldd "$exe" | sed -e 's|[[:space:]]*||' | grep "^lib.*[[:space:]]=>[[:space:]]\(/usr/lib\|/lib\)" | sed -e 's|[[:space:]].*||'
     LC_ALL=C a="" readelf -d "$1" | grep "(NEEDED)" | grep "Shared library:" | sed -e 's|.*Shared library: \[||' -e 's|\]$||' | grep "^lib"
@@ -173,9 +179,21 @@ case $PMTYPE in
         ;;
     dnf-rpm|dnf5-rpm)
         if is_installed $pkg_names ; then
+            if [ "$BASEDISTRNAME" = "alt" ] ; then
+                __epm_alt_rpm_requires $pkg_names
+                return
+            fi
             CMD="rpm -q --requires"
         else
-            CMD="dnf repoquery --requires"
+            CMD="$DNFCMD repoquery --requires"
+            if [ "$BASEDISTRNAME" = "alt" ] ; then
+                if [ -n "$short" ] ; then
+                    docmd $CMD $pkg_names | __epm_filter_out_base_alt_reqs | sed -e "s| .*||"
+                else
+                    docmd $CMD $pkg_names | __epm_filter_out_base_alt_reqs
+                fi
+                return
+            fi
         fi
         ;;
     pacman)
@@ -247,7 +265,11 @@ epm_requires()
 
     [ -n "$pkg_filenames" ] || fatal "Requires: package name is missed"
 
-    epm_requires_files $pkg_files
-    # shellcheck disable=SC2046
-    epm_requires_names $(print_name $pkg_names)
+    if [ -n "$debian" ] ; then
+        ( epm_requires_files $pkg_files ; epm_requires_names $(print_name $pkg_names) ) | __epm_filter_debian_reqs
+    else
+        epm_requires_files $pkg_files
+        # shellcheck disable=SC2046
+        epm_requires_names $(print_name $pkg_names)
+    fi
 }

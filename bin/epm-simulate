@@ -61,8 +61,8 @@ _epm_do_simulate()
 
     case $PMTYPE in
         apt-rpm|apt-dpkg)
-            CMD="apt-get --simulate install"
-            ;;
+            dryrun=--dry-run __epm_apt_install "$@"
+            return $? ;;
         aptitude-dpkg)
             CMD="aptitude -s install"
             ;;
@@ -82,7 +82,7 @@ EOF
             return $RES ;;
         dnf-rpm|dnf5-rpm)
             set_sudo
-            store_output sudocmd dnf --assumeno install $filenames
+            store_output sudocmd $DNFCMD --assumeno install $filenames
             __check_yum_result $RC_STDOUT $?
             RES=$?
             clean_store_output
@@ -112,8 +112,8 @@ EOF
             done
             return $res ;;
         opkg)
-            docmd --noaction install $filenames
-            return $res ;;
+            docmd opkg --noaction install $filenames
+            return $? ;;
         pacman)
             set_sudo
             store_output sudocmd pacman -v -S $filenames <<EOF
@@ -168,4 +168,3 @@ epm_simulate()
     fi
     return $RES
 }
-

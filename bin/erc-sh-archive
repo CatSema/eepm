@@ -24,32 +24,46 @@ have_patool()
 	[ -n "$use_patool" ] || is_command patool
 }
 
+# Resolve HAVE_7Z to an actually installed 7-zip binary. Returns 1 if none found.
+resolve_7z()
+{
+	is_command $HAVE_7Z && return 0
+	# p7zip (deprecated, does not preserve permissions)
+	is_command 7z && { HAVE_7Z='7z' ; return 0 ; }
+	# reduced p7-zip
+	is_command 7zr && { HAVE_7Z='7zr' ; return 0 ; }
+	# 7-zip Standalone/Alternative
+	is_command 7za && { HAVE_7Z='7za' ; return 0 ; }
+	return 1
+}
+
+# Ensure a 7-zip backend is available. Used by operations patool can't handle
+# (exe/dll/squashfs/...): with patool backend HAVE_7Z is not validated upfront.
+assure_7z()
+{
+	[ -n "$HAVE_7Z" ] || fatal "Could not find 7-zip backend, required for this archive type. Please install p7zip package and retry."
+}
+
 set_backend()
 {
-	HAVE_7Z='7z'
+	# prefer 7zz (official 7-Zip) over 7z (p7zip, deprecated since 2021)
+	HAVE_7Z='7zz'
 
 	[ "$ERC_BACKEND" = "patool" ] && use_patool=1
 	[ "$ERC_BACKEND" = "7z" ] && use_7z=1
 
 	[ -n "$use_patool" ] && [ -n "$use_7z" ] && fatal "Don't use --use-7z and --use-patool simulateously."
 
+	# Resolve HAVE_7Z to a real binary (empty if none). Needed even with patool
+	# backend, since some types are handled only by 7z (see assure_7z).
+	resolve_7z || HAVE_7Z=''
+
 	if [ -n "$use_7z" ] || ! have_patool ; then
 		# TODO: try install patool and p7zip
-		if ! is_command $HAVE_7Z ; then
-			# 7-zip
-			is_command 7zz && HAVE_7Z='7zz'
-		fi
-		if ! is_command $HAVE_7Z ; then
-			# reduced p7-zip
-			is_command 7zr && HAVE_7Z='7zr'
-		fi
-		if ! is_command $HAVE_7Z ; then
-			# 7-zip Standalone/Alternative
-			is_command 7za && HAVE_7Z='7za'
-		fi
-		is_command $HAVE_7Z || fatal "Could not find any patool or 7-zip backend. Please install p7zip package and retry."
+		[ -n "$HAVE_7Z" ] || fatal "Could not find any patool or 7-zip backend. Please install p7zip package and retry."
 	fi
-	[ -z "$force" ] || HAVE_7Z="$HAVE_7Z -y"
+	# note: -y is passed explicitly in extract commands, not here
+	[ -n "$quiet" ] && [ -n "$HAVE_7Z" ] && HAVE_7Z="$HAVE_7Z -bb0 -bd -bso0"
 }
 
 
@@ -79,10 +93,12 @@ zst
 zstd
 exe
 dll
+run
 AppImage
 appimage
 squashfs
 snap
+flatpak
 EOF
 }
 
@@ -131,7 +147,7 @@ get_archive_name()
 	local ext
 	ext=$(get_archive_ext "$1")
 	if [ -n "$ext" ] ; then
-		echo $(dirname "$1")/$(basename "$1" .$ext)
+		basename "$1" .$ext
 	else
 		echo "$1"
 		return 1
@@ -155,6 +171,22 @@ get_archive_type()
 	return 1
 }
 
+# Extract tar from stdin
+extract_tar_stdin() {
+    if is_command tar ; then
+        docmd tar -xhf -
+    else
+        docmd $HAVE_7Z x -y -si -ttar
+    fi
+}
+
+# Decompress a tar.* archive with 7z and pipe the tar into tar/7z.
+# Used as a fallback when the native (de)compressor is not installed.
+extract_7z_stream() {
+    local archive="$1"
+    docmd $HAVE_7Z x -so "$archive" | extract_tar_stdin
+}
+
 extract_command() {
     local cmd="$1"
     local archive="$2"
@@ -162,7 +194,7 @@ extract_command() {
     if is_command tar; then
         docmd $cmd "$archive"
     else
-        docmd $HAVE_7Z x -so "$archive" | docmd $HAVE_7Z x -y -si -ttar
+        extract_7z_stream "$archive"
     fi
 }
 

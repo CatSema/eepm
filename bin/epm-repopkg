@@ -76,8 +76,9 @@ __epm_repo_pkgdel_alt()
             local rd="$REPO_DIR/$arch/RPMS.$REPO_NAME"
             [ -d $REPO_DIR/$arch/RPMS.$REPO_NAME ] || continue
             for i in $rd/$1* ; do
+                [ -e "$i" ] || continue
                 [ "$1" = "$(epm print name for package $i)" ] || continue
-                rm -v $rd/$1*
+                rm -v "$i"
             done
         done
         shift
@@ -86,25 +87,139 @@ __epm_repo_pkgdel_alt()
 }
 
 
+# rpm-md repo is a flat dir with rpm packages
+__epm_repo_pkgadd_rpmmd()
+{
+    local REPO_DIR="$1"
+    shift
+    [ -d "$REPO_DIR" ] || fatal 'Can'\''t find repo dir $REPO_DIR.'
+    [ -n "$1" ] || fatal "Missed package name"
+    while [ -s "$1" ] ; do
+        cp -v "$1" "$REPO_DIR/" || fatal
+        shift
+    done
+}
+
+__epm_repo_pkgdel_rpmmd()
+{
+    local REPO_DIR="$1"
+    shift
+    [ -d "$REPO_DIR" ] || fatal 'Can'\''t find repo dir $REPO_DIR.'
+    [ -n "$1" ] || fatal "Missed package name"
+    local i
+    while [ -n "$1" ] ; do
+        for i in "$REPO_DIR"/$1*.rpm ; do
+            [ -e "$i" ] || continue
+            [ "$1" = "$(epm print name for package "$i")" ] || continue
+            rm -v "$i"
+        done
+        shift
+    done
+}
+
 __epm_repo_pkgupdate_alt()
 {
+    local __repo_kind="${__repo_kind:-alt}"
     local dir="$1"
     shift
-    for i in "$@" ; do
-        pkg="$(epm print name for package $i)" || fatal
-        __epm_repo_pkgdel_alt "$dir" $pkg
+    # A task or a wildcard can contain several versions of the same package.
+    # Keep only the newest EVR for each name/architecture pair.
+    local selected_dir candidate candidate_name candidate_arch candidate_epoch candidate_evr
+    local selected_file selected_evr selected_package comparison
+    selected_dir="$(mktemp -d)" || fatal "Cannot create temp directory"
+
+    for candidate in "$@" ; do
+        candidate_name="$(epm print name for package "$candidate")" || fatal
+        candidate_arch="$(epm print arch for package "$candidate")" || fatal
+        candidate_epoch="$(epm print field epoch for package "$candidate")" || fatal
+        [ "$candidate_epoch" = "(none)" ] && candidate_epoch=0
+        candidate_evr="$candidate_epoch:$(epm print version-release for package "$candidate")" || fatal
+        selected_file="$selected_dir/$candidate_name.$candidate_arch"
+
+        if [ -s "$selected_file" ] ; then
+            selected_evr="$(sed -n '1p' "$selected_file")"
+            comparison="$(epm print compare version "$selected_evr" "$candidate_evr")" || fatal
+            [ "$comparison" -ge 0 ] && continue
+        fi
+        printf '%s\n%s\n' "$candidate_evr" "$candidate" > "$selected_file"
     done
-    __epm_repo_pkgadd_alt "$dir" "$@"
+
+    for selected_file in "$selected_dir"/* ; do
+        [ -s "$selected_file" ] || continue
+        selected_package="$(sed -n '2p' "$selected_file")"
+        candidate_name="$(epm print name for package "$selected_package")" || fatal
+        __epm_repo_pkgdel_$__repo_kind "$dir" "$candidate_name"
+        __epm_repo_pkgadd_$__repo_kind "$dir" "$selected_package"
+    done
+    rm -rf "$selected_dir"
 }
 
 
+
+__download_task_rpms()
+{
+    local tmpdir="$1"
+    shift
+
+    local arg task pkg_filter
+    for arg in "$@" ; do
+        task="$(get_tasknumber_from_arg "$arg")"
+        pkg_filter="$(get_pkgname_from_taskarg "$arg")"
+        [ -n "$task" ] || continue
+
+        get_task_status "$task" || continue
+
+        local plan
+        plan="$(fetch_url $ALTTASKURL/$task/plan/add-bin)" || continue
+
+        echo "$plan" | grep -E "	($DISTRARCH|noarch)	" | while IFS='	' read -r pname pver parch pfile ppath prest ; do
+            [ -n "$pkg_filter" ] && [ "$pname" != "$pkg_filter" ] && continue
+            docmd eget -O "$tmpdir/$pfile" "$ALTTASKURL/$task/$ppath" || warning "Failed to download $pfile"
+        done
+    done
+}
+
+__epm_repo_pkgadd_from_task()
+{
+    local dir="$1"
+    shift
+
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal "Cannot create temp directory"
+    __download_task_rpms "$tmpdir" "$@"
+    # check if any RPMs were downloaded
+    set +f
+    local rpms
+    rpms=$(echo "$tmpdir"/*.rpm)
+    if [ "$rpms" = "$tmpdir/*.rpm" ] ; then
+        rm -rf "$tmpdir"
+        fatal "No packages downloaded from task(s)"
+    fi
+    __epm_repo_pkgadd_${__repo_kind:-alt} "$dir" $tmpdir/*.rpm
+    rm -rf "$tmpdir"
+}
 
 epm_repo_pkgadd()
 {
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        __epm_repo_pkgadd_alt "$@"
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __epm_repo_pkgadd_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgadd_alt "$dir" "$@"
+        fi
+        ;;
+    dnf-rpm|dnf5-rpm)
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __repo_kind=rpmmd __epm_repo_pkgadd_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgadd_rpmmd "$dir" "$@"
+        fi
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgadd()'
@@ -114,12 +229,47 @@ esac
 }
 
 
+__epm_repo_pkgupdate_from_task()
+{
+    local dir="$1"
+    shift
+
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal "Cannot create temp directory"
+    __download_task_rpms "$tmpdir" "$@"
+    # check if any RPMs were downloaded
+    set +f
+    local rpms
+    rpms=$(echo "$tmpdir"/*.rpm)
+    if [ "$rpms" = "$tmpdir/*.rpm" ] ; then
+        rm -rf "$tmpdir"
+        fatal "No packages downloaded from task(s)"
+    fi
+    __epm_repo_pkgupdate_alt "$dir" $tmpdir/*.rpm
+    rm -rf "$tmpdir"
+}
+
 epm_repo_pkgupdate()
 {
 
 case $PMTYPE in
     apt-rpm|apm-rpm)
-        __epm_repo_pkgupdate_alt "$@"
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __epm_repo_pkgupdate_from_task "$dir" "$@"
+        else
+            __epm_repo_pkgupdate_alt "$dir" "$@"
+        fi
+        ;;
+    dnf-rpm|dnf5-rpm)
+        local dir="$1"
+        shift
+        if is_taskarg "$@" ; then
+            __repo_kind=rpmmd __epm_repo_pkgupdate_from_task "$dir" "$@"
+        else
+            __repo_kind=rpmmd __epm_repo_pkgupdate_alt "$dir" "$@"
+        fi
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgupdate()'
@@ -135,6 +285,9 @@ epm_repo_pkgdel()
 case $PMTYPE in
     apt-rpm|apm-rpm)
         __epm_repo_pkgdel_alt "$@"
+        ;;
+    dnf-rpm|dnf5-rpm)
+        __epm_repo_pkgdel_rpmmd "$@"
         ;;
     *)
         fatal 'Have no suitable command for $PMTYPE in epm_repo_pkgdel()'

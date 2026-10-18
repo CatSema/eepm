@@ -9,11 +9,7 @@ if ! echo "$TAR" | grep -q "scanner-driver-avision.*.tar.gz.*" ; then
     fatal "Unknown file $TAR"
 fi
 
-erc $TAR || fatal
-
-#rm $TAR
-
-cd scanner-driver-avision* || fatal
+erc --here $TAR || fatal
 
 PKG="scanner-driver-avision-*.x86_64.rpm"
 

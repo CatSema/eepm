@@ -202,7 +202,7 @@ filter_glob()
 {
 	[ -z "$1" ] && cat && return
 	# translate glob to regexp
-	grep "$(echo "$1" | sed -e 's|\.|\\.|g' -e 's|\*|.*|g' -e 's|\?|.|g' )$"
+	grep "$(echo "$1" | sed -e 's|\.|\\.|g' -e 's|\*|.*|g' )$"
 }
 
 filter_order()
@@ -257,6 +257,14 @@ is_strange_url()
     return 1
 }
 
+# A downloaded package/binary is never HTML. If we got an HTML page the server
+# most likely redirected to a landing/error page - reject it and do not cache.
+is_html_file()
+{
+    LANG=C head -c 1024 "$1" 2>/dev/null \
+        | grep -qiE '<!doctype html|<html[ >]|<head[ >]'
+}
+
 is_ipfs_hash()
 {
     # CIDv0: starts with Qm, 46 chars, alphanumeric only
@@ -294,8 +302,8 @@ is_rsyncurl()
 # SSH/rsync URL: user@host:/path or host:/path (but not scheme://)
 is_sshurl()
 {
-    # Exclude scheme:// first, then match host:path
-    case "$1" in *://*) return 1 ;; *:*) return 0 ;; esac
+    # Exclude scheme:// and scheme:/ first, then match host:path
+    case "$1" in *://*) return 1 ;; *:/*) return 1 ;; *:*) return 0 ;; esac
     return 1
 }
 
@@ -328,6 +336,7 @@ __calc_avg_filtered()
     # Calculate mean and standard deviation, filter outliers, return average
     echo "$values" | awk '{
         n = NF
+        if (n == 0) { print "0"; exit }
         sum = 0
         for (i = 1; i <= n; i++) sum += $i
         avg = sum / n
@@ -350,6 +359,19 @@ __calc_avg_filtered()
     }'
 }
 
+# Get current time in nanoseconds (integer) for precise timing
+# Falls back to seconds if %N is not supported (BusyBox)
+__get_time_ns()
+{
+    local t
+    t=$(date +%s%N 2>/dev/null)
+    # If %N not supported, date outputs literal 'N' — fall back to seconds
+    case "$t" in
+        *N*) echo "$(date +%s)000000000" ;;
+        *) echo "$t" ;;
+    esac
+}
+
 # Single speedtest measurement with timeout (returns speed in MB/s)
 # Downloads to temp file using eget, counts bytes with pv or wc -c
 # Args: URL [timeout] [total_size]
@@ -359,25 +381,28 @@ __speedtest_single()
     local timeout="${2:-3}"
     local total_size="$3"
     local tmpfile start_time end_time size
+    local maxsize_opt=""
+
+    [ "$MAXSIZE_VALUE" ] && maxsize_opt="--max-size $MAXSIZE_VALUE"
 
     tmpfile=$(mktemp)
-    start_time=$(date +%s.%N)
+    start_time=$(__get_time_ns)
     if [ -n "$verbose" ] && which pv >/dev/null 2>&1 ; then
         # pv shows progress to stderr (-s for total size if known)
         local pv_opts="-f"
         [ -n "$total_size" ] && pv_opts="$pv_opts -s $total_size"
-        timeout "$timeout" eget -q -O - "$URL" 2>/dev/null | pv $pv_opts > "$tmpfile" || true
+        eget -q --read-timeout "$timeout" $maxsize_opt -O - "$URL" 2>/dev/null | pv $pv_opts > "$tmpfile" || true
     else
-        timeout "$timeout" eget -q --force -O "$tmpfile" "$URL" 2>/dev/null || true
+        eget -q --force --read-timeout "$timeout" $maxsize_opt -O "$tmpfile" "$URL" 2>/dev/null || true
     fi
-    end_time=$(date +%s.%N)
+    end_time=$(__get_time_ns)
     size=$(wc -c < "$tmpfile")
     rm -f "$tmpfile"
 
-    # Calculate speed: size / time in MB/s
+    # Calculate speed: size / time_ns in MB/s
     echo "$size $start_time $end_time" | awk '{
-        time = $3 - $2
-        if (time > 0) printf "%.2f", ($1 / time) / 1024 / 1024
+        time_ns = $3 - $2
+        if (time_ns > 0) printf "%.2f", ($1 / (time_ns / 1000000000)) / 1024 / 1024
         else print "0"
     }'
 }
@@ -428,6 +453,7 @@ USERAGENT=''
 HEADER_VALUE=''
 TIMEOUT_VALUE=''
 READTIMEOUT_VALUE=''
+MAXSIZE_VALUE=''
 TRIES_VALUE=''
 COOKIES_FILE=''
 USEOUTPUTDIR=''
@@ -475,8 +501,18 @@ eget_help()
 {
 cat <<EOF
 
-eget - wget like downloader wrapper with wildcard support in filename part of URL
-Usage: eget [options] http://somesite.ru/dir/na*.log
+eget - wget like downloader wrapper with wildcard (*) support in filename part of URL
+
+Usage modes:
+  eget [options] URL                      - download a single file by direct URL
+  eget [options] URL URL2 URL3            - download multiple files
+  eget [options] "http://site/dir/*.rpm"  - wildcard in URL: the URL is split into
+                                  directory + mask, the directory listing page is fetched
+                                  and files matching the mask are downloaded
+  eget [options] http://site/page "*.rpm" - page search: eget fetches any page HTML,
+                                  extracts all links (<a href=...>) and downloads those
+                                  matching the mask (works on any page with links, not
+                                  just directory listings, e.g. release pages)
 
 Options:
     -q|--quiet                - quiet mode
@@ -499,17 +535,21 @@ Options:
     --force|--allow-overwrite - force overwrite existing file
     -N|--timestamping         - only download if remote file is newer than local
     -i|--input-file FILE      - read URLs from FILE, one per line; each line can contain multiple mirror URLs (use - for stdin)
-    -T|--timeout=N            - set  the network timeout to N seconds
-    --read-timeout=N          - set the read (and write) timeout to N seconds
+    -T|--timeout=N            - set the connection timeout to N seconds
+    --read-timeout|--max-time=N - set the read/total timeout to N seconds
+    --max-size=N              - limit download size to N bytes (Range header or curl --max-filesize)
     --retry-connrefused       - consider “connection refused” a transient error and try again
     -t|--tries                - set number of tries to number. Specify 0 or ‘inf’ for infinite retrying
     --load-cookies file       - load cookies from file before the first HTTP retrieval
+
+EGET specific options:
     --latest                  - print only latest version of a file
     --second-latest           - print only second to latest version of a file
     --allow-mirrors           - try mirrors from EGET_MIRRORS if url is not accessible
     --trust-server-names      - use the name specified by the redirection
-
     --list|--list-only        - print only URLs
+
+Commands:
     --check-url URL           - check if the URL exists (returns HTTP 200 OK)
     --check-site URL          - check if the site is accessible (returns HTTP 200 OK or 404 Not found)
     --get-response URL        - get response with all headers (ever if HEAD is not acceptable)
@@ -517,6 +557,9 @@ Options:
     --get-filesize URL        - print file size in bytes (via Content-Length)
     --get-real-url URL        - print URL after all redirects
     --get-ipfs-cid URL        - print CID for URL (after all redirects)
+    --speedtest URL           - measure download speed for the URL
+    --tsv                     - output --speedtest results in TSV format
+    --measurements N       - number of measurements for --speedtest (default: 3)
 
 Supported URLs:
   ftp:// http:// https:// file:/ ipfs:// rsync:// [user@]host:/path
@@ -524,13 +567,20 @@ Supported URLs:
 Supported backends (set like EGET_BACKEND=curl)
   wget, curl and partially aria2c, axel, rsync
 
-Also you can set EGET_OPTIONS variable with needed options
-Set EGET_MIRRORS to override default mirrors for --allow-mirrors (default: eterfund mirrors)
+Environment variables:
+  EGET_BACKEND              - force specific backend (wget, wget2, curl, aria2c, axel)
+  EGET_OPTIONS              - extra options applied after command line args
+  EGET_MIRRORS              - override default mirrors for --allow-mirrors
+  EGET_WGET_OPTIONS         - extra options passed to wget
+  EGET_CURL_OPTIONS         - extra options passed to curl
+  EGET_ARIA2_OPTIONS        - extra options passed to aria2c
+  EGET_AXEL_OPTIONS         - extra options passed to axel
 
 Examples:
   $ eget http://ftp.somesite.ru/package-*.x64.tar
   $ eget http://ftp.somesite.ru/package *.tar
   $ eget https://github.com/owner/project package*.ext
+  $ eget https://disk.yandex.ru/d/HASH
   $ eget -O myname ipfs://QmVRUjnsnxHWkjq91KreCpUk4D9oZEbMwNQ3rzdjwND5dR
   $ eget --list http://ftp.somesite.ru/package-*.tar
   $ eget --check-url http://ftp.somesite.ru/test
@@ -542,7 +592,7 @@ EOF
 
 
 if [ -z "$1" ] ; then
-    echo "eget - wget like downloader wrapper with wildcard support, uses wget or curl as backend" >&2
+    echo "eget - wget like downloader wrapper with wildcard (*) support, uses wget or curl as backend" >&2
     echo "Run $0 --help to get help" >&2
     exit 1
 fi
@@ -641,6 +691,15 @@ while [ -n "$1" ] ; do
         --speedtest)
             SPEEDTEST="$1"
             ;;
+        --measurements)
+            if [ -z "$argvalue" ];then
+                shift
+                argvalue="$1"
+            fi
+            [ -z "$argvalue" ] && fatal "Error: --measurements requires an argument"
+            ! is_numeric "$argvalue" && fatal "Error: --measurements requires a numeric value, got '$argvalue'"
+            SPEEDTEST_COUNT="$argvalue"
+            ;;
         --tsv)
             TSV="$1"
             ;;
@@ -695,7 +754,7 @@ while [ -n "$1" ] ; do
             ! is_numeric "$argvalue" && fatal "Error: --timeout requires a numeric value, got '$argvalue'"
             TIMEOUT_VALUE="$argvalue"
             ;;
-        --read-timeout)
+        --read-timeout|--max-time)
             if [ -z "$argvalue" ];then
                 shift
                 argvalue="$1"
@@ -703,6 +762,15 @@ while [ -n "$1" ] ; do
             [ -z "$argvalue" ] && fatal "Error: --read-timeout requires an argument"
             ! is_numeric "$argvalue" && fatal "Error: --read-timeout requires a numeric value, got '$argvalue'"
             READTIMEOUT_VALUE="$argvalue"
+            ;;
+        --max-size)
+            if [ -z "$argvalue" ];then
+                shift
+                argvalue="$1"
+            fi
+            [ -z "$argvalue" ] && fatal "Error: --max-size requires an argument"
+            ! is_numeric "$argvalue" && fatal "Error: --max-size requires a numeric value (bytes), got '$argvalue'"
+            MAXSIZE_VALUE="$argvalue"
             ;;
         --retry-connrefused)
             retryconnrefused=1
@@ -871,12 +939,38 @@ select_ipfs_mode()
 
 
 # Functions for work with eget ipfs db
+
+# tac all IPFS DB files (last file first, so most recent entries come first)
+__eget_ipfs_db_tac()
+{
+	local f files=""
+	local IFS=': '
+	for f in $EGET_IPFS_DB ; do
+		[ -r "$f" ] && files="$f $files"
+	done
+	IFS=' '
+	for f in $files ; do
+		tac "$f"
+	done
+}
+
+# get last IPFS DB file (for writing)
+__eget_ipfs_db_last()
+{
+	local f last
+	local IFS=': '
+	for f in $EGET_IPFS_DB ; do
+		[ -n "$f" ] && last="$f"
+	done
+	echo "$last"
+}
+
 get_cid_by_url()
 {
     local URL="$1"
-    [ -r "$EGET_IPFS_DB" ] || return
+    [ -n "$EGET_IPFS_DB" ] || return
     is_fileurl "$URL" && return 1
-    tac "$EGET_IPFS_DB" | grep -F "$URL Qm" | cut -f2 -d" " | grep -E "Qm[[:alnum:]]{44}" | head -n1
+    __eget_ipfs_db_tac | grep -F "$URL Qm" | cut -f2 -d" " | grep -E "Qm[[:alnum:]]{44}" | head -n1
 }
 
 put_cid_and_url()
@@ -884,35 +978,40 @@ put_cid_and_url()
     local URL="$1"
     local CID="$2"
     local FN="$3"
-    [ -w "$EGET_IPFS_DB" ] || return
+    local DBFILE
+    DBFILE="$(__eget_ipfs_db_last)"
+    [ -w "$DBFILE" ] || return
 
     is_fileurl "$URL" && return
 
-    local ac="$(get_url_by_cid)"
+    local ac="$(get_url_by_cid "$CID")"
     if [ "$ac" = "$URL" ] ; then
         info "CID $CID is already exist as the same URL $URL in IPFS DB, skipping"
         return
     fi
-    echo "$URL $CID $FN" >> "$EGET_IPFS_DB"
-    info "Placed in $EGET_IPFS_DB: $URL $CID $FN"
+    echo "$URL $CID $FN" >> "$DBFILE"
+    info "Placed in $DBFILE: $URL $CID $FN"
 }
 
 get_filename_by_cid()
 {
     local CID="$1"
     [ -z "$EGET_IPFS_DB" ] && basename "$CID" && return
-    tac "$EGET_IPFS_DB" | grep -F " $CID " | head -n1 | cut -f3 -d" "
+    __eget_ipfs_db_tac | grep -F " $CID " | head -n1 | cut -f3 -d" "
 }
 
 get_url_by_cid()
 {
     local CID="$1"
+    [ -z "$CID" ] && fatal "get_url_by_cid: CID is empty"
     [ -z "$EGET_IPFS_DB" ] && echo "$CID" && return
-    tac "$EGET_IPFS_DB" | grep -F " $CID " | head -n1 | cut -f1 -d" "
+    __eget_ipfs_db_tac | grep -F " $CID " | head -n1 | cut -f1 -d" "
 }
 
 ###################
 
+# Save original backend before IPFS autodetection may call eget() recursively
+ORIG_EGET_BACKEND="$EGET_BACKEND"
 
 ipfs_mode="$EGET_IPFS"
 
@@ -926,10 +1025,11 @@ fi
 
 
 if [ -n "$ipfs_mode" ] && [ -n "$EGET_IPFS_DB" ] ; then
-    ddb="$(dirname "$EGET_IPFS_DB")"
+    DBFILE="$(__eget_ipfs_db_last)"
+    ddb="$(dirname "$DBFILE")"
     if [ -d "$ddb" ] ; then
         info "Using eget IPFS db $EGET_IPFS_DB"
-        [ -r "$EGET_IPFS_DB" ] || touch "$EGET_IPFS_DB"
+        [ -r "$DBFILE" ] || touch "$DBFILE"
     else
         EGET_IPFS_DB=''
     fi
@@ -1069,8 +1169,6 @@ fi
 
 
 
-ORIG_EGET_BACKEND="$EGET_BACKEND"
-
 # override backend by URL type
 if is_fileurl "$1" ; then
     EGET_BACKEND="file"
@@ -1091,9 +1189,15 @@ case "$orig_EGET_BACKEND" in
         RSYNC="$(print_command_path rsync)"
         [ -n "$RSYNC" ] || fatal "There are no rsync in the system. Install it with $ epm install rsync"
         ;;
-    */wget)
+    */wget|*/wget2)
         WGET="$orig_EGET_BACKEND"
         [ -x "$WGET" ] || fatal "There are no $orig_EGET_BACKEND in the system but you forced using it via EGET_BACKEND. Install it with $ epm install wget"
+        EGET_BACKEND="wget"
+        ;;
+    wget2)
+        WGET="$(print_command_path wget2)"
+        [ -n "$WGET" ] || fatal "There are no wget2 in the system but you forced using it via EGET_BACKEND. Install it with $ epm install wget2"
+        EGET_BACKEND="wget"
         ;;
     wget)
         WGET="$(print_command_path wget)"
@@ -1107,15 +1211,17 @@ case "$orig_EGET_BACKEND" in
         CURL="$(print_command_path curl)"
         [ -n "$CURL" ] || fatal "There are no curl in the system but you forced using it via EGET_BACKEND. Install it with $ epm install curl"
         ;;
-    */aria2)
+    */aria2|*/aria2c)
         ARIA2="$orig_EGET_BACKEND"
         [ -x "$ARIA2" ] || fatal "There are no $orig_EGET_BACKEND in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+        EGET_BACKEND="aria2"
         # aria2 needs wget for headers and stdout
         WGET="$(print_command_path wget)"
         ;;
-    aria2)
-        ARIA2="$(print_command_path aria2)"
-        [ -n "$ARIA2" ] || fatal "There are no aria2 in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+    aria2|aria2c)
+        ARIA2="$(print_command_path aria2c || print_command_path aria2)"
+        [ -n "$ARIA2" ] || fatal "There are no aria2c in the system but you forced using it via EGET_BACKEND. Install it with $ epm install aria2"
+        EGET_BACKEND="aria2"
         # aria2 needs wget for headers and stdout
         WGET="$(print_command_path wget)"
         ;;
@@ -1150,29 +1256,57 @@ case "$orig_EGET_BACKEND" in
         ;;
 esac
 
+# Detect wget2 (incompatible --spider -S output format for header operations)
+# Detect busybox wget (no --version support, lacks --tries and most long options)
+if [ -n "$WGET" ] ; then
+    if $WGET --version 2>&1 | head -1 | grep -q "^GNU Wget2" ; then
+        WGET2=1
+    elif ! $WGET --version >/dev/null 2>&1 ; then
+        BUSYBOX_WGET=1
+    fi
+fi
 
 # Wrapper for wget command with all configured options
 # Defined globally so it can be used by aria2/axel backends for header operations
 __wget()
 {
-    [ "$USEOUTPUTDIR" ] && set -- -P "$USEOUTPUTDIR" "$@"
+    local outputdir="$USEOUTPUTDIR"
+    if [ -n "$WGET2" ] ; then
+        local arg
+        for arg in "$@" ; do
+            case "$arg" in
+                ftp://*|ftps://*)
+                    fatal "wget2 does not support FTP, use EGET_BACKEND=wget or EGET_BACKEND=curl" ;;
+            esac
+        done
+        # wget2 treats absolute -P path as relative to the current dir, so make it relative via ../
+        case "$outputdir" in
+            /*) outputdir="$(echo "$PWD" | sed -e 's|/[^/]*|../|g')${outputdir#/}" ;;
+        esac
+    fi
+    [ "$outputdir" ] && set -- -P "$outputdir" "$@"
     [ "$USERAGENT" ] && set -- -U "$USERAGENT" "$@"
     [ "$trustservernames" ] && set -- --trust-server-names "$@"
     [ "$COOKIES_FILE" ] && set -- --load-cookies "$COOKIES_FILE" "$@"
     # Default: --tries 1 (single attempt), can be overridden
-    set -- --tries "${TRIES_VALUE:-1}" "$@"
+    # busybox wget doesn't support --tries
+    [ -z "$BUSYBOX_WGET" ] && set -- --tries "${TRIES_VALUE:-1}" "$@"
     [ "$retryconnrefused" ] && set -- --retry-connrefused "$@"
-    [ "$READTIMEOUT_VALUE" ] && set -- --read-timeout "$READTIMEOUT_VALUE" "$@"
     [ "$TIMEOUT_VALUE" ] && set -- --timeout "$TIMEOUT_VALUE" "$@"
     [ "$nodirectories" ] && set -- -nd "$@"
     [ "$nosslcheck" ] && set -- --no-check-certificate "$@"
     [ "$HEADER_VALUE" ] && set -- --header="$HEADER_VALUE" "$@"
-    [ "$compressed" ] && set -- --compression=auto "$@"
+    # wget2 requests and decodes compressed content by default and has no --compression=auto
+    [ "$compressed" ] && [ -z "$WGET2" ] && set -- --compression=auto "$@"
     [ "$NOGLOB" ] && set -- --no-glob "$@"
     [ "$showprogress" ] && set -- --show-progress "$@"
     [ "$quiet" ] && set -- -q "$@"
     [ "$FORCEIPV" ] && set -- "$FORCEIPV" "$@"
-    docmd $WGET $EGET_WGET_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $WGET $EGET_WGET_OPTIONS "$@"
+    else
+        docmd $WGET $EGET_WGET_OPTIONS "$@"
+    fi
 }
 
 # wget wrapper for downloads (adds -c/-N flags)
@@ -1180,6 +1314,7 @@ __wget_download()
 {
     [ -n "$CONTINUE" ] && set -- -c "$@"
     [ -n "$TIMESTAMPING" ] && set -- -N "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __wget "$@"
 }
 
@@ -1190,8 +1325,11 @@ __timestamping_download()
     local TARGETFILE="$2"
     local DOWNLOAD_CMD="$3"  # will be "__aria2 ..." or "__axel ..."
 
-    # If file doesn't exist, just download
-    [ ! -f "$TARGETFILE" ] && eval "$DOWNLOAD_CMD" && return
+    # If file doesn't exist or is empty, just download
+    if [ ! -s "$TARGETFILE" ] ; then
+        eval "$DOWNLOAD_CMD"
+        return
+    fi
 
     # Get Last-Modified header
     local remote_modified="$(url_get_header "$URL" "Last-Modified")"
@@ -1223,6 +1361,54 @@ __timestamping_download()
     else
         info "Local file is up to date, skipping download"
     fi
+}
+
+# Transform wget2 -S output to standard HTTP header format
+# wget2 uses ":status: NNN" instead of "HTTP/1.1 NNN Status"
+# and lowercase header names without leading spaces
+__wget2_filter_response()
+{
+	# --save-headers keeps CRLF line endings; wget2 2.x prints "Enqueuing URL" for redirects
+	tr -d '\r' | \
+	sed -n -e 's/^:status: \([0-9]*\)/HTTP\/2 \1/p' -e '/^HTTP\//p' -e '/^[A-Za-z][A-Za-z-]*: /p' -e 's|^Enqueu[a-z]* \(https\?://.*\)|location: \1|p' | \
+	sed -e 's/^\([A-Za-z-]*:\)/\L\1/'
+}
+
+# Extract HTTP headers from wget1 -S output and normalize:
+# strip leading spaces, convert header names to lowercase
+__wget1_filter_response()
+{
+	sed -n -e 's/^ *\(HTTP\/[12.]*\)/\1/p' -e 's/^  \([A-Za-z].*: \)/\1/p' | \
+	sed -e 's/^\([A-Za-z-]*:\)/\L\1/'
+}
+
+# get HTTP response headers (wget-based, used by wget/aria2/axel backends)
+__wget_url_get_response()
+{
+	local URL="$1"
+	local answer
+
+	if [ -n "$WGET2" ] ; then
+		# wget2 -S is broken for HTTP/1.1 (shows only a few headers),
+		# use --save-headers to stdout and filter header lines.
+		# wget2 -q suppresses -S output (unlike wget1), so don't use quiet=1
+		answer="$(__wget --timeout 20 --tries 1 --method=HEAD --save-headers -O - "$URL" 2>&1 | tr -d '\0' | __wget2_filter_response)"
+		if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+			__wget --timeout 20 --tries 1 --save-headers --header="Range: bytes=0-0" -O - "$URL" 2>&1 | tr -d '\0' | __wget2_filter_response
+			return
+		fi
+		echo "$answer"
+		return
+	fi
+
+	answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1 | __wget1_filter_response)"
+	# HTTP/1.1 405 Method Not Allowed
+	# HTTP/1.1 404 Not Found
+	if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+		quiet=1 __wget --timeout 20 --tries 1 -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1 | __wget1_filter_response
+		return
+	fi
+	echo "$answer"
 }
 
 if [ "$EGET_BACKEND" = "file" ] ; then
@@ -1260,13 +1446,13 @@ url_pget()
 url_check_accessible()
 {
     local URL="$1"
-    test -f "$(path_from_url "$URL")"
+    test -e "$(path_from_url "$URL")"
 }
 
 url_check_available()
 {
     local URL="$1"
-    test -f "$(path_from_url "$URL")"
+    test -e "$(path_from_url "$URL")"
 }
 
 url_get_filename()
@@ -1382,7 +1568,12 @@ url_sget()
        scat "$URL"
        return
     elif [ -n "$2" ] ; then
-       download_with_mirroring __wget_download "$URL" -O "$2"
+       if [ -n "$TIMESTAMPING" ] ; then
+           # wget's -N is incompatible with -O, use manual timestamping
+           __timestamping_download "$URL" "$2" "TIMESTAMPING='' download_with_mirroring __wget_download \"$URL\" -O \"$2\""
+       else
+           download_with_mirroring __wget_download "$URL" -O "$2"
+       fi
        return
     fi
 # TODO: поддержка rsync для известных хостов?
@@ -1410,16 +1601,7 @@ sget_with_mirrors()
 
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "curl" ] ; then
@@ -1438,9 +1620,8 @@ __curl()
         esac
     fi
     [ "$retryconnrefused" ] && set -- --retry-connrefused "$@"
-    # curl uses READTIMEOUT_VALUE as fallback for --max-time if TIMEOUT_VALUE not set
-    [ -z "$TIMEOUT_VALUE" ] && [ "$READTIMEOUT_VALUE" ] && set -- --max-time "$READTIMEOUT_VALUE" "$@"
-    [ "$TIMEOUT_VALUE" ] && set -- --max-time "$TIMEOUT_VALUE" "$@"
+    [ "$READTIMEOUT_VALUE" ] && set -- --max-time "$READTIMEOUT_VALUE" "$@"
+    [ "$TIMEOUT_VALUE" ] && set -- --connect-timeout "$TIMEOUT_VALUE" "$@"
     [ "$nosslcheck" ] && set -- -k "$@"
     [ "$HEADER_VALUE" ] && set -- --header "$HEADER_VALUE" "$@"
     [ "$compressed" ] && set -- --compressed "$@"
@@ -1455,6 +1636,7 @@ __curl()
 __curl_download()
 {
     [ -n "$CONTINUE" ] && set -- -C - "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header "Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __curl "$@"
 }
 # put remote content to stdout
@@ -1489,7 +1671,7 @@ url_sget()
        scat "$1"
        return
     elif [ -n "$2" ] ; then
-       if [ -n "$TIMESTAMPING" ] && [ -f "$2" ] ; then
+       if [ -n "$TIMESTAMPING" ] && [ -s "$2" ] ; then
            __curl_check_timestamp "$URL"
            download_with_mirroring __curl_download "$URL" -z "$2" --output "$2"
        else
@@ -1500,7 +1682,7 @@ url_sget()
 
     local FILENAME="$(url_get_filename "$URL")"
     if [ -n "$FILENAME" ] ; then
-        if [ -n "$TIMESTAMPING" ] && [ -f "$FILENAME" ] ; then
+        if [ -n "$TIMESTAMPING" ] && [ -s "$FILENAME" ] ; then
             __curl_check_timestamp "$URL"
             download_with_mirroring __curl_download "$URL" -z "$FILENAME" $CURLNAMEOPTIONS --output "$FILENAME"
         else
@@ -1512,7 +1694,7 @@ url_sget()
     if [ -n "$TIMESTAMPING" ] ; then
         # Need to get filename first to use -z
         FILENAME="$(basename "$URL")"
-        if [ -f "$FILENAME" ] ; then
+        if [ -s "$FILENAME" ] ; then
             __curl_check_timestamp "$URL"
             download_with_mirroring __curl_download "$URL" -z "$FILENAME" $CURLFILENAMEOPTIONS
         else
@@ -1550,11 +1732,11 @@ url_get_response()
     local URL="$1"
     local answer
     # Don't use -C - for header requests
-    answer="$(quiet=1 __curl --max-time 20 --retry 0 -LI "$URL" 2>&1)"
+    answer="$(quiet=1 __curl --max-time 20 --retry 0 -LI "$URL" 2>&1 | sed -e 's/\r$//' -e 's/ $//')"
     # HTTP/1.1 405 Method Not Allowed
     # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __curl --max-time 20 --retry 0 -L -i -r0-0 "$URL" 2>&1)
+    if echo "$answer" | grep -q "^HTTP/[12.]* 40[45]" ; then
+        quiet=1 __curl --max-time 20 --retry 0 -L -D - -o /dev/null -r0-0 "$URL" 2>&1 | sed -e 's/\r$//' -e 's/ $//'
         return
     fi
     echo "$answer"
@@ -1566,13 +1748,18 @@ __aria2()
     [ "$USEOUTPUTDIR" ] && set -- -d "$USEOUTPUTDIR" "$@"
     [ "$showprogress" ] && set -- --show-console-readout=true "$@"
     # aria2 has no direct quiet flag, but --show-console-readout=false reduces output
-    docmd $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    else
+        docmd $ARIA2 $EGET_ARIA2_OPTIONS "$@"
+    fi
 }
 
 # aria2 wrapper for downloads (adds --continue)
 __aria2_download()
 {
     [ -n "$CONTINUE" ] && set -- --continue=true "$@"
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __aria2 "$@"
 }
 
@@ -1629,19 +1816,10 @@ sget_with_mirrors()
     echo "$tab_urls" | __aria2_download -i-
 }
 
-# use __wget for headers (aria2/axel don't support this natively)
+# use __wget for headers (aria2 doesn't support this natively)
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "axel" ] ; then
@@ -1655,13 +1833,18 @@ __axel()
     [ "$quiet" ] && [ -z "$showprogress" ] && set -- --quiet "$@"
     [ "$FORCEIPV" ] && set -- "$FORCEIPV" "$@"
     # Note: axel doesn't support output directory, only output file (-o)
-    docmd $AXEL $EGET_AXEL_OPTIONS "$@"
+    if [ "$READTIMEOUT_VALUE" ] ; then
+        docmd timeout "${READTIMEOUT_VALUE}s" $AXEL $EGET_AXEL_OPTIONS "$@"
+    else
+        docmd $AXEL $EGET_AXEL_OPTIONS "$@"
+    fi
 }
 
 # axel wrapper for downloads
 # Note: axel auto-continues if state file (.st) exists, no explicit flag needed
 __axel_download()
 {
+    [ "$MAXSIZE_VALUE" ] && set -- --header="Range: bytes=0-$(($MAXSIZE_VALUE - 1))" "$@"
     __axel "$@"
 }
 
@@ -1742,19 +1925,10 @@ sget_with_mirrors()
     [ -n "$USEOUTPUTDIR" ] && cd "$oldpwd"
 }
 
-# use __wget for headers (aria2/axel don't support this natively)
+# use __wget for headers (axel doesn't support this natively)
 url_get_response()
 {
-    local URL="$1"
-    local answer
-    answer="$(quiet=1 __wget --timeout 20 --tries 1 --spider -S "$URL" 2>&1)"
-    # HTTP/1.1 405 Method Not Allowed
-    # HTTP/1.1 404 Not Found
-    if echo "$answer" | grep -q "^ *HTTP/[12.]* 40[45]" ; then
-        (quiet=1 __wget -O/dev/null --header="Range: bytes=0-0" -S "$URL" 2>&1)
-        return
-    fi
-    echo "$answer"
+	__wget_url_get_response "$@"
 }
 
 elif [ "$EGET_BACKEND" = "rsync" ] ; then
@@ -1828,7 +2002,8 @@ fi
 url_speedtest()
 {
     local URL="$1"
-    local timeout="${TIMEOUT_VALUE:-3}"
+    local timeout="${READTIMEOUT_VALUE:-3}"
+    local count="${SPEEDTEST_COUNT:-3}"
     local total_size
     local measurements=""
     local i speed
@@ -1836,8 +2011,10 @@ url_speedtest()
     # Get file size for progress display
     total_size=$(url_get_size "$URL")
 
-    for i in 1 2 3 ; do
-        [ -n "$verbose" ] && echo "Measurement $i/3..." >&2
+    i=0
+    while [ "$i" -lt "$count" ] ; do
+        i=$(($i + 1))
+        [ -n "$verbose" ] && echo "Measurement $i/$count..." >&2
         speed=$(__speedtest_single "$URL" "$timeout" "$total_size")
         measurements="$measurements $speed"
         [ -n "$verbose" ] && echo "  Speed: ${speed} MB/s" >&2
@@ -1861,7 +2038,7 @@ if [ "$EGET_BACKEND" = "wget" ] || [ "$EGET_BACKEND" = "curl" ] || [ "$EGET_BACK
 url_get_headers()
 {
     local URL="$1"
-    url_get_response "$URL" | grep -i "^ *[[:alpha:]].*: " | sed -e 's|^ *||' -e 's|\r$||'
+    url_get_response "$URL" | grep -i "^[[:alpha:]].*: "
 }
 
 url_check_accessible()
@@ -1880,12 +2057,12 @@ url_get_header()
 {
     local URL="$1"
     local HEADER="$2"
-    url_get_headers "$URL" | grep -i "^ *$HEADER: " | sed -e "s|^ *$HEADER: ||i"
+    url_get_headers "$URL" | grep -i "^$HEADER: " | sed -e "s|^$HEADER: ||i"
 }
 
 url_get_size()
 {
-    url_get_header "$1" "Content-Length" | tr -d '\r'
+    url_get_header "$1" "content-length"
 }
 
 url_get_raw_real_url()
@@ -1897,21 +2074,28 @@ url_get_raw_real_url()
     # don't check location if we have made form of the URL
     [ -n "$MADEURL" ] && [ "$MADEURL" = "$URL" ] && echo "$URL" && return
 
-    local loc
-    for loc in $(url_get_header "$URL" "Location" | tac | sed -e 's| .*||') ; do
+    local loc base="$URL"
+    local redirect_count=0
+    local max_redirects=10
+    # follow redirect chain in order, updating base URL at each step
+    for loc in $(url_get_header "$URL" "Location" | sed -e 's| .*||') ; do
+        redirect_count=$(($redirect_count + 1))
+        if [ "$redirect_count" -gt "$max_redirects" ] ; then
+            echo "Warning: too many redirects (>$max_redirects) for $URL" >&2
+            break
+        fi
         # add protocol if missed
         if is_protocol_relative_url "$loc" ; then
-            loc="$(echo "$URL" | sed -e 's|//.*||')$loc"
+            loc="$(echo "$base" | sed -e 's|//.*||')$loc"
         fi
-        # hack for construct full url from related Location
+        # construct full url from relative Location using current base host
         if is_abs_path "$loc" ; then
-            loc="$(concatenate_url_and_filename "$(get_host_only "$URL")" "$loc")" #"
+            loc="$(concatenate_url_and_filename "$(get_host_only "$base")" "$loc")" #"
         fi
-        echo "$loc"
-        return
+        base="$loc"
     done
 
-    echo "$URL"
+    echo "$base"
 }
 
 url_get_real_url()
@@ -1938,28 +2122,33 @@ url_get_filename()
     local filename
 
     # See https://www.cpcwood.com/blog/5-aws-s3-utf-8-content-disposition
-    # https://www.rfc-editor.org/rfc/rfc6266
+    # Per RFC 6266 Section 4.3, strip path components from filename
+    # (servers may send Windows-style paths with backslashes)
     local cd="$(url_get_header "$URL" "Content-Disposition")"
     if echo "$cd" | grep -qi "filename\*= *UTF-8" ; then
         #Content-Disposition: attachment; filename="unityhub-amd64-3.3.0.deb"; filename*=UTF-8''"unityhub-amd64-3.3.0.deb"
         #Content-Disposition: attachment; filename*=UTF-8''t1client-standalone-4.5.28.0-1238402-Release.deb; filename="t1client-standalone-4.5.28.0-1238402-Release.deb"
-        filename="$(echo "$cd" | sed -e "s|.*filename\*= *UTF-8''||i" -e 's|^"||' -e 's|";$||' -e 's|"$||' -e 's|; filename=.*||')"
+        filename="$(echo "$cd" | grep -i "filename\*= *UTF-8" | tail -n1 | sed -e "s|.*filename\*= *UTF-8''||i" -e 's|^"||' -e 's|";$||' -e 's|"$||' -e 's|; filename=.*||')"
+        filename="$(echo "$filename" | sed -e 's|.*[/\\]||' -e 's|.*%5[cC]||' -e 's|.*%2[fF]||')"
         [ "$filename" != "unspecified" ] && echo "$filename" && return
     fi
     if echo "$cd" | grep -qi "filename=" ; then
         #Content-Disposition: attachment; filename=postman-linux-x64.tar.gz
         #content-disposition: attachment; filename="code-1.77.1-1680651749.el7.x86_64.rpm"
-        filename="$(echo "$cd" | sed -e 's|.*filename= *||i' -e 's|^"||' -e 's|";.*||' -e 's|"$||')"
+        filename="$(echo "$cd" | grep -i "filename=" | tail -n1 | sed -e 's|.*filename= *||i' -e 's|^"||' -e 's|";.*||' -e 's|"$||')"
+        filename="$(echo "$filename" | sed -e 's|.*[/\\]||')"
         [ "$filename" != "unspecified" ] && echo "$filename" && return
     fi
 
     local loc="$(url_get_raw_real_url "$URL")"
+    # signed CDN redirects (e.g. GitHub release assets) put a UUID in the path
+    # and the real filename in a query parameter — fall back to original URL
     if is_strange_url "$loc" ; then
-        loc="$(echo "$loc" | sed -e "s|\?.*||")"
+        loc="$URL"
     fi
 
-    # hack for redirect to the main page
-    if is_httpurl "$loc" ; then
+    # hack for redirect to the main page (root URL with no filename)
+    if echo "$loc" | grep -qE '^https?://[^/]+/?$' ; then
         loc=""
     fi
 
@@ -2134,6 +2323,10 @@ sget()
     # download file and add to IPFS
     url_sget "$REALURL" "$TARGET" || return
 
+    if is_html_file "$TARGET" ; then
+        fatal "Downloaded '$TARGET' is an HTML page, not a file (server redirected to a landing/error page?). Not adding to IPFS."
+    fi
+
     # don't do ipfs put when gateway is using
     [ "$ipfs_mode" = "gateway" ] && return
 
@@ -2224,7 +2417,13 @@ sget()
         fi
     fi
 
-    url_sget "$@"
+    # Use normalized filename from Content-Disposition via -O
+    # (wget/curl may save with raw path separators otherwise, see RFC 6266 Section 4.3)
+    if [ -n "$TARGET_FROM_URL" ] ; then
+        url_sget "$URL" "$TARGET"
+    else
+        url_sget "$@"
+    fi
 }
 
 # Filter stdin: strip whitespace, skip empty lines and comments
@@ -2315,6 +2514,10 @@ make_fileurl()
 {
     local url="$1"
     local fn="$2"
+    local abs_path=''
+
+    # detect absolute path before stripping leading slashes
+    is_abs_path "$fn" && abs_path=1
 
     fn="$(echo "$fn" | sed -e 's|^./||' -e 's|^/*||')"
 
@@ -2324,7 +2527,7 @@ make_fileurl()
     elif is_rsyncurl "$url" || is_sshurl "$url" ; then
         # rsync/ssh URLs: just ensure trailing slash
         url="$(echo "$url" | sed 's|/*$|/|')"
-    elif is_abs_path "$fn" ; then
+    elif [ -n "$abs_path" ] ; then
         # if there is file path from the root of the site
         url="$(get_host_only "$url")"
     elif ! have_end_slash_or_php_parametr "$url" ; then
@@ -2355,7 +2558,7 @@ get_urls()
     if echo "$content" | grep -q '<' ; then
         # HTML format (wget FTP, HTTP): parse href attributes
         echo "$content" | sed -e 's|<|<\n|g' -e 's|data-file=|href=|g' -e "s|href=http|href=\"http|g" -e "s|>|\">|g" -e "s|'|\"|g" | \
-             grep -i -o -E 'href="(.+)"' | sed -e 's|&amp;|\&|' | cut -d'"' -f2 | sed -e 's|^ *||g' -e 's| *$||g'
+             grep -i -o -E 'href="(.+)"' | sed -e 's|&amp;|\&|' | cut -d'"' -f2 | sed -e 's|^ *||g' -e 's| *$||g' | grep -v '^\.\.\?/\?$'
     else
         # ls -l format (curl FTP): extract last field (filename)
         echo "$content" | awk '{print $NF}'
@@ -2429,6 +2632,62 @@ if is_github_url "$1" && [ -n "$2" ] ; then
     exit
 fi
 
+# separate part for Yandex.Disk downloads
+is_yadisk_url()
+{
+    case "$1" in
+        https://disk.yandex.ru/d/*|https://yadi.sk/d/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Get direct download URL from Yandex.Disk public link
+get_yadisk_download_url()
+{
+    local PUBLIC_URL="$1"
+    local API_URL="https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=$PUBLIC_URL"
+    local RESPONSE
+    RESPONSE="$(scat "$API_URL")" || fatal "Can't get download URL from Yandex.Disk API"
+    # extract href from JSON: {"href": "https://..."}
+    echo "$RESPONSE" | sed -e 's/.*"href" *: *"//;s/".*//'
+}
+
+# Get filename from Yandex.Disk public link metadata
+get_yadisk_filename()
+{
+    local PUBLIC_URL="$1"
+    local API_URL="https://cloud-api.yandex.net/v1/disk/public/resources?public_key=$PUBLIC_URL"
+    local RESPONSE
+    RESPONSE="$(scat "$API_URL")" || return 1
+    # extract name from JSON: {"name": "filename.ext", ...}
+    echo "$RESPONSE" | sed -e 's/.*"name" *: *"//;s/".*//'
+}
+
+if is_yadisk_url "$1" ; then
+    [ -n "$2" ] && fatal "too many args when Yandex.Disk URL used: extra '$2' arg"
+
+    if [ -n "$GETFILENAME" ] ; then
+        get_yadisk_filename "$1"
+        exit
+    fi
+
+    DOWNLOAD_URL="$(get_yadisk_download_url "$1")"
+    [ -n "$DOWNLOAD_URL" ] || fatal "Can't get download URL for $1"
+
+    if [ -n "$LISTONLY" ] ; then
+        echo "$DOWNLOAD_URL"
+        exit
+    fi
+
+    if [ -z "$TARGETFILE" ] ; then
+        TARGETFILE="$(get_yadisk_filename "$1")"
+    fi
+
+    MADEURL="$DOWNLOAD_URL"
+    sget "$DOWNLOAD_URL" "$TARGETFILE"
+    exit
+fi
+
 if is_ipfsurl "$1" ; then
     [ -n "$2" ] && fatal "too many args when ipfs://Qm... used: extra '$2' arg"
     sget "$1" "$TARGETFILE"
@@ -2474,19 +2733,12 @@ fi
 
 is_wildcard()
 {
-    case "$1" in *[*?]*|*\[*|*\]*) return 0 ;; esac
+    case "$1" in *[*]*|*\[*|*\]*) return 0 ;; esac
     return 1
 }
 
-is_query_string()
-{
-    case "$1" in *\?*=*) return 0 ;; esac
-    return 1
-}
-
-# https://www.freeoffice.com/download.php?filename=freeoffice-2021-1062.x86_64.rpm
-if [ -z "$NOGLOB" ] && is_wildcard "$URL" && ! is_query_string "$URL" ; then
-    fatal "Error: there are globbing symbol (*[]) in $URL. It is allowed only for mask part"
+if [ -z "$NOGLOB" ] && is_wildcard "$URL" ; then
+    fatal "Error: there are globbing symbols (*[]) in $URL. It is allowed only for mask part"
 fi
 
 if is_url "$MASK" ; then
@@ -2514,7 +2766,7 @@ if [ -n "$LISTONLY" ] ; then
 fi
 
 # If there is no wildcard symbol like asterisk, just download
-if [ -z "$SEPMASK" ] && ! is_wildcard "$MASK" || is_query_string "$MASK" ; then
+if [ -z "$SEPMASK" ] && ! is_wildcard "$MASK" ; then
     sget "$1" "$TARGETFILE"
     exit
 fi

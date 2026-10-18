@@ -24,16 +24,37 @@ fi
 if [ "$VERSION" = "*" ] ; then
     if [ "$PKGNAME" = "$BASEPKGNAME-beta" ] ; then
         prerelease="prerelease"
-        VERSION="$VERSION.beta"
+        mask="td-setup-linux-x64-*-beta.tar.xz"
+    else
+        mask="td-setup-linux-x64-*.tar.xz"
     fi
     # can't use get_github_tag (not every tag has binary release)
-    PKGURL=$(get_github_url "https://github.com/telegramdesktop/tdesktop/" "tsetup.$VERSION.tar.xz" $prerelease)
+    PKGURL=$(get_github_url "https://github.com/telegramdesktop/tdesktop/" "$mask" $prerelease)
 
 else
-    PKGBASEURL="https://github.com/telegramdesktop/tdesktop/releases/download/v$VERSION"
-    [ "$PKGNAME" = "$BASEPKGNAME-beta" ] && VERSION="$VERSION.beta"
-    # version can be 1.2.3.beta or 1.2.3
-    PKGURL="$PKGBASEURL/tsetup.$VERSION.tar.xz"
+    # Beta releases use tag v1.2.3, without the beta suffix.
+    TAGVER="$(echo "$VERSION" | sed -e 's/\.beta$//' -e 's/-beta$//')"
+    PKGBASEURL="https://github.com/telegramdesktop/tdesktop/releases/download/v$TAGVER"
+
+    case "$PKGNAME" in
+        "$BASEPKGNAME-beta")
+            rename_version=7.2.6
+            old_suffix=.beta
+            new_suffix=-beta
+            ;;
+        *)
+            rename_version=7.2.7
+            old_suffix=
+            new_suffix=
+            ;;
+    esac
+
+    if is_version_older "$TAGVER" "$rename_version" ; then
+        filename="tsetup.$TAGVER$old_suffix.tar.xz"
+    else
+        filename="td-setup-linux-x64-$TAGVER$new_suffix.tar.xz"
+    fi
+    PKGURL="$PKGBASEURL/$filename"
 fi
 
 # override PKGNAME for beta version

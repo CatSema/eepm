@@ -9,11 +9,11 @@ if ! echo "$TAR" | grep -q "cnijfilter2" ; then
     fatal "No idea how to handle $TAR"
 fi
 
-erc unpack $TAR && cd cni* || fatal
+erc --here unpack "$TAR" || fatal
 
 arch="$(epm print info -a)"
 
 #PKG="packages/cnijfilter2_*_amd64.deb"
-PKG="packages/cnijfilter2-*.$arch.rpm"
+PKG="cnijfilter2-*-rpm/packages/cnijfilter2-*.$arch.rpm"
 
 return_tar $PKG

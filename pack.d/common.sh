@@ -16,6 +16,8 @@ yaml_load_vars()
     data="$(epm tool yaml "$file" 2>/dev/null)"
     for field in "$@" ; do
         value="$(printf '%s\n' "$data" | grep "^${field}=" | head -n1 | sed "s/^[^=]*=\"\(.*\)\"$/\1/")"
+        # skip if key is not present in yaml (preserve existing value)
+        [ -n "$value" ] || continue
         # Use single quotes to prevent command execution in values
         eval "$field='$(printf '%s' "$value" | sed "s/'/'\\\\''/g")'"
     done
@@ -132,9 +134,32 @@ return_tar()
     rm -f $RETURNTARNAME
     for i in $* ; do
         #__handle_tarname $i
-        realpath $i >>$RETURNTARNAME || fatal "Can't save tar name $i to file $RETURNTARNAME"
+        realpath -s $i >>$RETURNTARNAME || fatal "Can't save tar name $i to file $RETURNTARNAME"
     done
     exit 0
+}
+
+# Prepare a temporary Flathub repository for selective runtime downloads.
+# The caller owns the directory and its cleanup. Keep one signed commit for
+# all files, even when the runtime is updated during packing.
+# Usage: prepare_flatpak_runtime repo descriptor runtime/org.gnome.Platform/arch/49
+# Sets FLATPAK_RUNTIME_COMMIT.
+prepare_flatpak_runtime()
+{
+    local repo="$1"
+    local descriptor="$2"
+    local runtime="$3"
+
+    epm assure ostree || fatal
+    sed -n 's/^GPGKey=//p' "$descriptor" | base64 -d > "$repo/flathub.trustedkeys.gpg" || fatal "Invalid Flathub signing key"
+    [ -s "$repo/flathub.trustedkeys.gpg" ] || fatal "Missing Flathub signing key"
+    ostree init --repo="$repo" --mode=archive || fatal
+    ostree remote add --repo="$repo" flathub https://dl.flathub.org/repo/ || fatal
+
+    # The legacy OSTree summary does not list every architecture.
+    eget -O "$repo/runtime.commit" "https://dl.flathub.org/repo/refs/heads/$runtime" || fatal
+    FLATPAK_RUNTIME_COMMIT="$(cat "$repo/runtime.commit")"
+    echo "$FLATPAK_RUNTIME_COMMIT" | grep -qE '^[0-9a-f]{64}$' || fatal "Invalid Flatpak runtime commit"
 }
 
 # really like install -D src dst

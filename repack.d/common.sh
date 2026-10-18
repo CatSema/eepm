@@ -20,21 +20,6 @@ warning()
     echo "WARNING: $*" >&2
 }
 
-# Load YAML fields into shell variables safely (prevents command injection)
-# Usage: yaml_load_vars file.yaml field1 field2 field3 ...
-yaml_load_vars()
-{
-    local file="$1"
-    shift
-    local data field value
-    data="$(epm tool yaml "$file" 2>/dev/null)"
-    for field in "$@" ; do
-        value="$(printf '%s\n' "$data" | grep "^${field}=" | head -n1 | sed "s/^[^=]*=\"\(.*\)\"$/\1/")"
-        # Use single quotes to prevent command execution in values
-        eval "$field='$(printf '%s' "$value" | sed "s/'/'\\\\''/g")'"
-    done
-}
-
 # compatibility layer
 
 # check if <arg> is a real command
@@ -151,13 +136,16 @@ move_dir()
 remove_dir()
 {
     local file="$1"
-    [ -n "$file" ] || return
-    [ -d "$BUILDROOT$file/" ] || return
+    [ -n "$file" ] || return 0
+    [ -d "$BUILDROOT$file/" ] || return 0
 
     # canonicalize
     file="$(echo "$file" | sed -e 's|/*$||')"
 
     echo "Removing $file dir ..."
+    # ensure traversability first (mode 600 dirs can't be entered)
+    chmod u+rwx "$BUILDROOT$file" 2>/dev/null
+    chmod -R u+rwX "$BUILDROOT$file/" 2>/dev/null
     rm -r "$BUILDROOT$file/"
     # %dir "/icons/"
     subst "s|^%dir $file/*$||" $SPEC
@@ -185,6 +173,13 @@ has_space()
 has_wildcard()
 {
     [ "${1/\*/}" != "$1" ]
+}
+
+# Check binary file for a pattern (including \xNN bytes).
+# Usage: check_binary <file> <pattern>
+check_binary()
+{
+    [ -f "$1" ] && LC_ALL=C grep -aqP "$2" "$1"
 }
 
 # Patch binary file: replace old_string with new_string (padded with nulls)
@@ -227,6 +222,16 @@ pack_file()
     grep -q "\"$file\"" $SPEC && return
     has_space "$file" && file="\"$file\""
     subst "s|%files|%files\n$file|" $SPEC
+}
+
+# Mark file as %config(noreplace) in spec so user changes survive package update
+# Usage: mark_config_noreplace <path>
+mark_config_noreplace()
+{
+    local file="$1"
+    [ -n "$file" ] || return
+    subst "s|\"$file\"|%config(noreplace) \"$file\"|" $SPEC
+    subst "s|^$file$|%config(noreplace) $file|" $SPEC
 }
 
 # Add dir (only dir) to spec (if missed)
@@ -431,6 +436,14 @@ fix_desktop_file()
     chmod -v 0644 $BUILDROOT/usr/share/applications/*.desktop
 }
 
+fix_chrome_crashpad()
+{
+    local crashpad="$1"
+    [ -n "$crashpad" ] || crashpad="$PRODUCTDIR/chrome_crashpad_handler"
+    [ -f "$BUILDROOT$crashpad" ] || return 0
+    chmod -v 0755 "$BUILDROOT$crashpad"
+}
+
 fix_chrome_sandbox()
 {
     local sandbox="$1"
@@ -439,7 +452,10 @@ fix_chrome_sandbox()
     userns_path='/proc/sys/kernel/unprivileged_userns_clone'
     userns_val="$(cat $userns_path 2>/dev/null)"
     #[ "$userns_val" = '1' ] && return
-    [ -n "$sandbox" ] || sandbox="$PRODUCTDIR/chrome-sandbox"
+    if ! [ -n "$sandbox" ] ; then
+        sandbox="$PRODUCTDIR/chrome-sandbox"
+        [ -e "$BUILDROOT$sandbox" ] || sandbox="$PRODUCTDIR/chrome_sandbox"
+    fi
     [ -e "$BUILDROOT$sandbox" ] || return 0
     chmod -v 4711 "$BUILDROOT$sandbox"
 }
@@ -466,6 +482,12 @@ add_conflicts()
 {
     [ -n "$1" ] || return
     __add_tag_after_d "Conflicts: $*"
+}
+
+add_obsoletes()
+{
+    [ -n "$1" ] || return
+    __add_tag_after_d "Obsoletes: $*"
 }
 
 add_provides()
@@ -547,25 +569,30 @@ __get_binary_requires()
     local fdir="$1"
     local d
     local findex
-    
+
+    # load ignored paths from file (persisted across script invocations)
+    [ -f "$BUILDROOT/.eepm_ignore_lib_path" ] && EEPM_IGNORE_LIB_PATH="$EEPM_IGNORE_LIB_PATH $(cat "$BUILDROOT/.eepm_ignore_lib_path" | tr '\n' ' ')"
+
     # prepare case for ignored path
     for d in $EEPM_IGNORE_LIB_PATH ; do
        info "  Skipping $d ..."
        findex="$findex -type d -path $BUILDROOT$d -prune -o"
     done
 
+    # *.musl.node: Node native addons built for musl carry NEEDED libc.so (musl
+    # SONAME), unsatisfiable on glibc; never loaded anyway (Node uses *.glibc.node).
     info "  Getting executable requires ..."
-    epm req --short $(find "$fdir" $findex -type f -executable) </dev/null 2>/dev/null
+    epm req --short $(find "$fdir" $findex -type f -executable ! -name "*.musl.node") </dev/null 2>/dev/null
 
     info "  Getting libs requires ..."
-    epm req --short $(find "$fdir" $findex -type f -name "lib*.so*") </dev/null 2>/dev/null
+    epm req --short $(find "$fdir" $findex -type f -name "lib*.so*" ! -name "*.musl.node") </dev/null 2>/dev/null
 }
 
 __get_library_provides()
 {
     local fdir="$1"
 
-    epm assure objdump binutils || fatal "Can't install needed binutils package"
+    epm assure objdump binutils >&2 || fatal "Can't install needed binutils package"
 
     info "  Getting internal provides ..."
     for libso in $(find "$fdir" -name "lib*.so*") ; do
@@ -615,6 +642,24 @@ get_libs_requires()
 stop_libs_requires()
 {
     touch "$BUILDROOT/.eepm_stop_libs_requires"
+}
+
+# warn about UPX-packed binaries: their linked libraries are hidden inside the
+# compressed image, so soname autodetection silently misses all dependencies
+warn_upx_binaries()
+{
+    local f found=''
+    while IFS= read -r f ; do
+        # UPX-packed files carry this banner string in the stub
+        if LANG=C grep -qa 'This file is packed with the UPX' "$f" 2>/dev/null ; then
+            warning "UPX-packed binary: ${f#$BUILDROOT}"
+            found=1
+        fi
+    done <<EOF
+$(find "$BUILDROOT" -type f -executable)
+EOF
+    [ -n "$found" ] || return 0
+    warning "UPX compression hides linked libraries: dependency autodetection will miss them. Add Requires manually (or unpack the binary with: upx -d)."
 }
 
 add_libs_requires()
@@ -673,6 +718,14 @@ ignore_lib_requires()
 ignore_library_path()
 {
    EEPM_IGNORE_LIB_PATH="$EEPM_IGNORE_LIB_PATH $@"
+   echo "$@" | xargs -n1 >> "$BUILDROOT/.eepm_ignore_lib_path"
+}
+
+skip_deb_dh_strip_nondeterminism()
+{
+   # epm-repack-deb reads this sidecar marker when converting the generated rpm to deb.
+   # Keep the marker outside BUILDROOT so it does not get packaged.
+   touch "$(dirname "$(dirname "$SPEC")")/.eepm_skip_deb_dh_strip_nondeterminism"
 }
 
 
@@ -704,6 +757,16 @@ set_autoprov()
     else
         subst "1iAutoProv: $*" $SPEC
     fi
+}
+
+# Replace release suffix (after epm1.repacked.) in spec
+# Usage: set_release_suffix NEW_SUFFIX
+# epm1.repacked.1 -> epm1.repacked.NEW_SUFFIX
+set_release_suffix()
+{
+    local suffix="$1"
+    [ -n "$suffix" ] || return
+    subst "s|^Release: epm[0-9]*\.repacked\.[^[:space:]]*|Release: epm1.repacked.$suffix|" $SPEC
 }
 
 # https://bugzilla.altlinux.org/42189

@@ -34,6 +34,10 @@ Examples:
   epm repo add autoimports - add autoimports (from Fedora) repo
   epm repo change yandex   - change only base url part to mirror.yandex.ru server (use epm repo change --list to get possible targets)
   epm repo list            - list current repos
+
+Environment:
+  EPM_APT_SOURCES_LIST     - use specified file instead of /etc/apt/sources.list (skip sources.list.d)
+  EPM_APT_SOURCES_ROOT     - use specified root directory for /etc/apt/sources.list and sources.list.d
 '
 }
 
@@ -61,7 +65,7 @@ epm_repo()
         epm_repolist "$@"
         ;;
     change)                           # HELPCMD: <mirror>: switch sources to the mirror (supports etersoft/yandex/basealt/datacenter/truenetwork/msu/altlinux.org/eterfund.org): rewrite URLs to the specified server
-        load_helper epm-repofix
+        load_helper epm-repochange
         epm_repochange "$@"
         ;;
     set)                              # HELPCMD: <repo>: remove all existing sources and add default mirror for the branch
@@ -73,7 +77,10 @@ epm_repo()
         load_helper epm-repomirrors
         # Remember current mirror before removing repos
         local current_mirror
-        current_mirror=$(__get_current_mirror)
+        # dnf repos are available only on one mirror
+        { [ "$PMTYPE" = "apt-rpm" ] || __alt_dnf_supports_aptrpm ; } && current_mirror=$(__get_current_mirror)
+        # keep the type of dnf repos (apt-rpm or rpm-md) for the recreated repos
+        __alt_dnf_uses_aptrpm_repos && export EPM_DNF_REPO_TYPE="apt-rpm"
         try_change_alt_repo
         epm repo rm all
         epm addrepo "$@" || fatal 'Cannot add repo "'$@'", restoring...'
@@ -123,7 +130,7 @@ epm_repo()
         load_helper epm-reposave
         epm_repostatus "$@"
         ;;
-    add)                              # HELPCMD: add package repo (etersoft, autoimports, archive 2017/01/31); run with param to get list
+    add)                              # HELPCMD: add package repo (etersoft, autoimports, --disabled); run with param to get list
         load_helper epm-addrepo
         epm_addrepo "$@"
         ;;
@@ -140,7 +147,7 @@ epm_repo()
         load_helper epm-repofix
         epm_repofix "$@"
         ;;
-    mirrors)                          # HELPCMD: list and test ALT Linux mirrors (--speedtest to test speed)
+    mirrors)                          # HELPCMD: list and test ALT Linux mirrors (run with --help for subcommands)
         load_helper epm-repomirrors
         epm_repomirrors "$@"
         ;;
@@ -154,11 +161,11 @@ epm_repo()
         load_helper epm-repoindex
         epm_repoindex "$@"
         ;;
-    pkgadd)                           # HELPCMD: add to <dir> applied <package-filename1> [<package-filename2>...]
+    pkgadd)                           # HELPCMD: add to <dir> applied <package-filename|task> [...]
         load_helper epm-repopkg
         epm_repo_pkgadd "$@"
         ;;
-    pkgupdate)                        # HELPCMD: replace in <dir> with new <package-filename1> [<package-filename2>...]
+    pkgupdate)                        # HELPCMD: replace in <dir> with new <package-filename|task> [...]
         load_helper epm-repopkg
         epm_repo_pkgupdate "$@"
         ;;

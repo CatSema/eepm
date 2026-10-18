@@ -5,11 +5,18 @@ RETURNTARNAME="$2"
 
 . $(dirname $0)/common.sh
 
-if ! echo "$TAR" | grep -q "linux-UFRII-drv" ; then
-    fatal "No idea how to handle $TAR"
-fi
+case "$TAR" in
+    *.tar.gz|*.tgz)
+        ARCHIVE="$TAR"
+        ;;
+    *)
+        ARCHIVE="$(basename "$TAR").tar.gz"
+        cp "$TAR" "$ARCHIVE" || fatal
+        ;;
+esac
 
-erc unpack $TAR && cd linux-* || fatal
+erc --here unpack "$ARCHIVE" || fatal
+cd "$(ls -d linux-*/)" || fatal
 
 case "$(epm print info -a)" in
     x86_64)
@@ -28,12 +35,21 @@ esac
 
 case "$(epm print info -p)" in
     rpm)
-        PKG="RPM/*.rpm"
+        for i in RPM/*.rpm ; do
+            [ -f "$i" ] || continue
+            PKG="$i"
+            break
+        done
         ;;
     *)
-        cd Debian || fatal
-        PKG="Debian/*.deb"
+        for i in Debian/*.deb Debian/Debian/*.deb ; do
+            [ -f "$i" ] || continue
+            PKG="$i"
+            break
+        done
         ;;
 esac
 
-return_tar $PKG
+[ -n "$PKG" ] || fatal "Can't find package in $TAR"
+
+return_tar "$PKG"

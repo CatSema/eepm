@@ -8,7 +8,10 @@ URL="https://github.com/QwenLM/qwen-code"
 
 . $(dirname $0)/common.sh
 
-# drop v0.10.2-nightly.20260217.a0a0a70b and v0.10.2-preview.0
-PKGURL=$(get_github_release_info  $URL |  grep 'browser_download_url' | grep -iEo 'https.*download.*' | grep -vi nightly | grep -vi preview | grep -E "cli.js" | head -n1 | sed -e 's|"$||')
+if [ "$VERSION" = "*" ] ; then
+    VERSION=$(get_github_tag https://github.com/QwenLM/qwen-code)
+fi
+
+PKGURL="https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-${VERSION}.tgz"
 
 install_pack_pkgurl

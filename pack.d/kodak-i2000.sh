@@ -9,9 +9,7 @@ if ! echo "$TAR" | grep -q "LinuxSoftware_i2000.*deb.tar.gz" ; then
     fatal "Unknow file $TAR"
 fi
 
-erc $TAR || fatal
-
-cd LinuxSoftware* || fatal
+erc --here $TAR || fatal
 
 PKG="kodak_i2000-*.amd64.deb"
 

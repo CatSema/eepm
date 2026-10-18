@@ -7,17 +7,25 @@ URL="$4"
 
 . $(dirname $0)/common.sh
 
-VERSION=$(echo "$URL" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
+TAG="$(echo "$URL" | sed -n 's|.*/download/\([^/]*\)/.*|\1|p')"
+case "$TAG" in
+    v[0-9]*)
+        VERSION="$(echo "$TAG" | sed -e 's|^v||')"
+        ;;
+    rc[0-9]*)
+        VERSION="$(echo "$TAG" | sed -n 's|^rc\([0-9][0-9.]*\)-\([0-9][0-9]*\)$|\1~rc\2|p')"
+        ;;
+esac
 [ -n "$VERSION" ] || fatal "Can't get package version"
 PKGNAME=$PRODUCT-$VERSION
 
-mkdir -p opt/
-erc unpack $TAR || fatal
-mv "$(erc basename $TAR)" opt/$PRODUCT
+erc -C opt/$PRODUCT unpack $TAR || fatal
 chmod 0755 opt/$PRODUCT/$PRODUCT
 
 iconname=chat.fluffy.$PRODUCT
-install_file opt/$PRODUCT/data/flutter_assets/assets/favicon.png /usr/share/pixmaps/$iconname.png
+iconfile=opt/$PRODUCT/data/flutter_assets/assets/favicon.png
+[ -f "$iconfile" ] || iconfile=opt/$PRODUCT/data/flutter_assets/assets/logo/mini/logo_mini.png
+install_file "$iconfile" /usr/share/pixmaps/$iconname.png
 
 cat <<EOF | create_file /usr/share/applications/$iconname.desktop
 [Desktop Entry]
@@ -37,6 +45,7 @@ erc pack $PKGNAME.tar opt usr
 
 cat <<EOF >$PKGNAME.tar.eepm.yaml
 name: $PRODUCT
+version: $VERSION
 group: Networking/Instant messaging
 license: AGPLv3
 url: https://github.com/krille-chan/fluffychat

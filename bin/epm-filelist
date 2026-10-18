@@ -31,7 +31,7 @@ __alt_local_content_filelist()
     load_helper epm-check_updated_repo
 
     local pkg="$1"
-    check_alt_contents_index || init_alt_contents_index
+    assure_alt_contents_index
     update_repo_if_needed
     local CI="$(cat $ALT_CONTENTS_INDEX_LIST)"
 
@@ -92,7 +92,7 @@ __epm_filelist_remote()
             ;;
         dnf-rpm|dnf5-rpm)
             assure_exists dnf-plugins-core
-            docmd dnf repoquery -l "$@"
+            docmd $DNFCMD repoquery -l "$@"
             ;;
         *)
             fatal "Query filelist for non installed packages is not implemented yet."

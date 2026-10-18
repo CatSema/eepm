@@ -7,19 +7,12 @@ URL="$4"
 . $(dirname $0)/common.sh
 
 VERSION=$(echo "$URL" | grep -oP 'OneScript-\K[0-9]+\.[0-9]+\.[0-9]+')
+[ -n "$VERSION" ] || VERSION=$(basename "$TAR" | grep -oP 'OneScript-\K[0-9]+\.[0-9]+\.[0-9]+')
 [ -n "$VERSION" ] || fatal "Can't get package version"
 
 PKGNAME=$PRODUCT-$VERSION
 
-erc unpack $TAR || fatal
-
-# erc creates directory from archive name
-SRCDIR=$(basename "$TAR" .zip | sed 's/\.tar$//')
-[ -d "$SRCDIR" ] || SRCDIR="."
-
-mkdir -p opt/$PRODUCT
-mv $SRCDIR/bin opt/$PRODUCT/
-mv $SRCDIR/lib opt/$PRODUCT/
+erc -C opt/$PRODUCT unpack $TAR || fatal
 
 chmod 755 opt/$PRODUCT/bin/oscript
 

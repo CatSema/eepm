@@ -99,10 +99,70 @@ eget()
     epm tool eget "$@"
 }
 
+ercat()
+{
+    epm tool ercat "$@"
+}
+
 fetch_url()
 {
     info "Fetching $1 ..."
-    $EPM --quiet tool eget -q -O- "$1"
+    $EPM --quiet tool eget -q -O- "$1" || return 1
+}
+
+# Get latest version of a package from deb repository Packages.gz index.
+# Usage: get_deb_repo_latest_version <packages_gz_url> <pkgname>
+get_deb_repo_latest_version()
+{
+    local packages_url="$1"
+    local pkgname="$2"
+    eget -O- "$packages_url" | gzip -d \
+        | grep -A1 -x "Package: $pkgname" \
+        | sed -n 's/^Version: \(.*\)/\1/p' \
+        | sort -V | tail -n 1
+}
+
+# Get the package file base name (Filename without dir and .deb) of the latest
+# version of a package from a deb repository Packages.gz index. Useful when the
+# download filename carries a build number that is not present in Version.
+# Usage: get_deb_repo_latest_filename <packages_gz_url> <pkgname>
+get_deb_repo_latest_filename()
+{
+    local packages_url="$1"
+    local pkgname="$2"
+    fetch_url "$packages_url" | ercat - \
+        | awk -v p="$pkgname" '
+            $1=="Package:"  { pkg=$2 }
+            $1=="Version:"  && pkg==p { ver=$2 }
+            $1=="Filename:" && pkg==p { print ver"\t"$2; pkg="" }
+        ' \
+        | sort -V | tail -n1 | cut -f2 \
+        | awk -F/ '{print $NF}' | sed 's/\.deb$//'
+}
+
+# Get the latest <location href> matching a mask from a yum/dnf repository's
+# repodata (useful when the bucket forbids directory listing). The mask is a
+# regex on the rpm file name as it appears in primary.xml's <location href="">.
+# Usage: get_rpm_repo_latest_file <repo_base_url> <filename_mask>
+get_rpm_repo_latest_file()
+{
+    local base="$1"
+    local mask="$2"
+    local primary
+    primary="$(fetch_url "$base/repodata/repomd.xml" \
+        | sed -nE 's#.*href="([^"]*primary\.xml\.(gz|zst))".*#\1#p' | head -n1)"
+    [ -n "$primary" ] || return
+    case "$primary" in
+        *.zst) epm assure zstdcat zstd </dev/null >&2 || return ;;
+    esac
+    fetch_url "$base/$primary" | ercat - \
+        | sed -n "s|.*<location href=\"\($mask\)\".*|\1|p" | sort -V | tail -n1
+}
+
+# Returns 0 if version $1 is older (lower) than $2.
+is_version_older()
+{
+    [ "$(epm --inscript print compare version "$1" "$2")" = "-1" ]
 }
 
 
@@ -138,6 +198,16 @@ override_pkgname()
     export EEPM_INTERNAL_PKGNAME="$PKGNAME"
 }
 
+__suggest_ipfs_on_error()
+{
+    if [ -z "$ipfs" ] ; then
+        local playname="$(basename $0 .sh)"
+        info
+        info 'Tip: try $ epm play --ipfs '$playname' to install from IPFS cache.'
+    fi
+    exit 1
+}
+
 # epm install $PKGURL
 install_pkgurl()
 {
@@ -154,7 +224,7 @@ install_pkgurl()
         exit 0
     fi
 
-    epm install $repack $PKGURL "$@" || exit
+    epm install $repack $PKGURL "$@" || __suggest_ipfs_on_error
 }
 
 # epm pack --install $PKGNAME "$PKGURL"
@@ -173,7 +243,7 @@ install_pack_pkgurl()
         exit 0
     fi
 
-    epm pack $repack --install $PKGNAME "$PKGURL" "$@"
+    epm pack $repack --install $PKGNAME "$PKGURL" "$@" || __suggest_ipfs_on_error
 }
 
 # ["version"]
@@ -257,8 +327,8 @@ build_full_version()
 get_installed_full_version()
 {
     local pkg="$1"
-    local ver="$(epm print version for package $pkg | head -n1)"
-    local rel="$(epm print release for package $pkg | head -n1)"
+    local ver="$(epm print version for package $pkg 2>/dev/null | head -n1)"
+    local rel="$(epm print release for package $pkg 2>/dev/null | head -n1)"
     local rel_suffix="$(get_release_suffix "$rel")"
     build_full_version "$ver" "$rel_suffix"
 }
@@ -274,37 +344,68 @@ __convert_glob__to_regexp()
 
 get_github_release_info() {
     local url="$1"
+    local flag="$2"
     local user_and_repo=${url#https://github.com/}
+    user_and_repo="${user_and_repo%/}"
+    local api_url result
 
-    fetch_url "https://api.github.com/repos/${user_and_repo%/}/releases"
+    if [ "$flag" = "latest" ] ; then
+        api_url="https://api.github.com/repos/$user_and_repo/releases/latest"
+    else
+        api_url="https://api.github.com/repos/$user_and_repo/releases"
+    fi
+
+    result="$(fetch_url "$api_url")" || return 1
+    [ -n "$result" ] || return 1
+    if echo "$result" | head -c 200 | grep -q '"message":[[:space:]]*"Not Found"' ; then
+        return 1
+    fi
+    echo "$result"
+}
+
+# Extract browser_download_url values from GitHub release JSON via epm tool json.
+# Handles both single-line and multi-line JSON correctly.
+__get_github_download_urls()
+{
+    epm --inscript --quiet tool json -b | grep '"browser_download_url"' | sed -e 's|.*[[:space:]]||' -e 's|"||g'
 }
 
 get_github_url()
 {
     local url="$1"
     local asset_name="$2"
+    local user_and_repo=${url#https://github.com/}
+    user_and_repo=${user_and_repo%/}
+
+    # If asset_name has no globs, try direct URL without API call
+    if ! echo "$asset_name" | grep -q '[*?]' ; then
+        local direct
+        for tag in "$VERSION-$RELEASE" "$VERSION" "v$VERSION" ; do
+            [ -n "$tag" ] || continue
+            direct="https://github.com/$user_and_repo/releases/download/$tag/$asset_name"
+            eget --check-url "$direct" 2>/dev/null && echo "$direct" && return
+        done
+    fi
 
     # See tdesktop.*.tar.gz
     #echo "$asset_name" | grep -q "\.[*?]" && fatal "Only glob symbols * and ? are supported. Don't use regexp! Input string: $asset_name"
     wc="$(__convert_glob__to_regexp "$asset_name")"
 
-    if [ "$3" == "prerelease" ] ; then
-        get_github_release_info "$url" | grep 'browser_download_url' | grep -iEo 'https.*download.*' | grep -E "$wc" | head -n1 | sed -e 's|"$||'
+    local info result=''
+    if [ "$3" = "prerelease" ] ; then
+        info="$(get_github_release_info "$url")" || \
+            fatal "GitHub repository $user_and_repo not found or unreachable"
+        result="$(echo "$info" | __get_github_download_urls | grep -E "$wc" | head -n1)"
     else
-        get_github_release_info "$url" \
-        | awk '{
-    if ($0 ~ /"prerelease": false/) {
-        prerelease = 0;
-    } else if ($0 ~ /"prerelease": true/) {
-        prerelease = 1;
-    }
-    if (!prerelease && $0 ~ /"browser_download_url":/) {
-        match($0, /"browser_download_url": "(https[^"]*)"/, arr);
-        print arr[1];
-    }
-}' | grep -E "$wc" | head -n1 | sed -e 's|"$||'
+        info="$(get_github_release_info "$url" "latest")" && \
+            result="$(echo "$info" | __get_github_download_urls | grep -E "$wc" | head -n1)"
+        if [ -z "$result" ] ; then
+            info="$(get_github_release_info "$url")" || \
+                fatal "GitHub repository $user_and_repo not found or unreachable"
+            result="$(echo "$info" | __get_github_download_urls | grep -E "$wc" | head -n1)"
+        fi
     fi
-
+    echo "$result"
 }
 
 # Get asset checksum from GitHub latest release
@@ -343,7 +444,7 @@ get_github_tag()
     for item in $(seq 0 100) ; do
         local val
         val=$(jv $item "tag_name")
-        [ -n "$val" ] || return
+        [ -n "$val" ] || break
         echo "Checking for [$item,$val] ..." >&2
         #[0,"draft"]     false
         #[0,"prerelease"]        true
@@ -353,8 +454,155 @@ get_github_tag()
         break
     done
 
-    echo "$val" | grep -oP '[0-9]+(\.[0-9]+)*(-[0-9]+)?' | head -n1
-    return
+    local version
+    version="$(echo "$val" | grep -oP '[0-9]+(\.[0-9]+)*(-[0-9]+)?' | head -n1)"
+    [ -n "$version" ] || fatal "Can't get tag from GitHub. Check network or use epm play <app>=<version>"
+    echo "$version"
+}
+
+# GitLab analogue of get_github_release_info: fetch releases JSON via GitLab API.
+get_gitlab_release_info()
+{
+    local url="$1"
+    local flag="$2"
+    local path=${url#https://gitlab.com/}
+    path="${path%/}"
+    # url-encode the project path (group/subgroup/project -> group%2Fsubgroup%2Fproject)
+    local enc_path
+    enc_path="$(echo "$path" | sed -e 's|/|%2F|g')"
+
+    local api_url result
+    if [ "$flag" = "latest" ] ; then
+        api_url="https://gitlab.com/api/v4/projects/$enc_path/releases?per_page=1"
+    else
+        api_url="https://gitlab.com/api/v4/projects/$enc_path/releases?per_page=100"
+    fi
+
+    result="$(fetch_url "$api_url")" || return 1
+    [ -n "$result" ] || return 1
+    echo "$result"
+}
+
+__get_gitlab_download_urls()
+{
+    epm --inscript --quiet tool json -b | grep '"direct_asset_url"' | sed -e 's|.*[[:space:]]||' -e 's|"||g'
+}
+
+# get_gitlab_url <https://gitlab.com/group/project> <asset_name_or_glob>
+get_gitlab_url()
+{
+    local url="$1"
+    local asset_name="$2"
+    local project=${url%/}
+
+    # If asset_name has no globs, try the direct release download URL without API call
+    if ! echo "$asset_name" | grep -q '[*?]' ; then
+        local tag direct
+        for tag in "v$VERSION" "$VERSION" ; do
+            direct="$project/-/releases/$tag/downloads/$asset_name"
+            eget --check-url "$direct" 2>/dev/null && echo "$direct" && return
+        done
+    fi
+
+    local wc info result=''
+    wc="$(__convert_glob__to_regexp "$asset_name")"
+    info="$(get_gitlab_release_info "$url" "latest")" && \
+        result="$(echo "$info" | __get_gitlab_download_urls | grep -E "$wc" | head -n1)"
+    echo "$result"
+}
+
+# get_gitlab_tag <https://gitlab.com/group/project> [version_filter_regexp]
+# Returns the latest release version. With a filter, returns the latest release
+# whose version matches it (e.g. to skip pre-releases by a project convention).
+get_gitlab_tag()
+{
+    local url="$1"
+    local filter="$2"
+    local info item val version
+
+    if [ -n "$filter" ] ; then
+        info="$(get_gitlab_release_info "$url")" || \
+            fatal "Can't get release info from GitLab for $url"
+    else
+        info="$(get_gitlab_release_info "$url" "latest")" || \
+            fatal "Can't get release info from GitLab for $url"
+    fi
+
+    for item in $(seq 0 100) ; do
+        val="$(echo "$info" | parse_json_value "[$item,\"tag_name\"]")"
+        [ -n "$val" ] || break
+        version="$(echo "$val" | grep -oP '[0-9]+(\.[0-9]+)*(-[0-9]+)?' | head -n1)"
+        [ -n "$version" ] || continue
+        [ -n "$filter" ] && { echo "$version" | grep -qE "$filter" || continue ; }
+        echo "$version"
+        return
+    done
+    fatal "Can't get tag from GitLab. Check network or use epm play <app>=<version>"
+}
+
+# Gitea analogue of get_github_release_info: fetch releases JSON via Gitea API.
+get_gitea_release_info()
+{
+    local url="$1"
+    local project_url=${url%/}
+    local host path api_url result
+
+    host="$(echo "$project_url" | sed -e 's|^https://||' -e 's|/.*||')"
+    path="${project_url#https://$host/}"
+
+    api_url="https://$host/api/v1/repos/$path/releases/latest"
+
+    result="$(fetch_url "$api_url")" || return 1
+    [ -n "$result" ] || return 1
+    echo "$result"
+}
+
+__get_gitea_download_urls()
+{
+    epm --inscript --quiet tool json -b | grep '"browser_download_url"' | sed -e 's|.*[[:space:]]||' -e 's|"||g'
+}
+
+# get_gitea_url <https://gitea.example.org/group/project> <asset_name_or_glob>
+get_gitea_url()
+{
+    local url="$1"
+    local asset_name="$2"
+    local project=${url%/}
+
+    # If asset_name has no globs, try the direct release download URL without API call
+    if ! echo "$asset_name" | grep -q '[*?]' ; then
+        local tag direct
+        for tag in "v$VERSION" "$VERSION" ; do
+            direct="$project/releases/download/$tag/$asset_name"
+            eget --check-url "$direct" 2>/dev/null && echo "$direct" && return
+        done
+    fi
+
+    local wc info result=''
+    wc="$(__convert_glob__to_regexp "$asset_name")"
+    info="$(get_gitea_release_info "$url")" && \
+        result="$(echo "$info" | __get_gitea_download_urls | grep -E "$wc" | head -n1)"
+    echo "$result"
+}
+
+# get_gitea_tag <https://gitea.example.org/group/project> [version_filter_regexp]
+get_gitea_tag()
+{
+    local url="$1"
+    local filter="$2"
+    local info val version
+
+    info="$(get_gitea_release_info "$url")" || \
+        fatal "Can't get release info from Gitea for $url"
+
+    val="$(echo "$info" | parse_json_value "[\"tag_name\"]")"
+    version="$(echo "$val" | grep -oP '[0-9]+(\.[0-9]+)*(-[0-9]+)?' | head -n1)"
+    if [ -n "$version" ] && [ -n "$filter" ] ; then
+        echo "$version" | grep -qE "$filter" || version=''
+    fi
+    [ -n "$version" ] && echo "$version" && return
+
+    fatal "Can't get tag from Gitea. Check network or use epm play <app>=<version>"
 }
 
 print_product_alt()
@@ -394,6 +642,7 @@ is_glibc_enough()
     local needed="$1"
     local PKG="glibc-core"
     epm status --installed $PKG || PKG="glibc"
+    epm status --installed $PKG || PKG="libc6"
 
     is_pkg_enough $PKG $needed
 }
@@ -401,9 +650,8 @@ is_glibc_enough()
 is_openssl_enough()
 {
     local needed="$1"
-    local PKG="openssl"
 
-    is_pkg_enough $PKG $needed
+    is_soname_present "libssl.so.$needed"
 }
 
 get_path_by_soname()
@@ -470,9 +718,12 @@ is_repacked_package()
     [ -n "$pkg" ] || pkg="$PKGNAME"
     [ -n "$pkg" ] || return 0 #fatal "is_repacked_package() is called without package name"
 
-    epm status --installed $pkg || return 0
+    epm status --installed $pkg >/dev/null 2>&1 || return 0
 
-    epm status --supported $pkg || return 1
+    if ! epm status --supported $pkg ; then
+       echo "Status checking is not supported for $(epm print info -e). Skipping installed package check (use --force to override)."
+       return 1
+    fi
 
     [ -n "$force" ] && return 0
 
@@ -519,8 +770,8 @@ is_installed_by_play()
     [ -n "$pkg" ] || return 1
 
     # Check exact package first
-    if epm status --installed $pkg ; then
-        epm status --repacked $pkg && return 0
+    if epm status --installed $pkg >/dev/null 2>&1 ; then
+        epm status --repacked $pkg >/dev/null 2>&1 && return 0
     fi
 
     # If BASEPKGNAME and PRODUCTALT are set, check only valid alternatives
@@ -530,12 +781,12 @@ is_installed_by_play()
     for i in $PRODUCTALT ; do
         if [ "$i" = "''" ] ; then
             # Check base package without suffix
-            if epm status --installed "$BASEPKGNAME" ; then
-                epm status --repacked "$BASEPKGNAME" && return 0
+            if epm status --installed "$BASEPKGNAME" >/dev/null 2>&1 ; then
+                epm status --repacked "$BASEPKGNAME" >/dev/null 2>&1 && return 0
             fi
         else
-            if epm status --installed "$BASEPKGNAME-$i" ; then
-                epm status --repacked "$BASEPKGNAME-$i" && return 0
+            if epm status --installed "$BASEPKGNAME-$i" >/dev/null 2>&1 ; then
+                epm status --repacked "$BASEPKGNAME-$i" >/dev/null 2>&1 && return 0
             fi
         fi
     done
@@ -543,43 +794,87 @@ is_installed_by_play()
     return 1
 }
 
+# check if installed version is up to date, exit if no update needed
+# --latest: skip version check, update from upstream
+# --force: skip "already installed" check
+# uses outer $1 (script action: --run / --update) to differentiate behavior.
 check_for_product_update()
 {
-    # get installed version (VERSION-RELEASE format)
-    local fullpkgver="$(get_installed_full_version $PKGNAME)"
+    # action — set by the caller from outer $1 (--run / --update); default safe to "run"
+    local action="${1:---run}"
 
-    # load latest version and release from app-versions
-    load_latest_version $PKGNAME
-    latestpkgver="$VERSION"
-    local fulllatestver="$(build_full_version "$VERSION" "$RELEASE")"
+    local fullpkgver="$(get_installed_full_version "$(__lowpkgname "$PKGNAME")")"
 
-    # ignore update if package is not installed
+    # not installed yet, proceed with install
     [ -n "$fullpkgver" ] || return
 
-    if [ -z "$latestpkgver" ] ; then
-        echo "Can't get info about latest version of $PKGNAME, so skip updating installed version $fullpkgver."
-        exit
+    # if PKGNAME lists several packages, make sure ALL of them are installed;
+    # otherwise a part is missing and we must (re)install instead of skipping
+    # (get_installed_full_version returns a version if any package is installed)
+    # https://bugs.etersoft.ru/show_bug.cgi?id=19203
+    if epm tool estrlist has_space "$PKGNAME" 2>/dev/null ; then
+        epm installed $(__lowpkgname "$PKGNAME") || return
     fi
-    # fulllatestver <= fullpkgver
-    if [ -z "$force" ] || [ -z "$latest" ] ; then
-        if [ "$(epm print compare package version $fulllatestver $fullpkgver)" != "1" ] ; then
-            if [ "$fulllatestver" = "$fullpkgver" ] ; then
-                echo "Latest available version of $PKGNAME $fulllatestver is already installed."
-            else
-                echo "Latest available version of $PKGNAME: $fulllatestver, but you have a newer version installed: $fullpkgver."
+
+    # --latest or --force: skip version check, caller will reinstall from upstream
+    if [ -n "$latest" ] || [ -n "$force" ] ; then
+        echo "Updating $PKGNAME from $fullpkgver to latest upstream version ..."
+        return
+    fi
+
+    # Apps whose version is pinned to another installed package (e.g.
+    # virtualbox-extpack must match the installed virtualbox) may define a
+    # get_target_version() function returning the version they will install.
+    # Compare the installed package against it instead of app-versions, so a
+    # matching install is not re-done on every --update.
+    if type get_target_version >/dev/null 2>&1 ; then
+        local target_version
+        target_version="$(get_target_version)"
+        if [ -n "$target_version" ] ; then
+            local instver
+            instver="$(epm print version for package "$(__lowpkgname "$PKGNAME")" 2>/dev/null | head -n1)"
+            if [ "$instver" = "$target_version" ] ; then
+                echo "$PKGNAME $instver already matches the target version $target_version."
+                exit
             fi
-            exit
+            echo "Updating $PKGNAME from $fullpkgver to $target_version ..."
+            VERSION="$target_version"
+            return
         fi
     fi
 
-    #echo "Updating $PKGNAME from $fullpkgver to the latest available version (equal to $fulllatestver or newer) ..."
-    if [ -n "$force" ] || [ -z "$latest" ] ; then
-        echo "Updating $PKGNAME from $fullpkgver to latest available version ..."
-    else
-        echo "Updating $PKGNAME from $fullpkgver to $fulllatestver version ..."
-        VERSION="$latestpkgver"
-        # RELEASE already set by load_latest_version
+    # user specified explicit version (e.g., epm play app=1.2.3): skip app-versions check
+    if [ -n "$VERSION" ] && [ "$VERSION" != "*" ] ; then
+        echo "Installing $PKGNAME version $VERSION (explicit version requested) ..."
+        return
     fi
+
+    load_latest_version $PKGNAME
+    local fulllatestver="$(build_full_version "$VERSION" "$RELEASE")"
+
+    if [ -z "$VERSION" ] ; then
+        # vendor doesn't publish version info — can't determine if update is needed.
+        # For --update (auto-update): skip silently, don't reinstall.
+        # For --run (user explicitly invoked): proceed with reinstall — user likely wants to repair install.
+        if [ "$action" = "--update" ] ; then
+            echo "Can't get info about latest version of $PKGNAME, so skip updating installed version $fullpkgver."
+            exit
+        fi
+        echo "Can't get info about latest version of $PKGNAME (vendor doesn't publish app-versions). Reinstalling $fullpkgver ..."
+        return
+    fi
+
+    # fulllatestver <= fullpkgver: no update needed
+    if [ "$(epm print compare package version $fulllatestver $fullpkgver)" != "1" ] ; then
+        if [ "$fulllatestver" = "$fullpkgver" ] ; then
+            echo "Latest available version of $PKGNAME $fulllatestver is already installed."
+        else
+            echo "Latest available version of $PKGNAME: $fulllatestver, but you have a newer version installed: $fullpkgver."
+        fi
+        exit
+    fi
+
+    echo "Updating $PKGNAME from $fullpkgver to $fulllatestver version ..."
 }
 
 
@@ -600,18 +895,17 @@ esac
 [ -n "$PRODUCTALT" ] && check_alternative_pkgname
 [ -n "$PKGNAME" ] || fatal "Can't get PKGNAME"
 
-# deb targets always in low case
-[ "$PKGFORMAT" = "deb" ] && PKGNAME="$(echo $PKGNAME | tr "[A-Z]" "[a-z]")"
-
+# lowercase package name for deb package manager commands (alien lowercases when converting rpm to deb)
+__lowpkgname() { [ "$PKGFORMAT" = "deb" ] && echo "$1" | tr "A-Z" "a-z" || echo "$1" ; }
 
 case "$1" in
     "--package-name")
         #[ -n "$DESCRIPTION" ] || exit 0
-        echo "$PKGNAME"
+        __lowpkgname "$PKGNAME"
         exit
         ;;
     "--installed")
-        is_installed_by_play $PKGNAME
+        is_installed_by_play "$(__lowpkgname "$PKGNAME")"
         exit
         ;;
 esac
@@ -623,7 +917,8 @@ check_tty
 case "$1" in
     "--remove")
         #is_repacked_packages || exit 0
-        epm remove $PKGNAME
+        # PKGNAME may contain several space-separated package names — pass them as separate args
+        epm remove $(__lowpkgname "$PKGNAME")
         exit
         ;;
     "--info")
@@ -636,10 +931,14 @@ case "$1" in
         exit
         ;;
     "--installed-version")
-        get_installed_full_version $PKGNAME
+        get_installed_full_version "$(__lowpkgname "$PKGNAME")"
         exit
         ;;
     "--available-version")
+        if type get_target_version >/dev/null 2>&1 ; then
+            get_target_version
+            exit $?
+        fi
         load_latest_version $PKGNAME
         build_full_version "$VERSION" "$RELEASE"
         exit
@@ -649,21 +948,22 @@ case "$1" in
         pkgistext="package is"
         epm tool estrlist has_space "$PKGNAME" 2>/dev/null && pkgtext="packages" && pkgistext="packages are"
 
-        if ! epm installed $PKGNAME ; then
+        if ! epm installed "$(__lowpkgname "$PKGNAME")" ; then
             echo "Skipping update of $PKGNAME ($pkgistext not installed)"
             exit
         fi
 
-        if epm mark checkhold $PKGNAME ; then
+        if epm mark checkhold "$(__lowpkgname "$PKGNAME")" ; then
             echo "Skipping update of $PKGNAME ($pkgistext on hold, see '# epm mark showhold')"
             exit
         fi
 
-        check_for_product_update
+        check_for_product_update "$1"
         # pass to run play code
         ;;
     "--run")
-        # just pass to run play code
+        check_for_product_update "$1"
+        # pass to run play code
         ;;
     *)
         fatal "Unknown command '$1'. Use this script only via epm play."

@@ -37,7 +37,7 @@ epm_install_files_alt_via_repo()
 
     #docmd epm repo save
 
-    docmd epm repo add $repodir
+    docmd epm repo add --name "local-repo" $repodir
     docmd epm update
 
     # install with name=version
@@ -69,8 +69,8 @@ epm_install_files_alt()
         return
     fi
 
-    # install packages via local repo if enabled
-    if [ -n "$use_local_repo" ] ; then
+    # install packages via local repo if enabled (apt only: it uses name=version install)
+    if [ -n "$use_local_repo" ] && [ "$PMTYPE" = "apt-rpm" ] ; then
         [ -n "$nodeps" ] && warning "Option --nodeps is not supported with local repo, ignored"
         epm_install_files_alt_via_repo $files
         return
@@ -111,15 +111,18 @@ epm_install_files_alt()
         fatal "Only RPM 6 can install packages larger than 4 GB"
     fi
 
-    # try install via apt if we could't install package file via rpm (we guess we need install requirements firsly)
-
+    # try install via apt/dnf if we could't install package file via rpm (we guess we need install requirements firsly)
     if [ -z "$direct" ] && [ -z "$noscripts" ] ; then
-        epm_install_names $files
-        return
+        case "$PMTYPE" in
+            apt-rpm|dnf-rpm|dnf5-rpm)
+                epm_install_names $files
+                return
+                ;;
+        esac
     fi
 
     # TODO: use it always (apt can install version from repo instead of a file package)
-    info "Workaround for install packages via apt with --noscripts (see https://bugzilla.altlinux.org/44670)"
+    [ "$PMTYPE" = "apt-rpm" ] && info "Workaround for install packages via apt with --noscripts (see https://bugzilla.altlinux.org/44670)"
     info "Firstly install package requrements …"
     # names of packages to be installed
     local fl="$(epm print name for package $files)"
@@ -143,130 +146,39 @@ get_current_kernel_flavour()
     echo "$rflv"
 }
 
-# extract kernel flavour from package name
-# kernel-image-6.12 -> 6.12
-# kernel-image-std-def -> std-def
-# kernel-image-6.12.10-6.12-alt1 -> 6.12
-# kernel-image-5.10.123-std-def-alt1 -> std-def
-get_flavour_from_kernel_package()
+# print "module flavour" for kernel-modules-<module>[-<flavour>]
+__epm_alt_kernel_module_flavour()
 {
-    local pkg="$1"
-    # remove kernel-image- prefix if present
-    pkg="${pkg#kernel-image-}"
-
-    # if just flavour (no dots or single segment like "std-def" or "6.12")
-    case "$pkg" in
-        *-*-alt*)
-            # full version like 6.12.10-6.12-alt1 or 5.10.123-std-def-alt1
-            # extract flavour using same logic as get_current_kernel_flavour
-            local flv
-            flv="${pkg#*-}"   # 6.12-alt1 or std-def-alt1
-            flv="${flv%-*}"   # 6.12 or std-def
-            echo "$flv"
-            ;;
-        *)
-            # short form: 6.12 or std-def
-            echo "$pkg"
-            ;;
-    esac
+    local n="${1#kernel-modules-}" f
+    for f in "$(echo "$n" | sed -n 's|.*-\([0-9]\+\.[0-9]\+\)$|\1|p')" "$(echo "$n" | sed -n 's|.*-\([a-z]\+-def\)$|\1|p')" "${n##*-}" ; do
+        [ -n "$f" ] && [ "$f" != "$n" ] || continue
+        if echo "$f" | grep -q -E '^([0-9]+\.[0-9]+|[a-z]+-def)$' || a='' rpm -q "kernel-image-$f" >/dev/null 2>&1 ; then
+            echo "${n%-"$f"} $f"
+            return
+        fi
+    done
+    echo "$n $(get_current_kernel_flavour)"
 }
 
-# std-def 1.2.3-alt1 -> 1.2.3-std-def-alt1
-make_kernel_release()
-{
-    echo "$2" | sed -e "s|-|-$1-|"
-}
-
-# return latest installed kernel in a form like 5.15.109-un-def-alt1
-get_latest_kernel_rel()
-{
-    local kernel_flavour="$1"
-    # current
-    rrel=$(uname -r)
-
-    # latest
-    # copied and modified from update-kernel
-    # get the maximum available kernel package version
-    kmaxver=
-    while read version
-    do
-        comparever="$(a='' rpmevrcmp "$kmaxver" "$version")"
-        [ "$comparever" -lt 0 ] && kmaxver="$version" ||:
-    done <<<"$(epm print version-release for package kernel-image-$kernel_flavour)"
-    [ -z "$kmaxver" ] && echo "$rrel" && return
-
-    make_kernel_release "$kernel_flavour" "$kmaxver"
-}
-
-# install <module-name>-std-def
+# install kernel-modules-<module>[-<flavour>] with the latest kernel via update-kernel logic
 epm_install_alt_kernel_module()
 {
     [ -n "$1" ] || return 0
 
-    local kflist=''
-    local kmplist=''
-    local kmf module flavour tmp
-
-    # fill kernel flavour list
-    for kmf in "$@"; do
-        case "$kmf" in
-            # full package with explicit version: kernel-modules-<mod>-<ver>
-            kernel-modules-*-*[0-9]*)
-                tmp=${kmf#kernel-modules-}      # tmp="<mod>-<ver>"
-                flavour=${tmp##*-}              # take version part
-                ;;
-            # full package without version: kernel-modules-<mod>
-            kernel-modules-*)
-                flavour=$(get_current_kernel_flavour)
-                ;;
-            # short name with version: <mod>-<ver>
-            *-[0-9]*)
-                flavour=${kmf##*-}
-                ;;
-            # everything else — module name only
-            *)
-                flavour=$(get_current_kernel_flavour)
-                ;;
-        esac
-        kflist="$kflist $flavour"
+    local list='' kmf flavour module
+    for kmf in "$@" ; do
+        list="$list
+$(__epm_alt_kernel_module_flavour "$kmf")"
     done
 
-    # firstly, update all needed kernels (by flavour)
-    for flavour in $(estrlist uniq $kflist); do
-        info
-        docmd epm update-kernel -t "$flavour" || exit
+    load_helper epm-kernel_update
+    for flavour in $(echo "$list" | cut -d' ' -f2 | grep . | sort -u) ; do
+        local addopts=''
+        for module in $(echo "$list" | grep " $flavour\$" | cut -d' ' -f1) ; do
+            addopts="$addopts -A $module"
+        done
+        epm_kernel_update -t "$flavour" $addopts || return
     done
-
-    # skip install modules if there are no installed kernels (may be, a container)
-    epm installed "kernel-image-$flavour" || return 0
-
-    # make list for install kernel modules
-    for kmf in "$@"; do
-        case "$kmf" in
-            kernel-modules-*-*[0-9]*)
-                tmp=${kmf#kernel-modules-}
-                module=${tmp%-*}
-                flavour=${tmp##*-}
-                ;;
-            kernel-modules-*)
-                module=${kmf#kernel-modules-}
-                flavour=$(get_current_kernel_flavour)
-                ;;
-            *-[0-9]*)
-                module=${kmf%-*}
-                flavour=${kmf##*-}
-                ;;
-            *)
-                module=$kmf
-                flavour=$(get_current_kernel_flavour)
-                ;;
-        esac
-        kvf=$(get_latest_kernel_rel "$flavour")
-        kmplist="$kmplist kernel-modules-$module-$kvf"
-    done
-
-    # secondly, install module(s)
-    epm_install_names $kmplist
 }
 
 
@@ -287,22 +199,15 @@ epm_install_alt_names()
     while [ -n "$1" ] ; do
         local pkgname
         pkgname="$1"
-        if echo "$pkgname" | grep -v "#" | grep -q "^kernel-modules*-" ; then
-            # virtualbox[-std-def]
-            local kmn="$(echo $pkgname | sed -e 's|kernel-modules*-||')"
-            local kf1="$(echo "$kmn" | cut -d- -f2)"
-            local kf2="$(echo "$kmn" | cut -d- -f4)"
-            # pass install with full pkgnames
-            if [ "$kf1" != "$kf2" ] && [ -n "$kf2" ] || echo "$kf1" | grep -q "^[0-9]" ; then
-                installnames="$installnames $pkgname"
-            else
-                kmlist="$kmlist $kmn"
-            fi
-        elif echo "$pkgname" | grep -v "#" | grep -q "^kernel-image-" ; then
-            # kernel-image-6.12 or kernel-image-std-def or full kernel-image-6.12.10-6.12-alt1
-            local flavour
-            flavour="$(get_flavour_from_kernel_package "$pkgname")"
-            kilist="$kilist $flavour"
+        if echo "$pkgname" | grep -q "^kernel-image-" && ! echo "$pkgname" | grep -q -- "-debuginfo" ; then
+            # kernel-image-6.12, kernel-image-std-def or kernel-image-6.12-6.12.10-alt1
+            kilist="$kilist $pkgname"
+        elif echo "$pkgname" | grep -q -E -- '[#=]|-[0-9][^-]*-alt[^-]*$' ; then
+            # pass install with full pkgnames (with version)
+            installnames="$installnames $pkgname"
+        elif echo "$pkgname" | grep -q "^kernel-modules-" ; then
+            # virtualbox[-6.12]
+            kmlist="$kmlist $pkgname"
         else
             installnames="$installnames $pkgname"
         fi
@@ -312,12 +217,16 @@ epm_install_alt_names()
     epm_install_names $installnames || return
     epm_install_alt_kernel_module $kmlist || return
 
-    # install kernel images via update-kernel (handles modules automatically)
+    # install kernel images via update-kernel logic (handles modules automatically)
     if [ -n "$kilist" ] ; then
         load_helper epm-kernel_update
-        local flavour
-        for flavour in $kilist ; do
-            epm_kernel_update -t "$flavour" || return
+        local kpkg
+        for kpkg in $kilist ; do
+            if echo "$kpkg" | grep -q -E -- '[#=]|-[0-9][^-]*-alt[^-]*$' ; then
+                epm_kernel_update -r "$kpkg" || return
+            else
+                epm_kernel_update -t "${kpkg#kernel-image-}" || return
+            fi
         done
     fi
 }
@@ -345,10 +254,12 @@ apt_repo_after()
 prepare_task_packages()
 {
     # Sets global vars:
-    #   installlist  — final list of packages to install
-    #   unique_tasks — unique task names from args
+    #   installlist             — final list of packages to install
+    #   requested_task_packages — packages explicitly requested from a task
+    #   unique_tasks            — unique task names from args
 
     installlist=""
+    requested_task_packages=""
     unique_tasks=""
     local seen_tasks=""
     local task_packages=""
@@ -370,6 +281,7 @@ prepare_task_packages()
         # Add specific package or all task packages to install list
         if [ -n "$pkg" ]; then
             installlist="$installlist $pkg"
+            requested_task_packages="$requested_task_packages $pkg"
         else
             installlist="$installlist $task_packages"
         fi
@@ -377,6 +289,36 @@ prepare_task_packages()
 }
 
 # copied from epm_upgrade_alt_tasks()
+# dnf can't use apt task repos: download task packages and install them as files
+# args: <package names> <task numbers...>
+# download rpms with names from list $1 from task(s) to a temp dir, set task_files
+# (for non apt backends: task repos have no rpm-md)
+__epm_download_alt_task_files()
+{
+    local names="$1"
+    shift
+    load_helper epm-repopkg
+    local tmpdir
+    tmpdir="$(mktemp -d)" || fatal
+    remove_on_exit "$tmpdir"
+    __download_task_rpms "$tmpdir" "$@"
+    local f
+    task_files=''
+    for f in "$tmpdir"/*.rpm ; do
+        [ -e "$f" ] || continue
+        estrlist contains "$(epm print name for package "$f")" "$names" || continue
+        task_files="$task_files $f"
+    done
+    [ -n "$task_files" ] || fatal "No packages downloaded from task(s)"
+}
+
+__epm_install_alt_task_files()
+{
+    load_helper epm-install
+    __epm_download_alt_task_files "$@"
+    epm_install_files $task_files
+}
+
 epm_install_alt_tasks()
 {
     load_helper epm-install
@@ -390,6 +332,9 @@ epm_install_alt_tasks()
     else
         # hack: drop -devel packages to avoid package provided by multiple packages
         installlist="$(estrlist reg_exclude ".*-devel .*-devel-static .*-checkinstall .*-debuginfo" "$installlist")"
+        # Keep packages explicitly requested as task/PACKAGE.  In particular,
+        # a task may be used to install a -devel subpackage.
+        installlist="$(estrlist union "$installlist $requested_task_packages")"
     fi
 
     # TODO: need we this option?
@@ -401,8 +346,23 @@ epm_install_alt_tasks()
     [ -n "$verbose" ] && info "Packages to install: $installlist"
 
     if [ -z "$installlist" ] ; then
-        warning 'There is no installed packages for upgrade from task' "$*"
+        warning 'No packages available for install from task(s)' "$*"
         return 22
+    fi
+
+    if [ "$PMTYPE" != "apt-rpm" ] ; then
+        # dnf reads APT-RPM repos: install from the task repos with dependencies from the system repos
+        if __alt_dnf_supports_aptrpm ; then
+            local res
+            load_helper epm-sh-backend
+            __use_tmp_dnf_for_tasks $unique_tasks || return 1
+            (pkg_names="$installlist" epm_install)
+            res=$?
+            __EPM_DNF_REPO_OPTIONS=''
+            return $res
+        fi
+        __epm_install_alt_task_files "$installlist" $unique_tasks
+        return
     fi
 
     local res

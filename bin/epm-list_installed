@@ -39,12 +39,19 @@ epm_list_installed()
 case $PMTYPE in
     *-dpkg)
         warmup_dpkgbase
-        docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture} - \${Description}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | cut -d'
-' -f1 | __fo_pfn "$@"
+        if [ -n "$short" ] ; then
+            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
+        else
+            docmd dpkg-query -W --showformat="\${db:Status-Abbrev}\${Package}-\${Version}:\${Architecture} - \${binary:Summary}\n" "$@" | grep "^.i" | sed -e "s|^.. ||g" | __fo_pfn "$@"
+        fi
         return ;;
     *-rpm)
         warmup_rpmbase
-        docmd rpm -qa --queryformat "%{name}-%{version}-%{release} - %{summary}\n" "$@" | __fo_pfn "$@"
+        if [ -n "$short" ] ; then
+            docmd rpm -qa --queryformat "%{name}\n" "$@" | __fo_pfn "$@"
+        else
+            docmd rpm -qa --queryformat "%{name}-%{version}-%{release} - %{summary}\n" "$@" | __fo_pfn "$@"
+        fi
         return ;;
     packagekit)
         docmd pkcon get-packages --filter installed
@@ -72,7 +79,7 @@ case $PMTYPE in
         docmd pkg info 2>/dev/null | sed -e "s| | - |" | __fo_pfn "$@"
         return ;;
     pacman)
-        docmd pacman -Qi "$@" 2>/dev/null | awk '/^Name/{name=$3} /^Version/{ver=$3} /^Description/{$1=$2=""; desc=$0} /^$/{print name"-"ver" -"desc}' | __fo_pfn "$@"
+        LC_ALL=C docmd pacman -Qi "$@" 2>/dev/null | awk '/^Name/{name=$3} /^Version/{ver=$3} /^Description/{$1=$2=""; desc=$0} /^$/{print name"-"ver" -"desc}' | __fo_pfn "$@"
         return
         ;;
     npackd)

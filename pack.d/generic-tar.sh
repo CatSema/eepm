@@ -11,7 +11,7 @@ alpkg=$(basename $TAR)
 
 # FIXME: this heruistic need be improved
 if [ -n "$VERSION" ] ; then
-    PRODUCT="$(echo "$alpkg" | sed -e "s|[-_.].*||")"
+    PRODUCT="$(echo "$alpkg" | sed -e "s|[-_.]${VERSION}.*||")"
 else
     VERSION="$(echo "$alpkg" | grep -o -P '[-_.][0-9][0-9]*([.]*[0-9][0-9a-z]*)*' | head -n1 | sed -e 's|^[-_.]||')" #"
     [ -n "$VERSION" ] || fatal "Can't get version from $TAR. We have almost no chance it will supported in alien."
@@ -47,11 +47,14 @@ fi
 #   alpkg=$newalpkg
 #   fi
 
-# TODO: how to add to tarball?
-cat <<EOF >$PKGNAME.eepm.yaml
+# don't overwrite yaml created by pack.d script
+if [ ! -r "$PKGNAME.eepm.yaml" ] ; then
+    # TODO: how to add to tarball?
+    cat <<EOF >$PKGNAME.eepm.yaml
 name: $PRODUCT
 version: $VERSION
 upstream_file: $alpkg
 EOF
+fi
 
 return_tar $PKGNAME

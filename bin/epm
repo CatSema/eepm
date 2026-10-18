@@ -120,10 +120,12 @@ phelp()
 print_version()
 {
         local tg_link=$(make_osc8_link "https://t.me/useepm")
+        local max_link=$(make_osc8_link "https://max.eepm.ru")
+        local matrix_link=$(make_osc8_link "https://matrix.eepm.ru")
         local wiki_link=$(make_osc8_link "https://wiki.etersoft.ru/Epm")
-        message 'EPM package manager version $EPMVERSION  Telegram: $tg_link  $wiki_link
+        message 'EPM package manager version $EPMVERSION  Telegram: $tg_link  MAX: $max_link  Matrix: $matrix_link  $wiki_link
                  Running on $DISTRNAME/$DISTRVERSION ($PMTYPE package manager uses $PKGFORMAT package format)
-                 Copyright (c) Etersoft 2012-2025
+                 Copyright (c) Etersoft 2012-2026
                  This program may be freely redistributed under the terms of the GNU AGPLv3.'
 }
 
@@ -136,6 +138,7 @@ verbose=$EPM_VERBOSE
 quiet=
 nodeps=
 noremove=
+allow_remove=
 dryrun=
 force=
 full=
@@ -172,6 +175,8 @@ direct_args=
 ipfs=
 exclude=
 force_overwrite=
+norecommends=
+regexp=
 
 epm_vardir=/var/lib/eepm
 epm_cachedir=/var/cache/eepm
@@ -181,6 +186,16 @@ eget_ipfs_db=$epm_vardir/eget-ipfs-db.txt
 for i in $CONFIGDIR/eepm.conf $CONFIGDIR/conf.d/*.conf ; do
     [ -f "$i" ] && . "$i"
 done
+
+# backend can be set in config (EPM_BACKEND), use it for nested epm calls too
+if [ -n "$EPM_BACKEND" ] ; then
+    export EPM_BACKEND
+    set_pm_type
+fi
+
+# export eget settings if set in config
+[ -n "$eget_backend" ] && export EGET_BACKEND="$eget_backend"
+[ -n "$eget_options" ] && export EGET_OPTIONS="$eget_options"
 
 # export proxy settings if set in config
 # Note: apt may require /etc/apt/apt.conf.d/ config, see https://bugzilla.altlinux.org/38543
@@ -364,7 +379,7 @@ check_command()
         epm_cmd=update
         direct_args=1
         ;;
-    addrepo|ar|--add-repo)    # HELPCMD: add package repo (etersoft, autoimports, archive 2017/01/31); run with param to get list
+    addrepo|ar|--add-repo)    # HELPCMD: add package repo (etersoft, autoimports, --disabled); run with param to get list
         epm_cmd=addrepo
         direct_args=1
         ;;
@@ -504,6 +519,10 @@ check_command()
         epm_cmd=moo
         direct_args=1
         ;;
+    hedgehog)
+        epm_cmd=hedgehog
+        direct_args=1
+        ;;
     prescription|recipe)      # HELPCMD: run prescription (a script to achieving the goal), run without args to get list
         epm_cmd=prescription
         direct_args=1
@@ -588,6 +607,10 @@ check_option()
     --noremove|--no-remove)  # HELPOPT: exit if any packages are to be removed during upgrade
         noremove="--no-remove"
         ;;
+    --allow-remove|--allow-erasing) # HELPOPT: allow removing conflicting packages during install
+        noremove=""
+        allow_remove="--allow-remove"
+        ;;
     --no-stdin|--inscript)  # HELPOPT: don't read from stdin for epm args
         inscript=1
         ;;
@@ -596,6 +619,9 @@ check_option()
         ;;
     --short)              # HELPOPT: short output (just 'package' instead 'package-version-release')
         short="--short"
+        ;;
+    --debian)             # HELPOPT: filter requires to non-library package names (for requires)
+        debian="--debian"
         ;;
     --direct)              # HELPOPT: direct install package file from ftp (not via hilevel repository manager)
         direct="--direct"
@@ -622,6 +648,7 @@ check_option()
         put_to_repo="$(echo "$1" | sed -e 's|--put-to-repo=||')"
         ;;
     --update)              # HELPOPT: run update before install/upgrade
+        [ -n "$direct_args" ] && return 1
         update_repo="--update"
         ;;
     --download-only)       # HELPOPT: download only the package/tarball (before any transformation)
@@ -653,6 +680,12 @@ check_option()
         ;;
     --force-overwrite)      # HELPOPT: force overwrite one package's file with another's file
         force_overwrite="--force-overwrite"
+        ;;
+    --norecommends|--no-recommends)  # HELPOPT: skip recommended packages during install
+        norecommends="--norecommends"
+        ;;
+    --regex|--regexp)        # HELPOPT: treat search pattern as regular expression (for grep filter only)
+        regexp="--regexp"
         ;;
     --manual-requires)       # HELPOPT: includes all package dependencies in the install/uninstall list
         manual_requires="--manual-requires"
@@ -732,7 +765,7 @@ if [ -n "$quiet" ] ; then
 fi
 
 # fill
-export EPM_OPTIONS="$nodeps $force $full $verbose $debug $quiet $interactive $non_interactive $parallel $save_only $download_only $force_overwrite $manual_requires $noscripts $scripts $dryrun"
+export EPM_OPTIONS="$nodeps $force $full $verbose $debug $quiet $interactive $non_interactive $parallel $save_only $download_only $force_overwrite $manual_requires $noscripts $scripts $dryrun $norecommends $noremove $allow_remove"
 
 # if input is not console and run script from file, get pkgs from stdin too
 if [ -z "$direct_args" ] && [ ! -n "$inscript" ] && [ -p /dev/stdin ] && [ "$EPMMODE" != "pipe" ] ; then
@@ -795,7 +828,8 @@ esac
 
 case $epm_cmd in
     upgrade|Upgrade|install|reinstall|release_upgrade|release_downgrade)
-        if [ -n "$parallel" ] && [ -z "$eget_backend" ] ; then
+        # only apt-rpm downloads packages to the cache itself (dnf etc. download in parallel already)
+        if [ -n "$parallel" ] && [ "$PMTYPE" = "apt-rpm" ] && [ -z "$eget_backend" ] ; then
             is_command aria2 && eget_backend=aria2 && echo "Use installed aria2 to parallel package downloading."
             [ -z "$eget_backend" ] && is_command axel && eget_backend=axel && echo "Use installed axel to parallel package downloading."
             [ -n "$eget_backend" ] || info "It is better to install aria2 for parallel downloading."
